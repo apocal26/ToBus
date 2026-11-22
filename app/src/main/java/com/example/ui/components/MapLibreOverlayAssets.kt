@@ -34,6 +34,11 @@ internal object MapLibreTransitIds {
     const val ROUTE_GLOW_LAYER = "tobus-route-glow"
     const val ROUTE_CORE_LAYER = "tobus-route-core"
 
+    const val EXTERNAL_ROUTE_SOURCE = "tobus-external-route-source"
+    const val EXTERNAL_ROUTE_CASING_LAYER = "tobus-external-route-casing"
+    const val EXTERNAL_ROUTE_GLOW_LAYER = "tobus-external-route-glow"
+    const val EXTERNAL_ROUTE_CORE_LAYER = "tobus-external-route-core"
+
     const val STOPS_SOURCE = "tobus-stops-source"
     const val STOPS_HALO_LAYER = "tobus-stops-halo"
     const val STOPS_DOT_LAYER = "tobus-stops-dot"
@@ -432,6 +437,9 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
     if (style.getSource(MapLibreTransitIds.ROUTE_SOURCE) == null) {
         style.addSource(GeoJsonSource(MapLibreTransitIds.ROUTE_SOURCE))
     }
+    if (style.getSource(MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE) == null) {
+        style.addSource(GeoJsonSource(MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE))
+    }
     if (style.getSource(MapLibreTransitIds.STOPS_SOURCE) == null) {
         style.addSource(GeoJsonSource(MapLibreTransitIds.STOPS_SOURCE))
     }
@@ -462,6 +470,18 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
         Expression.stop(1, Expression.literal(1.7f)),
     )
 
+    val isRouteDimmed = Expression.eq(Expression.get("dimmed"), Expression.literal(true))
+    val mainRouteOpacityExpr = Expression.switchCase(
+        isRouteDimmed,
+        Expression.literal(0.20f),
+        Expression.literal(1.0f),
+    )
+    val mainRouteGlowOpacityExpr = Expression.switchCase(
+        isRouteDimmed,
+        Expression.literal(0.08f),
+        Expression.literal(1.0f),
+    )
+
     // 1. Route Polylines (casing -> glow -> crisp core)
     if (style.getLayer(MapLibreTransitIds.ROUTE_CASING_LAYER) == null) {
         style.addLayer(
@@ -469,6 +489,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                 PropertyFactory.lineColor(
                     if (isDarkBasemap) "rgba(6, 9, 15, 0.85)" else "rgba(255, 255, 255, 0.84)",
                 ),
+                PropertyFactory.lineOpacity(mainRouteOpacityExpr),
                 PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                 PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 PropertyFactory.lineOffset(routeOffsetExpr),
@@ -489,6 +510,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
         style.addLayer(
             LineLayer(MapLibreTransitIds.ROUTE_GLOW_LAYER, MapLibreTransitIds.ROUTE_SOURCE).withProperties(
                 PropertyFactory.lineColor(routeGlowExpr),
+                PropertyFactory.lineOpacity(mainRouteGlowOpacityExpr),
                 PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                 PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 PropertyFactory.lineOffset(routeOffsetExpr),
@@ -510,6 +532,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
         style.addLayer(
             LineLayer(MapLibreTransitIds.ROUTE_CORE_LAYER, MapLibreTransitIds.ROUTE_SOURCE).withProperties(
                 PropertyFactory.lineColor(routeColorExpr),
+                PropertyFactory.lineOpacity(mainRouteOpacityExpr),
                 PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
                 PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
                 PropertyFactory.lineOffset(routeOffsetExpr),
@@ -526,9 +549,87 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
         )
     }
 
+    // 1b. Focused External Bus Route Overlay (Emerald highlight when inspecting a bus of another line)
+    if (style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_CASING_LAYER) == null) {
+        style.addLayer(
+            LineLayer(
+                MapLibreTransitIds.EXTERNAL_ROUTE_CASING_LAYER,
+                MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE,
+            ).withProperties(
+                PropertyFactory.lineColor(
+                    if (isDarkBasemap) "rgba(6, 9, 15, 0.90)" else "rgba(255, 255, 255, 0.90)",
+                ),
+                PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                PropertyFactory.lineWidth(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(10.0, 5.6f),
+                        Expression.stop(13.5, 8.2f),
+                        Expression.stop(17.0, 11.8f),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    if (style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_GLOW_LAYER) == null) {
+        style.addLayer(
+            LineLayer(
+                MapLibreTransitIds.EXTERNAL_ROUTE_GLOW_LAYER,
+                MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE,
+            ).withProperties(
+                PropertyFactory.lineColor("rgba(16, 185, 129, 0.34)"),
+                PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                PropertyFactory.lineBlur(4.5f),
+                PropertyFactory.lineWidth(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(10.0, 8.0f),
+                        Expression.stop(13.5, 12.2f),
+                        Expression.stop(17.0, 17.0f),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    if (style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_CORE_LAYER) == null) {
+        style.addLayer(
+            LineLayer(
+                MapLibreTransitIds.EXTERNAL_ROUTE_CORE_LAYER,
+                MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE,
+            ).withProperties(
+                PropertyFactory.lineColor("#10B981"),
+                PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                PropertyFactory.lineWidth(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(10.0, 3.0f),
+                        Expression.stop(13.5, 4.4f),
+                        Expression.stop(17.0, 6.2f),
+                    ),
+                ),
+            ),
+        )
+    }
+
     // 2. Discreet, Clickable Stop Dots (strict boolean expressions!)
     val isStopSelected = Expression.eq(Expression.get("isSelected"), Expression.literal(true))
     val isStopFav = Expression.eq(Expression.get("isFav"), Expression.literal(true))
+    val isStopDimmed = Expression.eq(Expression.get("dimmed"), Expression.literal(true))
+    val stopDotOpacityExpr = Expression.switchCase(
+        isStopSelected,
+        Expression.literal(1.0f),
+        isStopDimmed,
+        Expression.literal(0.24f),
+        Expression.literal(1.0f),
+    )
     val stopStrokeColor = Expression.match(
         Expression.get("dir"),
         Expression.literal("#FFB300"),
@@ -549,6 +650,8 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                     Expression.switchCase(
                         isStopSelected,
                         Expression.literal(0.32f),
+                        isStopDimmed,
+                        Expression.literal(0f),
                         isStopFav,
                         Expression.literal(0.28f),
                         Expression.literal(0f),
@@ -579,6 +682,8 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                         Expression.literal(if (isDarkBasemap) "#0E131B" else "#FFFFFF"),
                     ),
                 ),
+                PropertyFactory.circleOpacity(stopDotOpacityExpr),
+                PropertyFactory.circleStrokeOpacity(stopDotOpacityExpr),
                 PropertyFactory.circleStrokeColor(
                     Expression.switchCase(
                         isStopSelected,
@@ -770,22 +875,54 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
 internal fun buildRoutesFeatureCollection(
     routePatterns: List<RoutePattern>,
     colorByDirection: Boolean,
+    highlightedDirectionId: Int? = null,
+    dimAll: Boolean = false,
 ): FeatureCollection {
     if (routePatterns.isEmpty()) return FeatureCollection.fromFeatures(emptyArray())
     val hasBothDirs = routePatterns.map { it.directionId }.distinct().size > 1
-    val features = routePatterns.mapNotNull { pattern ->
+    // Draw dimmed patterns FIRST so the highlighted direction always sits cleanly on top
+    val orderedPatterns = routePatterns.sortedByDescending { pat ->
+        dimAll || (highlightedDirectionId != null && pat.directionId != highlightedDirectionId)
+    }
+    val features = orderedPatterns.mapNotNull { pattern ->
         if (pattern.points.size < 2) return@mapNotNull null
         val coords = pattern.points.map { Point.fromLngLat(it.lon, it.lat) }
         val feature = Feature.fromGeometry(LineString.fromLngLats(coords))
         val dir = if (colorByDirection) pattern.directionId else 0
+        val dimmed = dimAll || (highlightedDirectionId != null && pattern.directionId != highlightedDirectionId)
         val offsetSign = when {
-            !hasBothDirs -> 0
+            !hasBothDirs || (highlightedDirectionId != null && !dimmed) -> 0
             pattern.directionId == 1 -> 1
             else -> -1
         }
         feature.addNumberProperty("dir", dir)
         feature.addNumberProperty("offsetSign", offsetSign)
+        feature.addBooleanProperty("dimmed", dimmed)
         feature
+    }
+    return FeatureCollection.fromFeatures(features)
+}
+
+internal fun buildExternalRouteFeatureCollection(
+    externalBus: BusVehicle?,
+    externalRoutePatterns: List<RoutePattern>,
+): FeatureCollection {
+    if (externalBus == null || externalRoutePatterns.isEmpty()) {
+        return FeatureCollection.fromFeatures(emptyArray())
+    }
+    val resolvedDir = com.example.data.model.GttFleetAnalyzer.resolveDirectionId(
+        bus = externalBus,
+        routePatterns = externalRoutePatterns,
+    ) ?: externalBus.directionId
+    val selectedPatterns = if (resolvedDir != null) {
+        externalRoutePatterns.filter { it.directionId == resolvedDir }.ifEmpty { externalRoutePatterns }
+    } else {
+        externalRoutePatterns
+    }
+    val features = selectedPatterns.mapNotNull { pattern ->
+        if (pattern.points.size < 2) return@mapNotNull null
+        val coords = pattern.points.map { Point.fromLngLat(it.lon, it.lat) }
+        Feature.fromGeometry(LineString.fromLngLats(coords))
     }
     return FeatureCollection.fromFeatures(features)
 }
@@ -795,6 +932,8 @@ internal fun buildStopsFeatureCollection(
     favoriteStopIds: Set<String>,
     selectedStopId: String?,
     colorByDirection: Boolean,
+    highlightedDirectionId: Int? = null,
+    dimAll: Boolean = false,
 ): FeatureCollection {
     if (stops.isEmpty()) return FeatureCollection.fromFeatures(emptyArray())
     val features = stops.map { stop ->
@@ -802,10 +941,12 @@ internal fun buildStopsFeatureCollection(
         val dir = if (colorByDirection) stop.directionId else 0
         val isFav = favoriteStopIds.contains(stop.stopId)
         val isSelected = stop.stopId == selectedStopId
+        val dimmed = !isSelected && (dimAll || (highlightedDirectionId != null && stop.directionId != highlightedDirectionId))
         feature.addStringProperty("stopId", stop.stopId)
         feature.addNumberProperty("dir", dir)
         feature.addBooleanProperty("isFav", isFav)
         feature.addBooleanProperty("isSelected", isSelected)
+        feature.addBooleanProperty("dimmed", dimmed)
         feature.addStringProperty("label", shortTurinPlaceName(stop.name))
         feature
     }

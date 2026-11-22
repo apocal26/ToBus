@@ -25,12 +25,14 @@ import com.example.data.model.RefreshInterval
 import com.example.data.model.RoutePattern
 import com.example.data.model.ServiceAlertInfo
 import com.example.data.model.StopArrival
+import com.example.data.model.StopSearchEntry
 import com.example.data.model.TransitStop
 import com.example.data.model.UserWidgetSettings
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.formatTurinLabel
 import com.example.data.model.shortTurinPlaceName
 import com.example.data.network.GttRealtimeRepository
+import com.example.data.network.GttStaticRouteStore
 import com.example.data.preferences.ToBusPreferences
 import com.example.map.TransitMapBitmapRenderer
 import com.example.map.WebMercator
@@ -48,6 +50,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class WidgetPreviewSize(
     val labelIt: String,
@@ -90,9 +93,12 @@ data class ToBusUiState(
     val selectedVehicleId: String? = null,
     val focusedExternalVehicle: BusVehicle? = null,
     val focusedExternalTerminus: String? = null,
+    val focusedExternalRoutePatterns: List<RoutePattern> = emptyList(),
     val selectedStop: TransitStop? = null,
     val stopArrivals: List<StopArrival> = emptyList(),
     val isLoadingStopArrivals: Boolean = false,
+    val stopSearchResults: List<StopSearchEntry> = emptyList(),
+    val isLoadingStopIndex: Boolean = false,
     val favoriteStops: List<FavoriteStop> = emptyList(),
     val stopWidgetPreviewByStopId: Map<String, List<StopArrival>> = emptyMap(),
     val isLoadingStopWidgetPreview: Boolean = false,
@@ -168,6 +174,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var stopPreviewJob: Job? = null
     private var routeLoadJob: Job? = null
     private var stopArrivalsJob: Job? = null
+    private var focusArrivalJob: Job? = null
+    private var stopSearchJob: Job? = null
     private var foregroundPollingJob: Job? = null
     private var clockTickerJob: Job? = null
     private var lastPollElapsedMs: Long = 0L
@@ -208,6 +216,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             foregroundPollingJob = null
             clockTickerJob?.cancel()
             clockTickerJob = null
+            focusArrivalJob?.cancel()
+            focusArrivalJob = null
             stopLocationUpdates()
         }
     }
@@ -657,6 +667,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 selectedVehicleId = null,
                 focusedExternalVehicle = null,
                 focusedExternalTerminus = null,
+                focusedExternalRoutePatterns = emptyList(),
                 selectedStop = null,
                 stopArrivals = emptyList(),
                 isLoadingStopArrivals = false,
@@ -784,6 +795,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     fun selectVehicle(vehicle: BusVehicle?) {
         if (vehicle != null) {
             stopArrivalsJob?.cancel()
+            focusArrivalJob?.cancel()
         }
         val flyReq = if (vehicle != null) {
             cameraFlySeq++
@@ -805,6 +817,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 selectedVehicleId = vehicle?.vehicleId,
                 focusedExternalVehicle = if (keepExternal) state.focusedExternalVehicle else null,
                 focusedExternalTerminus = if (keepExternal) state.focusedExternalTerminus else null,
+                focusedExternalRoutePatterns = if (keepExternal) state.focusedExternalRoutePatterns else emptyList(),
                 selectedStop = if (vehicle != null) null else state.selectedStop,
                 stopArrivals = if (vehicle != null) emptyList() else state.stopArrivals,
                 isLoadingStopArrivals = if (vehicle != null) false else state.isLoadingStopArrivals,
@@ -815,131 +828,116 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Locates and focuses the exact live bus corresponding to an arrival chip tapped inside a stop card
+     * Locates and focuses the EXACT live bus corresponding to an arrival chip tapped inside a stop card
      * (works both for the currently tracked line AND for any other line passing through that stop, e.g. 55 or 5).
+     *
+     * Strictly uses the TARGET line's own route geometry and direction at this stop — NEVER guesses
+     * a random "nearest straight-line bus" or opposite-direction bus.
      */
-    fun focusBusForArrival(arrival: StopArrival, indexInLine: Int) {
+    fun focusBusForArrival(arrival: StopArrival, @Suppress("UNUSED_PARAMETER") indexInLine: Int) {
         val state = _uiState.value
         val stop = state.selectedStop ?: return
-        val nowMillis = System.currentTimeMillis()
-        val allLive = repository.getLastCachedSnapshot()?.allVehicles.orEmpty().ifEmpty { state.lineVehicles }
         val targetLine = arrival.lineCode.trim().uppercase()
+        val isTrackedLine = targetLine.equals(state.settings.selectedLine, ignoreCase = true)
 
-        // 1. Exact vehicleId match
-        val exactByVehicle = arrival.vehicleId?.trim()?.takeIf { it.isNotEmpty() }?.let { vid ->
-            allLive.firstOrNull {
-                it.vehicleId.equals(vid, ignoreCase = true) || it.label.equals(vid, ignoreCase = true)
+        // Exclude vehicles already explicitly assigned to OTHER arrival chips of the same line
+        val claimedVehicleIds = state.stopArrivals
+            .asSequence()
+            .filter {
+                it !== arrival &&
+                    it.lineCode.equals(targetLine, ignoreCase = true) &&
+                    !it.vehicleId.isNullOrBlank()
             }
-        }
+            .mapNotNull { it.vehicleId?.trim()?.takeIf { id -> id.isNotEmpty() } }
+            .toSet()
 
-        // 2. Exact tripId match (normalized after ':')
-        val cleanTrip = arrival.tripId?.trim()?.substringAfterLast(":")?.takeIf { it.isNotEmpty() }
-        val exactByTrip = if (exactByVehicle == null && cleanTrip != null) {
-            allLive.firstOrNull { bus ->
-                val busTrip = bus.tripId?.trim()?.substringAfterLast(":")
-                busTrip != null && busTrip.equals(cleanTrip, ignoreCase = true)
-            }
-        } else {
-            null
-        }
-
-        // 3. Smart live matching ONLY for Live realtime arrivals (never guess a different bus for scheduled "Stimato" trips!)
-        val matchedByProximity = if (exactByVehicle == null && exactByTrip == null && arrival.isRealtime) {
-            val isTrackedLine = targetLine.equals(state.settings.selectedLine, ignoreCase = true)
-            val lineBuses = allLive.filter { bus ->
-                if (!bus.lineCode.equals(targetLine, ignoreCase = true) &&
-                    !bus.rawRouteId.equals(targetLine, ignoreCase = true)
-                ) {
-                    return@filter false
-                }
-                val patternsForBus = if (isTrackedLine) state.routePatterns else emptyList()
-                val health = com.example.data.model.GttFleetAnalyzer.assess(bus, patternsForBus, nowMillis)
-                if (!health.isReliableLive) return@filter false
-
-                // For the tracked line, strictly exclude buses heading in the opposite direction
-                if (isTrackedLine && state.routePatterns.isNotEmpty()) {
-                    val resolvedDir = com.example.data.model.GttFleetAnalyzer.resolveDirectionId(bus, state.routePatterns)
-                    if (resolvedDir != null && resolvedDir != stop.directionId) return@filter false
-                }
-                true
-            }
-            if (lineBuses.isEmpty()) {
-                null
+        focusArrivalJob?.cancel()
+        focusArrivalJob = viewModelScope.launch {
+            val nowMillis = System.currentTimeMillis()
+            val allLive = repository.getLastCachedSnapshot()?.allVehicles.orEmpty().ifEmpty { state.lineVehicles }
+            val targetLinePatterns = if (isTrackedLine) {
+                state.routePatterns
             } else {
-                val mins = arrival.minutesUntil(nowMillis).coerceAtLeast(1)
-                // Expected road distance at ~15.5 km/h urban average (~215m/min straight-line)
-                val expectedMeters = mins * 215.0
-                val maxAllowedEtaErrorMeters = maxOf(950.0, expectedMeters * 0.75)
-
-                val approaching = lineBuses.mapNotNull { bus ->
-                    val dist = haversineMeters(bus.latitude, bus.longitude, stop.lat, stop.lon)
-                    val headingPenalty = bus.bearing?.let { b ->
-                        if (dist > 150.0) {
-                            val toStop = initialBearingDeg(bus.latitude, bus.longitude, stop.lat, stop.lon)
-                            val diff = kotlin.math.abs(((b - toStop + 540.0) % 360.0) - 180.0)
-                            if (diff > 100.0) return@mapNotNull null
-                            diff * 6.0
-                        } else {
-                            0.0
-                        }
-                    } ?: 300.0
-                    val etaError = kotlin.math.abs(dist - expectedMeters)
-                    if (etaError > maxAllowedEtaErrorMeters) return@mapNotNull null
-                    Triple(bus, dist, etaError + headingPenalty)
-                }.sortedBy { it.second }
-
-                // Pick the N-th distinct approaching bus matching this arrival slot — NEVER recycle the 1-min bus for later slots!
-                if (indexInLine in approaching.indices) {
-                    approaching[indexInLine].first
-                } else {
-                    null
+                val activeTrips = allLive
+                    .asSequence()
+                    .filter {
+                        it.lineCode.equals(targetLine, ignoreCase = true) ||
+                            it.rawRouteId.equals(targetLine, ignoreCase = true)
+                    }
+                    .mapNotNull { it.tripId?.trim()?.takeIf { tid -> tid.isNotEmpty() } }
+                    .toSet()
+                withContext(Dispatchers.IO) {
+                    repository.getFastRoutePatternsForLine(targetLine, activeTrips)
                 }
             }
-        } else {
-            null
-        }
 
-        val matched = exactByVehicle ?: exactByTrip ?: matchedByProximity
-        if (matched == null) {
-            val clockStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.ITALY)
-                .format(java.util.Date(arrival.arrivalEpochSeconds * 1000L))
-            _uiState.update {
-                it.copy(
-                    statusToast = if (arrival.isRealtime) {
-                        "Posizione GPS del bus linea $targetLine ($clockStr) non ancora disponibile"
-                    } else {
-                        "Corsa programmata linea $targetLine ($clockStr) · mezzo non ancora tracciato dal vivo"
-                    },
+            // Re-check if user closed/switched stop while loading target line geometry
+            if (_uiState.value.selectedStop?.stopId != stop.stopId) return@launch
+
+            val matched = GttRealtimeRepository.findExactBusForArrival(
+                arrival = arrival,
+                stop = stop,
+                allLivePool = allLive,
+                targetLinePatterns = targetLinePatterns,
+                claimedVehicleIds = claimedVehicleIds,
+                nowMillis = System.currentTimeMillis(),
+            )
+
+            if (matched == null) {
+                val clockStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.ITALY)
+                    .format(java.util.Date(arrival.arrivalEpochSeconds * 1000L))
+                _uiState.update {
+                    it.copy(
+                        statusToast = if (arrival.isRealtime) {
+                            "Posizione GPS esatta di questa corsa (linea $targetLine, $clockStr) non disponibile"
+                        } else {
+                            "Corsa programmata linea $targetLine ($clockStr) · mezzo non ancora tracciato dal vivo"
+                        },
+                    )
+                }
+                return@launch
+            }
+
+            stopArrivalsJob?.cancel()
+            val currentState = _uiState.value
+            val isExternal = currentState.lineVehicles.none { it.vehicleId == matched.vehicleId }
+            val resolvedExtDir = if (isExternal && targetLinePatterns.isNotEmpty()) {
+                com.example.data.model.GttFleetAnalyzer.resolveDirectionId(matched, targetLinePatterns)
+                    ?: matched.directionId
+            } else {
+                null
+            }
+            val patternExtTerminus = if (isExternal && resolvedExtDir != null) {
+                targetLinePatterns.firstOrNull { it.directionId == resolvedExtDir }?.terminusName()
+            } else {
+                null
+            }
+            val cleanHeadsign = arrival.headsign
+                .takeIf { it.isNotBlank() && !it.startsWith("Linea ", ignoreCase = true) }
+                ?: patternExtTerminus
+
+            cameraFlySeq++
+            val targetCam = CameraState(
+                centerLat = matched.latitude,
+                centerLon = matched.longitude,
+                zoom = currentState.camera.zoom.coerceAtLeast(15.6).coerceAtMost(CameraState.MAX_ZOOM),
+            )
+            _uiState.update { current ->
+                current.copy(
+                    selectedStop = null,
+                    stopArrivals = emptyList(),
+                    isLoadingStopArrivals = false,
+                    selectedVehicleId = matched.vehicleId,
+                    focusedExternalVehicle = if (isExternal) matched else null,
+                    focusedExternalTerminus = if (isExternal) cleanHeadsign else null,
+                    focusedExternalRoutePatterns = if (isExternal) targetLinePatterns else emptyList(),
+                    cameraFlyRequest = CameraFlyRequest(target = targetCam, id = cameraFlySeq),
+                    nowMillis = nowMillis,
+                    statusToast = "Linea ${matched.lineCode} · Vettura #${matched.label}",
                 )
             }
-            return
+            resolveMissingVehicleStopNames(listOf(matched))
         }
-
-        stopArrivalsJob?.cancel()
-        val isExternal = state.lineVehicles.none { it.vehicleId == matched.vehicleId }
-        val cleanHeadsign = arrival.headsign
-            .takeIf { it.isNotBlank() && !it.startsWith("Linea ", ignoreCase = true) }
-
-        cameraFlySeq++
-        val targetCam = CameraState(
-            centerLat = matched.latitude,
-            centerLon = matched.longitude,
-            zoom = _uiState.value.camera.zoom.coerceAtLeast(15.6).coerceAtMost(CameraState.MAX_ZOOM),
-        )
-        _uiState.update { current ->
-            current.copy(
-                selectedStop = null,
-                stopArrivals = emptyList(),
-                isLoadingStopArrivals = false,
-                selectedVehicleId = matched.vehicleId,
-                focusedExternalVehicle = if (isExternal) matched else null,
-                focusedExternalTerminus = if (isExternal) cleanHeadsign else null,
-                cameraFlyRequest = CameraFlyRequest(target = targetCam, id = cameraFlySeq),
-                nowMillis = nowMillis,
-                statusToast = "Linea ${matched.lineCode} · Vettura #${matched.label}",
-            )
-        }
-        resolveMissingVehicleStopNames(listOf(matched))
     }
 
     private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
@@ -952,18 +950,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         return r * 2.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1.0 - a))
     }
 
-    private fun initialBearingDeg(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val phi1 = Math.toRadians(lat1)
-        val phi2 = Math.toRadians(lat2)
-        val dLambda = Math.toRadians(lon2 - lon1)
-        val y = kotlin.math.sin(dLambda) * kotlin.math.cos(phi2)
-        val x = kotlin.math.cos(phi1) * kotlin.math.sin(phi2) -
-            kotlin.math.sin(phi1) * kotlin.math.cos(phi2) * kotlin.math.cos(dLambda)
-        return (Math.toDegrees(kotlin.math.atan2(y, x)) + 360.0) % 360.0
-    }
-
     fun selectStop(stop: TransitStop?) {
         stopArrivalsJob?.cancel()
+        focusArrivalJob?.cancel()
         if (stop == null) {
             _uiState.update {
                 it.copy(
@@ -980,6 +969,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 selectedVehicleId = null,
                 focusedExternalVehicle = null,
                 focusedExternalTerminus = null,
+                focusedExternalRoutePatterns = emptyList(),
                 selectedStop = stop,
                 stopArrivals = emptyList(),
                 isLoadingStopArrivals = true,
@@ -987,6 +977,65 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         refreshSelectedStopArrivals(silent = false)
+    }
+
+    /**
+     * Searches all Turin GTT stops locally from the cached GTFS directory (matching stop name,
+     * palina number, headsign, and serving lines together so homonymous stops are unambiguous).
+     */
+    fun searchStops(query: String) {
+        stopSearchJob?.cancel()
+        stopSearchJob = viewModelScope.launch {
+            val state = _uiState.value
+            if (state.stopSearchResults.isEmpty()) {
+                _uiState.update { it.copy(isLoadingStopIndex = true) }
+            }
+            val index = withContext(Dispatchers.IO) {
+                repository.getStopSearchIndex()
+            }
+            val current = _uiState.value
+            val matches = withContext(Dispatchers.Default) {
+                GttStaticRouteStore.searchStops(
+                    index = index,
+                    query = query,
+                    preferredLine = current.settings.selectedLine,
+                    userLat = current.userLocation?.lat,
+                    userLon = current.userLocation?.lon,
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    stopSearchResults = matches,
+                    isLoadingStopIndex = false,
+                )
+            }
+        }
+    }
+
+    /**
+     * Opens any stop selected from the global Stop Search sheet, centers the camera on that exact pole,
+     * and loads its real-time arrivals without cluttering or unexpectedly replacing the active line.
+     */
+    fun openSearchedStop(entry: StopSearchEntry) {
+        val state = _uiState.value
+        val baseStop = entry.toTransitStop(directionId = 0)
+        val resolvedDirOnCurrentLine = GttRealtimeRepository.resolveStopDirectionOnLinePatterns(
+            stop = baseStop,
+            linePatterns = state.routePatterns,
+        )
+        val stop = baseStop.copy(directionId = resolvedDirOnCurrentLine ?: 0)
+        cameraFlySeq++
+        val targetCam = CameraState(
+            centerLat = stop.lat,
+            centerLon = stop.lon,
+            zoom = state.camera.zoom.coerceAtLeast(15.6).coerceAtMost(CameraState.MAX_ZOOM),
+        )
+        _uiState.update { current ->
+            current.copy(
+                cameraFlyRequest = CameraFlyRequest(target = targetCam, id = cameraFlySeq),
+            )
+        }
+        selectStop(stop)
     }
 
     fun refreshSelectedStopArrivals(silent: Boolean = false) {

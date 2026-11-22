@@ -216,6 +216,7 @@ fun ToBusApp(
                         onToggleFavoriteStop = viewModel::toggleFavoriteStop,
                         onOpenFavoriteStop = viewModel::openFavoriteStop,
                         onFocusArrivalBus = viewModel::focusBusForArrival,
+                        onSelectLine = viewModel::selectLine,
                     )
 
                     AppDestination.WIDGET -> WidgetStudioScreen(
@@ -288,7 +289,15 @@ fun ToBusApp(
         LinePickerSheet(
             selectedLine = uiState.settings.selectedLine,
             activeLines = uiState.allActiveLines,
+            stopSearchResults = uiState.stopSearchResults,
+            isLoadingStopIndex = uiState.isLoadingStopIndex,
+            userLocation = uiState.userLocation,
             onSelectLine = viewModel::selectLine,
+            onSearchStops = viewModel::searchStops,
+            onSelectStop = { entry ->
+                currentTab = AppDestination.MAP
+                viewModel.openSearchedStop(entry)
+            },
             onDismiss = { showLinePicker = false },
         )
     }

@@ -5,6 +5,7 @@ import android.util.Log
 import com.example.data.model.GeoPoint
 import com.example.data.model.RoutePattern
 import com.example.data.model.StopArrival
+import com.example.data.model.StopSearchEntry
 import com.example.data.model.TransitStop
 import java.util.Calendar
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +34,11 @@ class GttStaticRouteStore(context: Context) {
     private val gtfsDir = File(context.applicationContext.filesDir, "gtt_gtfs").apply { mkdirs() }
     private val gtfsZipFile = File(gtfsDir, "gtt_gtfs.zip")
     private val downloadMutex = Mutex()
+    private val stopIndexMutex = Mutex()
+    @Volatile
+    private var cachedStopSearchIndex: List<StopSearchEntry>? = null
+    @Volatile
+    private var cachedStopIndexZipStamp: Long = 0L
 
     private val downloadClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -101,6 +107,40 @@ class GttStaticRouteStore(context: Context) {
         } catch (e: Exception) {
             Log.d(TAG, "Lookup nomi fermate fallito: ${e.message}")
             emptyMap()
+        }
+    }
+
+    /**
+     * Builds (and caches in RAM) an indexed directory of all Turin GTFS stops enriched with
+     * the exact lines and primary headsigns serving each individual physical pole (`palina`).
+     */
+    suspend fun getStopSearchIndex(
+        nowMillis: Long = System.currentTimeMillis(),
+    ): List<StopSearchEntry> = withContext(Dispatchers.IO) {
+        val zipFile = if (gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES) {
+            gtfsZipFile
+        } else {
+            ensureGtfsZipReady() ?: return@withContext emptyList()
+        }
+        val stamp = zipFile.lastModified()
+        cachedStopSearchIndex?.let { cached ->
+            if (cached.isNotEmpty() && cachedStopIndexZipStamp == stamp) return@withContext cached
+        }
+        stopIndexMutex.withLock {
+            cachedStopSearchIndex?.let { cached ->
+                if (cached.isNotEmpty() && cachedStopIndexZipStamp == stamp) return@withContext cached
+            }
+            val built = try {
+                extractStopSearchIndexFromZip(zipFile, nowMillis)
+            } catch (e: Exception) {
+                Log.w(TAG, "Costruzione indice fermate fallita: ${e.message}")
+                emptyList()
+            }
+            if (built.isNotEmpty()) {
+                cachedStopSearchIndex = built
+                cachedStopIndexZipStamp = stamp
+            }
+            built
         }
     }
 
@@ -1004,6 +1044,278 @@ class GttStaticRouteStore(context: Context) {
         }
         if (out.last() != points.last()) out.add(points.last())
         return out
+    }
+
+    /**
+     * Pure-Kotlin builder extracting every Turin physical stop (`palina`) along with the exact lines
+     * and headsigns serving that specific pole from [zipFile].
+     * Uses 1 representative trip per `(routeId, directionId, shapeId)` so scanning `stop_times.txt`
+     * covers all variants/detours in ~60-100 ms with low memory footprint.
+     */
+    internal fun extractStopSearchIndexFromZip(
+        zipFile: File,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): List<StopSearchEntry> {
+        ZipFile(zipFile).use { zip ->
+            val routesEntry = zip.getEntry("routes.txt") ?: return emptyList()
+            val tripsEntry = zip.getEntry("trips.txt") ?: return emptyList()
+            val stopTimesEntry = zip.getEntry("stop_times.txt") ?: return emptyList()
+            val stopsEntry = zip.getEntry("stops.txt") ?: return emptyList()
+
+            val romeTz = java.util.TimeZone.getTimeZone("Europe/Rome")
+            val cal = Calendar.getInstance(romeTz).apply { timeInMillis = nowMillis }
+            val yyyymmdd = cal.get(Calendar.YEAR) * 10000 +
+                (cal.get(Calendar.MONTH) + 1) * 100 +
+                cal.get(Calendar.DAY_OF_MONTH)
+            val activeServiceIds = resolveActiveServiceIds(zip, yyyymmdd, gtfsDayColumnName(cal.get(Calendar.DAY_OF_WEEK)))
+
+            // 1. routeId -> clean short line code (e.g. "12U" -> "12")
+            val routeCodeById = HashMap<String, String>(256)
+            zip.getInputStream(routesEntry).use { stream ->
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 16 * 1024).use { reader ->
+                    val cols = parseCsvHeader(reader.readLine() ?: return@use)
+                    val idxId = cols["route_id"] ?: return@use
+                    val idxShort = cols["route_short_name"]
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) {
+                            val f = parseCsvLine(line)
+                            val rid = f.getOrNull(idxId)?.trim().orEmpty()
+                            val rawShort = idxShort?.let { f.getOrNull(it)?.trim() }.orEmpty()
+                            if (rid.isNotEmpty()) {
+                                val normalized = GtfsRtProtobufParser.normalizeGttLineCode(
+                                    rawShort.ifBlank { rid },
+                                ).ifBlank { rawShort.ifBlank { rid }.uppercase() }
+                                routeCodeById[rid] = normalized
+                            }
+                        }
+                        line = reader.readLine()
+                    }
+                }
+            }
+
+            // 2. Pick 1 representative trip per (routeId, directionId, shapeId/headsign)
+            //    preferring trips active today, with automatic fallback if a variant runs other days.
+            data class RepTrip(val lineCode: String, val headsign: String, val isToday: Boolean)
+            val chosenByVariantKey = HashMap<String, Pair<String, RepTrip>>(2048)
+            zip.getInputStream(tripsEntry).use { stream ->
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 32 * 1024).use { reader ->
+                    val cols = parseCsvHeader(reader.readLine() ?: return@use)
+                    val idxRoute = cols["route_id"] ?: return@use
+                    val idxTrip = cols["trip_id"] ?: return@use
+                    val idxService = cols["service_id"]
+                    val idxDir = cols["direction_id"]
+                    val idxShape = cols["shape_id"]
+                    val idxHeadsign = cols["trip_headsign"]
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) {
+                            val f = parseCsvLine(line)
+                            val rid = f.getOrNull(idxRoute)?.trim().orEmpty()
+                            val tid = f.getOrNull(idxTrip)?.trim().orEmpty()
+                            val lineCode = routeCodeById[rid]
+                            if (tid.isNotEmpty() && lineCode != null) {
+                                val sid = idxService?.let { f.getOrNull(it)?.trim() }.orEmpty()
+                                val dir = idxDir?.let { f.getOrNull(it)?.trim() }.orEmpty()
+                                val shape = idxShape?.let { f.getOrNull(it)?.trim() }.orEmpty()
+                                val headsign = idxHeadsign?.let { f.getOrNull(it)?.trim() }.orEmpty()
+                                val isToday = activeServiceIds.isEmpty() || sid in activeServiceIds
+                                val variantKey = "$rid|$dir|${shape.ifBlank { headsign }}"
+                                val prev = chosenByVariantKey[variantKey]
+                                if (prev == null || (!prev.second.isToday && isToday)) {
+                                    chosenByVariantKey[variantKey] = tid to RepTrip(lineCode, headsign, isToday)
+                                }
+                            }
+                        }
+                        line = reader.readLine()
+                    }
+                }
+            }
+
+            val repByTripId = HashMap<String, RepTrip>(chosenByVariantKey.size * 2)
+            for ((tid, meta) in chosenByVariantKey.values) {
+                repByTripId[tid] = meta
+            }
+
+            // 3. Stream stop_times.txt once to map stopId -> lines & primary headsigns
+            val linesByStop = HashMap<String, LinkedHashSet<String>>(4096)
+            val headsignsByStop = HashMap<String, LinkedHashSet<String>>(4096)
+            zip.getInputStream(stopTimesEntry).use { stream ->
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 64 * 1024).use { reader ->
+                    val cols = parseCsvHeader(reader.readLine() ?: return@use)
+                    val idxTrip = cols["trip_id"] ?: return@use
+                    val idxStop = cols["stop_id"] ?: return@use
+                    val idxPickup = cols["pickup_type"]
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) {
+                            val f = parseCsvLine(line)
+                            val tid = f.getOrNull(idxTrip)?.trim().orEmpty()
+                            val meta = repByTripId[tid]
+                            if (meta != null) {
+                                val pickup = idxPickup?.let { f.getOrNull(it)?.trim() }
+                                if (pickup != "1") {
+                                    val sid = f.getOrNull(idxStop)?.trim().orEmpty()
+                                    if (sid.isNotEmpty()) {
+                                        linesByStop.getOrPut(sid) { LinkedHashSet(4) }.add(meta.lineCode)
+                                        if (meta.headsign.isNotBlank()) {
+                                            val cleanHead = com.example.data.model.shortTurinPlaceName(meta.headsign)
+                                            if (cleanHead.isNotBlank()) {
+                                                headsignsByStop.getOrPut(sid) { LinkedHashSet(3) }.add(cleanHead)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        line = reader.readLine()
+                    }
+                }
+            }
+
+            // 4. Stream stops.txt and assemble StopSearchEntry list
+            val out = ArrayList<StopSearchEntry>(linesByStop.size.coerceAtLeast(256))
+            val lineSortComparator = compareBy<String>(
+                { it.takeWhile { c -> c.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE },
+                { it },
+            )
+            zip.getInputStream(stopsEntry).use { stream ->
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 32 * 1024).use { reader ->
+                    val cols = parseCsvHeader(reader.readLine() ?: return@use)
+                    val idxId = cols["stop_id"] ?: return@use
+                    val idxCode = cols["stop_code"]
+                    val idxName = cols["stop_name"] ?: return@use
+                    val idxLat = cols["stop_lat"] ?: return@use
+                    val idxLon = cols["stop_lon"] ?: return@use
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) {
+                            val f = parseCsvLine(line)
+                            val sid = f.getOrNull(idxId)?.trim().orEmpty()
+                            val scode = idxCode?.let { f.getOrNull(it)?.trim() }.orEmpty().ifBlank { sid }
+                            val name = f.getOrNull(idxName)?.trim().orEmpty()
+                            val lat = f.getOrNull(idxLat)?.trim()?.toDoubleOrNull()
+                            val lon = f.getOrNull(idxLon)?.trim()?.toDoubleOrNull()
+                            if (sid.isNotEmpty() && name.isNotEmpty() && lat != null && lon != null &&
+                                lat in 44.80..45.35 && lon in 7.30..8.00
+                            ) {
+                                val stopLines = linesByStop[sid]?.sortedWith(lineSortComparator).orEmpty()
+                                // Keep stops that actually have at least one bus/tram line serving them
+                                if (stopLines.isNotEmpty()) {
+                                    val heads = headsignsByStop[sid]?.take(2).orEmpty()
+                                    out.add(
+                                        StopSearchEntry(
+                                            stopId = sid,
+                                            stopCode = scode,
+                                            name = name,
+                                            lat = lat,
+                                            lon = lon,
+                                            lines = stopLines,
+                                            headsigns = heads,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                        line = reader.readLine()
+                    }
+                }
+            }
+            return out
+        }
+    }
+
+    /**
+     * Multi-token stop search supporting stop names, palina numbers, and line numbers together
+     * (e.g. `"317"`, `"porta nuova"`, or `"porta nuova 12"`).
+     * When [query] is blank and user GPS is available, returns the closest physical poles nearby.
+     */
+    internal fun searchStops(
+        index: List<StopSearchEntry>,
+        query: String,
+        preferredLine: String,
+        userLat: Double? = null,
+        userLon: Double? = null,
+        limit: Int = 24,
+    ): List<StopSearchEntry> {
+        if (index.isEmpty()) return emptyList()
+        val normPref = normalizeLineKey(preferredLine)
+        val trimmed = query.trim().lowercase(java.util.Locale.ITALY)
+
+        fun distMeters(e: StopSearchEntry): Double {
+            if (userLat == null || userLon == null) return 100_000.0
+            return com.example.data.model.GttFleetAnalyzer.haversineMeters(userLat, userLon, e.lat, e.lon)
+        }
+
+        if (trimmed.isEmpty()) {
+            return if (userLat != null && userLon != null) {
+                index.asSequence()
+                    .map { it to distMeters(it) }
+                    .filter { it.second <= 2_500.0 }
+                    .sortedBy { it.second }
+                    .take(14)
+                    .map { it.first }
+                    .toList()
+            } else {
+                index.asSequence()
+                    .filter { e -> e.lines.any { normalizeLineKey(it) == normPref } }
+                    .sortedBy { it.name }
+                    .take(14)
+                    .toList()
+            }
+        }
+
+        val tokens = trimmed
+            .replace("#", " ")
+            .split(Regex("\\s+"))
+            .filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return emptyList()
+
+        val scored = ArrayList<Pair<StopSearchEntry, Double>>(64)
+        for (entry in index) {
+            val codeLower = entry.stopCode.lowercase(java.util.Locale.ITALY)
+            val idLower = entry.stopId.lowercase(java.util.Locale.ITALY)
+            val nameLower = entry.name.lowercase(java.util.Locale.ITALY)
+            val headLower = entry.headsigns.joinToString(" ").lowercase(java.util.Locale.ITALY)
+            val linesLower = entry.lines.map { it.lowercase(java.util.Locale.ITALY) }
+
+            var allMatch = true
+            var score = 0.0
+            for (tok in tokens) {
+                when {
+                    codeLower == tok || idLower == tok -> score += 120.0
+                    linesLower.any { it == tok } -> score += 55.0
+                    nameLower.startsWith(tok) -> score += 70.0
+                    codeLower.startsWith(tok) -> score += 65.0
+                    nameLower.contains(tok) -> score += 45.0
+                    headLower.contains(tok) -> score += 28.0
+                    else -> {
+                        allMatch = false
+                        break
+                    }
+                }
+            }
+            if (!allMatch) continue
+
+            if (entry.lines.any { normalizeLineKey(it) == normPref }) {
+                score += 18.0
+            }
+            if (userLat != null && userLon != null) {
+                val d = distMeters(entry)
+                // Gentle proximity bonus (up to +20 pts for stops right next to the user)
+                score += (20.0 * (1.0 - (d / 4_000.0).coerceIn(0.0, 1.0)))
+            }
+            scored.add(entry to score)
+        }
+
+        return scored
+            .sortedWith(
+                compareByDescending<Pair<StopSearchEntry, Double>> { it.second }
+                    .thenBy { distMeters(it.first) }
+                    .thenBy { it.first.stopCode },
+            )
+            .take(limit)
+            .map { it.first }
     }
     }
 }

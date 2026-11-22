@@ -546,4 +546,263 @@ class StopArrivalsCalendarAndDedupTest {
         assertTrue(reconciled.none { it.lineCode == "55" })
         assertTrue(reconciled.none { it.lineCode == "99" })
     }
+
+    @Test
+    fun resolveStopDirectionOnLinePatternsHandlesInvertedDirectionIdsAndAmbiguousStreets() {
+        // Physical stop #317 is directionId = 1 on Line 12,
+        // but the SAME physical pole is directionId = 0 on Line 55!
+        val stopOnLine12 = TransitStop(
+            stopId = "317",
+            stopCode = "317",
+            name = "Santa Rita",
+            lat = 45.0500,
+            lon = 7.6500,
+            directionId = 1,
+            sequence = 5,
+        )
+        val northPoly = listOf(
+            GeoPoint(45.0250, 7.6500),
+            GeoPoint(45.0500, 7.6500),
+            GeoPoint(45.0750, 7.6500),
+        )
+        val line55Patterns = listOf(
+            RoutePattern(
+                id = "55_dir0",
+                name = "Linea 55 -> Vanchiglia",
+                directionId = 0, // Inverted numeric directionId vs Line 12!
+                segments = listOf(northPoly),
+                stops = listOf(stopOnLine12.copy(directionId = 0)),
+            ),
+            RoutePattern(
+                id = "55_dir1",
+                name = "Linea 55 -> Gerbido",
+                directionId = 1,
+                segments = listOf(northPoly.reversed()),
+                stops = listOf(
+                    TransitStop("318", "318", "Santa Rita Opp", 45.0505, 7.6506, directionId = 1, sequence = 5),
+                ),
+            ),
+        )
+
+        assertEquals(0, GttRealtimeRepository.resolveStopDirectionOnLinePatterns(stopOnLine12, line55Patterns))
+
+        // On an ambiguous two-way street where neither pattern lists the stop and both overlap at the exact same coords -> null
+        val ambiguousPatterns = listOf(
+            RoutePattern("99_0", "Dir 0", 0, listOf(northPoly), emptyList()),
+            RoutePattern("99_1", "Dir 1", 1, listOf(northPoly.reversed()), emptyList()),
+        )
+        assertNull(GttRealtimeRepository.resolveStopDirectionOnLinePatterns(stopOnLine12, ambiguousPatterns))
+    }
+
+    @Test
+    fun crossLineOtherLine55FocusAndReconcileNeverPicksNearestOppositeDirectionBus() {
+        val nowMillis = 1_795_334_400_000L
+        val nowSec = nowMillis / 1000L
+
+        // User is currently tracking Line 12 and taps stop #317 (directionId = 1 on Line 12)
+        val stopOnLine12 = TransitStop(
+            stopId = "317",
+            stopCode = "317",
+            name = "Santa Rita",
+            lat = 45.0500,
+            lon = 7.6500,
+            directionId = 1,
+            sequence = 5,
+        )
+        val line12NorthPoly = listOf(
+            GeoPoint(45.0300, 7.6500),
+            GeoPoint(45.0500, 7.6500),
+            GeoPoint(45.0700, 7.6500),
+        )
+        val line12Patterns = listOf(
+            RoutePattern("12_1", "Linea 12 -> Porta Nuova", 1, listOf(line12NorthPoly), listOf(stopOnLine12)),
+            RoutePattern("12_0", "Linea 12 -> Allamano", 0, listOf(line12NorthPoly.reversed()), emptyList()),
+        )
+
+        // Line 55 serves the EXACT same stop #317 going NORTH, but its GTFS directionId is 0 (opposite number!)
+        val line55Patterns = listOf(
+            RoutePattern(
+                id = "55_0",
+                name = "Linea 55 -> Vanchiglia",
+                directionId = 0,
+                segments = listOf(line12NorthPoly),
+                stops = listOf(stopOnLine12.copy(directionId = 0)),
+            ),
+            RoutePattern(
+                id = "55_1",
+                name = "Linea 55 -> Gerbido",
+                directionId = 1,
+                segments = listOf(line12NorthPoly.reversed()),
+                stops = listOf(
+                    TransitStop("318", "318", "Santa Rita Opp", 45.0506, 7.6506, directionId = 1, sequence = 5),
+                ),
+            ),
+        )
+
+        // Bus #5501 (Line 55): ONLY ~120m away from stop #317, BUT travelling SOUTH (OPPOSITE directionId = 1)!
+        val bus55OppositeNearby = BusVehicle(
+            entityId = "e5501",
+            vehicleId = "5501",
+            label = "5501",
+            lineCode = "55",
+            rawRouteId = "55U",
+            tripId = null,
+            latitude = 45.0511,
+            longitude = 7.6500,
+            bearing = 180f, // Heading South (opposite!)
+            speedKmh = 20f,
+            directionId = 1, // Line 55's opposite direction!
+            timestampSeconds = nowSec - 4L,
+            stopId = null,
+            status = VehicleStopStatus.IN_TRANSIT_TO,
+        )
+        // Bus #5502 (Line 55): ~2.0 km upstream heading NORTH (CORRECT directionId = 0, ~7-8 min away)
+        val bus55CorrectUpstream = BusVehicle(
+            entityId = "e5502",
+            vehicleId = "5502",
+            label = "5502",
+            lineCode = "55",
+            rawRouteId = "55U",
+            tripId = null,
+            latitude = 45.0320,
+            longitude = 7.6500,
+            bearing = 0f, // Heading North (toward stop!)
+            speedKmh = 18f,
+            directionId = 0, // Line 55's true direction at stop #317!
+            timestampSeconds = nowSec - 4L,
+            stopId = null,
+            status = VehicleStopStatus.IN_TRANSIT_TO,
+        )
+
+        val allLivePool = listOf(bus55OppositeNearby, bus55CorrectUpstream)
+
+        // 1. Reconcile stop arrivals with otherLinePatterns["55"] -> links the 8-min arrival to #5502, NEVER #5501
+        val rawFeed = listOf(
+            StopArrival(
+                lineCode = "55",
+                headsign = "Vanchiglia",
+                arrivalEpochSeconds = nowSec + 8L * 60L,
+                isRealtime = true,
+                vehicleId = null,
+                sourceLabel = "GTT Palina",
+            ),
+        )
+        val reconciled = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stopOnLine12,
+            preferredLine = "12",
+            liveVehicles = emptyList(),
+            allLivePool = allLivePool,
+            routePatterns = line12Patterns,
+            rawArrivals = rawFeed,
+            nowMillis = nowMillis,
+            otherLinePatterns = mapOf("55" to line55Patterns),
+        )
+        val line55Arrivals = reconciled.filter { it.lineCode == "55" }
+        assertEquals(1, line55Arrivals.size)
+        assertEquals("5502", line55Arrivals.first().vehicleId)
+
+        // 2. Tapping the 8-min arrival focuses #5502 (NEVER the closer opposite-direction #5501!)
+        val focusedFor8Min = GttRealtimeRepository.findExactBusForArrival(
+            arrival = rawFeed.first(),
+            stop = stopOnLine12,
+            allLivePool = allLivePool,
+            targetLinePatterns = line55Patterns,
+            nowMillis = nowMillis,
+        )
+        assertNotNull(focusedFor8Min)
+        assertEquals("5502", focusedFor8Min!!.vehicleId)
+
+        // 3. Tapping an unlinked 2-min arrival where ONLY opposite-direction #5501 is nearby MUST return null (NEVER #5501 or #5502!)
+        val unlinked2Min = StopArrival(
+            lineCode = "55",
+            headsign = "Vanchiglia",
+            arrivalEpochSeconds = nowSec + 2L * 60L,
+            isRealtime = true,
+            vehicleId = null,
+            sourceLabel = "GTT Palina",
+        )
+        val focusedFor2Min = GttRealtimeRepository.findExactBusForArrival(
+            arrival = unlinked2Min,
+            stop = stopOnLine12,
+            allLivePool = allLivePool,
+            targetLinePatterns = line55Patterns,
+            claimedVehicleIds = setOf("5502"),
+            nowMillis = nowMillis,
+        )
+        assertNull("Must NEVER jump to nearby opposite-direction bus #5501!", focusedFor2Min)
+    }
+
+    @Test
+    fun stopSearchIndexDisambiguatesHomonymousStopsByLineAndPalinaCode() {
+        val zipFile = File.createTempFile("gtt_stop_search_test_", ".zip")
+        try {
+            ZipOutputStream(zipFile.outputStream()).use { zos ->
+                fun putEntry(name: String, content: String) {
+                    zos.putNextEntry(ZipEntry(name))
+                    zos.write(content.toByteArray(Charsets.UTF_8))
+                    zos.closeEntry()
+                }
+                putEntry(
+                    "routes.txt",
+                    """
+                    route_id,route_short_name
+                    12U,12
+                    55U,55
+                    4U,4
+                    15U,15
+                    """.trimIndent(),
+                )
+                putEntry(
+                    "trips.txt",
+                    """
+                    route_id,service_id,trip_id,trip_headsign,direction_id,shape_id
+                    12U,ALL,T12_0,ALLAMANO,0,S12_0
+                    55U,ALL,T55_0,VANCHIGLIA,0,S55_0
+                    4U,ALL,T4_0,FALCHERA,0,S4_0
+                    15U,ALL,T15_0,SASSI,0,S15_0
+                    """.trimIndent(),
+                )
+                putEntry(
+                    "stop_times.txt",
+                    """
+                    trip_id,arrival_time,departure_time,stop_id,stop_sequence,pickup_type
+                    T12_0,09:00:00,09:00:00,39,1,0
+                    T55_0,09:00:00,09:00:00,39,1,0
+                    T4_0,09:00:00,09:00:00,40,1,0
+                    T15_0,09:00:00,09:00:00,40,1,0
+                    """.trimIndent(),
+                )
+                putEntry(
+                    "stops.txt",
+                    """
+                    stop_id,stop_code,stop_name,stop_lat,stop_lon
+                    39,39,PORTA NUOVA,45.0628,7.6788
+                    40,40,PORTA NUOVA,45.0632,7.6795
+                    """.trimIndent(),
+                )
+            }
+
+            val index = GttStaticRouteStore.extractStopSearchIndexFromZip(zipFile)
+            assertEquals(2, index.size)
+
+            val pole39 = index.first { it.stopCode == "39" }
+            assertEquals(listOf("12", "55"), pole39.lines)
+            assertTrue(pole39.headsigns.any { it.contains("Allamano", ignoreCase = true) })
+
+            val pole40 = index.first { it.stopCode == "40" }
+            assertEquals(listOf("4", "15"), pole40.lines)
+
+            // Multi-token query "porta nuova 12" filters immediately to ONLY pole #39!
+            val onlyLine12 = GttStaticRouteStore.searchStops(index, "porta nuova 12", preferredLine = "12")
+            assertEquals(1, onlyLine12.size)
+            assertEquals("39", onlyLine12.first().stopCode)
+
+            // Searching "#40" puts pole #40 first!
+            val byCode = GttStaticRouteStore.searchStops(index, "#40", preferredLine = "12")
+            assertEquals(1, byCode.size)
+            assertEquals("40", byCode.first().stopCode)
+        } finally {
+            zipFile.delete()
+        }
+    }
 }

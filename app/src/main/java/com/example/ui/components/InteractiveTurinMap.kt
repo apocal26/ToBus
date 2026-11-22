@@ -86,11 +86,13 @@ fun InteractiveTurinMap(
     mapStyle: MapStyle,
     vehicles: List<BusVehicle>,
     focusedExternalVehicle: BusVehicle? = null,
+    focusedExternalRoutePatterns: List<RoutePattern> = emptyList(),
     userLocation: UserLocationState? = null,
     cameraFlyRequest: CameraFlyRequest? = null,
     routePatterns: List<RoutePattern>,
     favoriteStopIds: Set<String>,
     selectedVehicleId: String?,
+    selectedStop: TransitStop? = null,
     selectedStopId: String?,
     nowMillis: Long,
     isForegroundActive: Boolean,
@@ -123,10 +125,15 @@ fun InteractiveTurinMap(
         if (activeExternalBus != null) vehicles + activeExternalBus else vehicles
     }
 
-    val visibleStops = remember(routePatterns) {
-        routePatterns
+    val visibleStops = remember(routePatterns, selectedStop) {
+        val base = routePatterns
             .flatMap { it.stops }
             .distinctBy { "${it.stopId}_${it.directionId}" }
+        if (selectedStop != null && base.none { it.stopId == selectedStop.stopId }) {
+            base + selectedStop
+        } else {
+            base
+        }
     }
 
     val busHealthById = remember(vehicles, routePatterns, nowMillis) {
@@ -142,6 +149,16 @@ fun InteractiveTurinMap(
     val resolvedDirectionById = remember(vehicles, routePatterns) {
         vehicles.associate { bus ->
             bus.vehicleId to GttFleetAnalyzer.resolveDirectionId(bus, routePatterns)
+        }
+    }
+
+    val hasExternalRouteFocus = activeExternalBus != null && focusedExternalRoutePatterns.isNotEmpty()
+    val highlightedMainDirectionId = remember(selectedVehicleId, activeExternalBus, resolvedDirectionById, vehicles) {
+        if (selectedVehicleId == null || activeExternalBus != null) {
+            null
+        } else {
+            resolvedDirectionById[selectedVehicleId]
+                ?: vehicles.firstOrNull { it.vehicleId == selectedVehicleId }?.directionId
         }
     }
 
@@ -449,12 +466,27 @@ fun InteractiveTurinMap(
         map.animateCamera(CameraUpdateFactory.newCameraPosition(targetPos), 460)
     }
 
-    // Update Route Polylines & visibility
-    LaunchedEffect(activeStyle, styleReadyTick, routePatterns, colorByDirection, showRouteLine) {
+    // Update Route Polylines & visibility (highlighting selected bus direction or dimming when inspecting external bus)
+    LaunchedEffect(
+        activeStyle,
+        styleReadyTick,
+        routePatterns,
+        colorByDirection,
+        showRouteLine,
+        highlightedMainDirectionId,
+        hasExternalRouteFocus,
+    ) {
         val style = activeStyle ?: return@LaunchedEffect
         if (!style.isFullyLoaded) return@LaunchedEffect
         val source = style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.ROUTE_SOURCE)
-        source?.setGeoJson(buildRoutesFeatureCollection(routePatterns, colorByDirection))
+        source?.setGeoJson(
+            buildRoutesFeatureCollection(
+                routePatterns = routePatterns,
+                colorByDirection = colorByDirection,
+                highlightedDirectionId = highlightedMainDirectionId,
+                dimAll = hasExternalRouteFocus,
+            ),
+        )
 
         val vis = if (showRouteLine) Property.VISIBLE else Property.NONE
         style.getLayer(MapLibreTransitIds.ROUTE_CASING_LAYER)?.setProperties(PropertyFactory.visibility(vis))
@@ -462,8 +494,41 @@ fun InteractiveTurinMap(
         style.getLayer(MapLibreTransitIds.ROUTE_CORE_LAYER)?.setProperties(PropertyFactory.visibility(vis))
     }
 
+    // Update Focused External Bus Route Overlay (e.g. showing Line 55's exact path when focusing a Line 55 bus)
+    LaunchedEffect(
+        activeStyle,
+        styleReadyTick,
+        activeExternalBus,
+        focusedExternalRoutePatterns,
+    ) {
+        val style = activeStyle ?: return@LaunchedEffect
+        if (!style.isFullyLoaded) return@LaunchedEffect
+        val source = style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE)
+        val fc = buildExternalRouteFeatureCollection(activeExternalBus, focusedExternalRoutePatterns)
+        source?.setGeoJson(fc)
+
+        val vis = if (activeExternalBus != null && focusedExternalRoutePatterns.isNotEmpty()) {
+            Property.VISIBLE
+        } else {
+            Property.NONE
+        }
+        style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_CASING_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+        style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_GLOW_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+        style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_CORE_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+    }
+
     // Update Stops & visibility
-    LaunchedEffect(activeStyle, styleReadyTick, visibleStops, favoriteStopIds, selectedStopId, colorByDirection, showRouteLine) {
+    LaunchedEffect(
+        activeStyle,
+        styleReadyTick,
+        visibleStops,
+        favoriteStopIds,
+        selectedStopId,
+        colorByDirection,
+        showRouteLine,
+        highlightedMainDirectionId,
+        hasExternalRouteFocus,
+    ) {
         val style = activeStyle ?: return@LaunchedEffect
         if (!style.isFullyLoaded) return@LaunchedEffect
         val source = style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.STOPS_SOURCE)
@@ -473,9 +538,11 @@ fun InteractiveTurinMap(
                 favoriteStopIds = favoriteStopIds,
                 selectedStopId = selectedStopId,
                 colorByDirection = colorByDirection,
+                highlightedDirectionId = highlightedMainDirectionId,
+                dimAll = hasExternalRouteFocus,
             ),
         )
-        val vis = if (showRouteLine) Property.VISIBLE else Property.NONE
+        val vis = if (showRouteLine || selectedStopId != null) Property.VISIBLE else Property.NONE
         style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.STOPS_DOT_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.STOPS_SELECTED_LABEL_LAYER)?.setProperties(PropertyFactory.visibility(vis))

@@ -479,6 +479,26 @@ data class LineSummary(
     val activeVehicleCount: Int,
 )
 
+data class StopSearchEntry(
+    val stopId: String,
+    val stopCode: String,
+    val name: String,
+    val lat: Double,
+    val lon: Double,
+    val lines: List<String> = emptyList(),
+    val headsigns: List<String> = emptyList(),
+) {
+    fun toTransitStop(directionId: Int = 0): TransitStop = TransitStop(
+        stopId = stopId,
+        stopCode = stopCode.ifBlank { stopId },
+        name = name,
+        lat = lat,
+        lon = lon,
+        directionId = directionId,
+        sequence = 0,
+    )
+}
+
 data class LiveFeedSnapshot(
     val feedTimestampSeconds: Long,
     val fetchedAtMillis: Long,

@@ -144,6 +144,7 @@ fun MapScreen(
     onToggleFavoriteStop: (TransitStop) -> Unit,
     onOpenFavoriteStop: (FavoriteStop) -> Unit,
     onFocusArrivalBus: (StopArrival, Int) -> Unit,
+    onSelectLine: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -218,10 +219,12 @@ fun MapScreen(
             mapStyle = uiState.settings.mapStyle,
             vehicles = uiState.lineVehicles,
             focusedExternalVehicle = uiState.focusedExternalVehicle,
+            focusedExternalRoutePatterns = uiState.focusedExternalRoutePatterns,
             userLocation = uiState.userLocation,
             cameraFlyRequest = uiState.cameraFlyRequest,
             routePatterns = uiState.routePatterns,
             selectedVehicleId = uiState.selectedVehicleId,
+            selectedStop = uiState.selectedStop,
             selectedStopId = uiState.selectedStop?.stopId,
             favoriteStopIds = uiState.favoriteStopIds,
             nowMillis = uiState.nowMillis,
@@ -333,8 +336,8 @@ fun MapScreen(
                                     staleOrStuckCount > 0 ->
                                         "$staleOrStuckCount con GPS fermo · Cambia linea"
                                     uiState.onlineSourcesCount > 0 ->
-                                        "${uiState.onlineSourcesCount} fonti attive · Cambia linea"
-                                    else -> "Tocca per cambiare linea"
+                                        "${uiState.onlineSourcesCount} fonti attive · Linee e fermate"
+                                    else -> "Linee e fermate GTT"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSubtitle,
@@ -525,36 +528,39 @@ fun MapScreen(
                 uiState.selectedVehicle?.let { bus ->
                     val isExternal = uiState.focusedExternalVehicle?.vehicleId == bus.vehicleId &&
                         uiState.lineVehicles.none { it.vehicleId == bus.vehicleId }
-                    val activePatterns = if (isExternal) emptyList() else uiState.routePatterns
+                    val activePatterns = if (isExternal) uiState.focusedExternalRoutePatterns else uiState.routePatterns
                     val resolvedDirectionId = if (isExternal) {
-                        bus.directionId
+                        GttFleetAnalyzer.resolveDirectionId(bus, activePatterns) ?: bus.directionId
                     } else {
                         resolvedDirectionById[bus.vehicleId]
                             ?: GttFleetAnalyzer.resolveDirectionId(bus, activePatterns)
                     }
-                    val currentStop = if (isExternal) {
-                        null
-                    } else {
-                        GttFleetAnalyzer.findCurrentStop(bus, activePatterns, resolvedDirectionId)
-                    }
+                    val currentStop = GttFleetAnalyzer.findCurrentStop(bus, activePatterns, resolvedDirectionId)
                     val health = if (isExternal) {
-                        GttFleetAnalyzer.assess(bus, emptyList(), uiState.nowMillis)
+                        GttFleetAnalyzer.assess(bus, activePatterns, uiState.nowMillis)
                     } else {
                         healthByVehicleId[bus.vehicleId]
                             ?: GttFleetAnalyzer.assess(bus, activePatterns, uiState.nowMillis)
                     }
                     SelectedBusInspectorCard(
                         bus = bus,
+                        isExternal = isExternal,
                         resolvedDirectionId = resolvedDirectionId,
                         health = health,
                         terminusName = if (isExternal) {
                             uiState.focusedExternalTerminus
+                                ?: activePatterns.firstOrNull { it.directionId == resolvedDirectionId }?.terminusName()
                         } else {
                             uiState.terminusForDirection(resolvedDirectionId)
                         },
                         currentStopName = currentStop?.name,
                         nowMillis = uiState.nowMillis,
                         colorByDirection = uiState.settings.colorByDirection,
+                        onSwitchToLine = if (isExternal) {
+                            { onSelectLine(bus.lineCode) }
+                        } else {
+                            null
+                        },
                         onClose = { onSelectVehicle(null) },
                         modifier = cardModifier,
                     )
@@ -577,9 +583,24 @@ fun MapScreen(
                 },
             ) {
                 uiState.selectedStop?.let { stop ->
+                    val isStopOnTrackedLine = remember(stop.stopId, stop.stopCode, uiState.routePatterns) {
+                        uiState.routePatterns.any { pat ->
+                            pat.stops.any {
+                                it.stopId.equals(stop.stopId, ignoreCase = true) ||
+                                    it.stopCode.equals(stop.stopCode, ignoreCase = true)
+                            }
+                        }
+                    }
+                    val stopTerminusName = if (isStopOnTrackedLine) {
+                        uiState.terminusForDirection(stop.directionId)
+                    } else {
+                        uiState.stopArrivals.firstOrNull {
+                            it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", ignoreCase = true)
+                        }?.headsign
+                    }
                     SelectedStopArrivalsCard(
                         stop = stop,
-                        terminusName = uiState.terminusForDirection(stop.directionId),
+                        terminusName = stopTerminusName,
                         selectedLine = uiState.settings.selectedLine,
                         arrivals = uiState.stopArrivals,
                         isLoading = uiState.isLoadingStopArrivals,
@@ -1221,12 +1242,14 @@ private fun AlertItemCard(
 @Composable
 private fun SelectedBusInspectorCard(
     bus: BusVehicle,
+    isExternal: Boolean,
     resolvedDirectionId: Int?,
     health: VehicleHealthAssessment,
     terminusName: String?,
     currentStopName: String?,
     nowMillis: Long,
     colorByDirection: Boolean,
+    onSwitchToLine: (() -> Unit)?,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1248,7 +1271,11 @@ private fun SelectedBusInspectorCard(
         }
     }
     val isAltDir = colorByDirection && resolvedDirectionId == 1
-    val badgeAccent = if (isAltDir) AccentCyan else AccentGold
+    val badgeAccent = when {
+        isExternal -> AccentEmerald
+        isAltDir -> AccentCyan
+        else -> AccentGold
+    }
     val shortTerminus = remember(terminusName) { terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName) }
     val shortCurrentStop = remember(currentStopName) {
         currentStopName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
@@ -1320,18 +1347,37 @@ private fun SelectedBusInspectorCard(
                             style = MaterialTheme.typography.titleLarge,
                             color = TextPrimary,
                         )
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(badgeAccent.copy(alpha = 0.2f))
-                                .border(1.dp, badgeAccent.copy(alpha = 0.5f), RoundedCornerShape(999.dp))
-                                .padding(horizontal = 8.dp, vertical = 2.dp),
-                        ) {
-                            Text(
-                                text = "Linea ${bus.lineCode}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = badgeAccent,
-                            )
+                        if (onSwitchToLine != null) {
+                            val switchInteraction = remember { MutableInteractionSource() }
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .glassInteractive(switchInteraction, onClick = onSwitchToLine)
+                                    .background(badgeAccent.copy(alpha = 0.22f))
+                                    .border(1.dp, badgeAccent.copy(alpha = 0.65f), RoundedCornerShape(999.dp))
+                                    .padding(horizontal = 9.dp, vertical = 3.dp)
+                                    .testTag("switch_to_external_line_button"),
+                            ) {
+                                Text(
+                                    text = "Passa a ${bus.lineCode} ↗",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = badgeAccent,
+                                )
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .background(badgeAccent.copy(alpha = 0.2f))
+                                    .border(1.dp, badgeAccent.copy(alpha = 0.5f), RoundedCornerShape(999.dp))
+                                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                            ) {
+                                Text(
+                                    text = "Linea ${bus.lineCode}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = badgeAccent,
+                                )
+                            }
                         }
                     }
                     if (shortTerminus != null) {
@@ -1788,6 +1834,14 @@ private fun SelectedStopArrivalsCard(
                                                     color = TextSubtitle,
                                                 )
                                             }
+                                            val linkedVid = arrival.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+                                            val canLocateLive = arrival.isRealtime &&
+                                                (linkedVid != null || !arrival.tripId.isNullOrBlank())
+                                            val statusLabel = when {
+                                                arrival.isRealtime && linkedVid != null -> "Live · #$linkedVid"
+                                                arrival.isRealtime -> "Live"
+                                                else -> "Stimato"
+                                            }
                                             Row(
                                                 verticalAlignment = Alignment.CenterVertically,
                                                 horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -1799,11 +1853,11 @@ private fun SelectedStopArrivalsCard(
                                                         .background(if (arrival.isRealtime) AccentEmerald else TextSubtitle),
                                                 )
                                                 Text(
-                                                    text = if (arrival.isRealtime) "Live" else "Stimato",
+                                                    text = statusLabel,
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = if (arrival.isRealtime) AccentEmerald else TextSubtitle,
                                                 )
-                                                if (arrival.isRealtime) {
+                                                if (canLocateLive) {
                                                     Icon(
                                                         imageVector = Icons.Rounded.MyLocation,
                                                         contentDescription = "Mostra pullman sulla mappa",
