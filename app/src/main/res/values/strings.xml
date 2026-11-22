@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">ToBus</string>
+    <string name="widget_label_square">ToBus · Mappa 2×2</string>
+    <string name="widget_label_wide">ToBus · Mappa 4×2</string>
+    <string name="widget_label_stops">ToBus · Fermate Live</string>
+    <string name="widget_description">Mappa live della tua linea GTT di Torino in stile Dark Glass sulla Home.</string>
+    <string name="widget_description_square">Widget quadrato 2×2 compatto con mappa live GTT Torino.</string>
+    <string name="widget_description_stops">Passaggi in tempo reale alle tue fermate preferite GTT di Torino.</string>
+    <string name="tab_map">Mappa</string>
+    <string name="tab_widget">Impostazioni</string>
+    <string name="cd_refresh_map">Aggiorna posizione pullman</string>
+    <string name="cd_user_location">Mostra la mia posizione GPS</string>
+    <string name="cd_gtt_alerts">Avvisi GTT</string>
+    <string name="cd_select_line">Cambia linea GTT</string>
+    <string name="cd_fit_buses">Centra mappa sui pullman</string>
+    <string name="cd_zoom_in">Avvicina mappa</string>
+    <string name="cd_zoom_out">Allontana mappa</string>
+    <string name="cd_open_infomezzi">Apri Infomezzi nel browser</string>
+    <string name="cd_sources_info">Stato fonti dati</string>
+    <string name="cd_favorite_stop">Salva fermata nei preferiti</string>
+    <string name="cd_close">Chiudi</string>
+    <string name="cd_pin_widget">Aggiungi widget alla schermata Home</string>
+    <string name="widget_tap_to_refresh">Aggiorna widget</string>
+    <string name="widget_loading">Aggiorno…</string>
+    <string name="widget_no_buses">Nessun mezzo</string>
+    <string name="widget_error">Offline</string>
+</resources>

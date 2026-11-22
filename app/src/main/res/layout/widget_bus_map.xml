@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg_rounded"
+    android:clipToOutline="true">
+
+    <!-- Full-bleed live OSM Turin map bitmap -->
+    <ImageView
+        android:id="@+id/widget_map_image"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@string/widget_description"
+        android:scaleType="centerCrop" />
+
+    <!-- Top-left high-contrast Smoked Glass pill -->
+    <LinearLayout
+        android:id="@+id/widget_header_pill"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="10dp"
+        android:background="@drawable/widget_pill_dark"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="10dp"
+        android:paddingBottom="4dp">
+
+        <TextView
+            android:id="@+id/widget_line_badge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/widget_badge_amber"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:minWidth="26dp"
+            android:paddingStart="8dp"
+            android:paddingTop="2dp"
+            android:paddingEnd="8dp"
+            android:paddingBottom="2dp"
+            android:text="4"
+            android:textColor="#FF0D0D12"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <ImageView
+            android:id="@+id/widget_live_dot"
+            android:layout_width="7dp"
+            android:layout_height="7dp"
+            android:layout_marginStart="8dp"
+            android:contentDescription="@null"
+            android:src="@drawable/widget_live_dot" />
+
+        <TextView
+            android:id="@+id/widget_status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="5dp"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif"
+            android:maxLines="1"
+            android:text="@string/widget_loading"
+            android:textColor="#F2FFFFFF"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- Top-right Smoked Glass refresh circle -->
+    <ImageButton
+        android:id="@+id/widget_refresh_btn"
+        android:layout_width="34dp"
+        android:layout_height="34dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="10dp"
+        android:background="@drawable/widget_refresh_btn_dark"
+        android:contentDescription="@string/widget_tap_to_refresh"
+        android:padding="8dp"
+        android:scaleType="centerInside"
+        android:src="@drawable/ic_widget_refresh_light" />
+
+    <!-- Bottom-left freshness pill -->
+    <TextView
+        android:id="@+id/widget_time_pill"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|start"
+        android:layout_margin="10dp"
+        android:background="@drawable/widget_pill_dark"
+        android:fontFamily="sans-serif"
+        android:paddingStart="9dp"
+        android:paddingTop="3dp"
+        android:paddingEnd="9dp"
+        android:paddingBottom="3dp"
+        android:text="--:--"
+        android:textColor="#B3FFFFFF"
+        android:textSize="10sp" />
+
+</FrameLayout>

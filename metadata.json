@@ -1,0 +1,6 @@
+{
+  "name": "ToBus",
+  "description": "Mappa live e widget minimale per seguire la tua linea GTT a Torino in tempo reale.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
