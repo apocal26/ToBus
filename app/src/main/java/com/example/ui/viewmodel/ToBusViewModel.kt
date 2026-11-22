@@ -913,8 +913,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 null
             }
             val cleanHeadsign = arrival.headsign
-                .takeIf { it.isNotBlank() && !it.startsWith("Linea ", ignoreCase = true) }
+                .takeIf { it.isNotBlank() && !com.example.data.model.isGenericDirectionLabel(it) }
                 ?: patternExtTerminus
+                ?: arrival.headsign.takeIf { it.isNotBlank() && !it.startsWith("Linea ", ignoreCase = true) }
 
             cameraFlySeq++
             val targetCam = CameraState(

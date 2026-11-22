@@ -483,14 +483,22 @@ class GttStaticRouteStore(context: Context) {
                         val simplified = simplifyPoints(pts, maxPts = 320)
                         val dir = cand.directionId.coerceIn(0, 1)
                         val patternStops = stopsByTripId[cand.sampleTripId].orEmpty()
+                        val lastStopName = if (patternStops.size >= 2) {
+                            patternStops.lastOrNull()?.name?.trim()
+                                ?.takeIf { it.isNotBlank() && !it.all { ch -> ch.isDigit() || ch == '#' } }
+                        } else {
+                            null
+                        }
                         val rawHeadsign = cand.headsign.trim()
                         val isGenericName = rawHeadsign.isBlank() ||
                             rawHeadsign.startsWith("Linea ", ignoreCase = true) ||
-                            rawHeadsign.contains(" - ")
+                            rawHeadsign.contains(" - ") ||
+                            com.example.data.model.isGenericDirectionLabel(rawHeadsign)
                         val resolvedName = if (!isGenericName) {
                             rawHeadsign
                         } else {
-                            patternStops.lastOrNull()?.name?.takeIf { it.isNotBlank() }
+                            lastStopName
+                                ?: patternStops.lastOrNull()?.name?.takeIf { it.isNotBlank() }
                                 ?: rawHeadsign.ifBlank { "Linea $normalizedTarget" }
                         }
                         RoutePattern(
@@ -1137,14 +1145,16 @@ class GttStaticRouteStore(context: Context) {
                 repByTripId[tid] = meta
             }
 
-            // 3. Stream stop_times.txt once to map stopId -> lines & primary headsigns
+            // 3. Stream stop_times.txt once to map stopId -> lines, representative trips, and each trip's final stop
             val linesByStop = HashMap<String, LinkedHashSet<String>>(4096)
-            val headsignsByStop = HashMap<String, LinkedHashSet<String>>(4096)
+            val repTripsByStop = HashMap<String, LinkedHashSet<String>>(4096)
+            val lastStopByTrip = HashMap<String, Pair<Int, String>>(repByTripId.size * 2)
             zip.getInputStream(stopTimesEntry).use { stream ->
                 BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 64 * 1024).use { reader ->
                     val cols = parseCsvHeader(reader.readLine() ?: return@use)
                     val idxTrip = cols["trip_id"] ?: return@use
                     val idxStop = cols["stop_id"] ?: return@use
+                    val idxSeq = cols["stop_sequence"]
                     val idxPickup = cols["pickup_type"]
                     var line = reader.readLine()
                     while (line != null) {
@@ -1153,17 +1163,17 @@ class GttStaticRouteStore(context: Context) {
                             val tid = f.getOrNull(idxTrip)?.trim().orEmpty()
                             val meta = repByTripId[tid]
                             if (meta != null) {
-                                val pickup = idxPickup?.let { f.getOrNull(it)?.trim() }
-                                if (pickup != "1") {
-                                    val sid = f.getOrNull(idxStop)?.trim().orEmpty()
-                                    if (sid.isNotEmpty()) {
+                                val sid = f.getOrNull(idxStop)?.trim().orEmpty()
+                                if (sid.isNotEmpty()) {
+                                    val seq = idxSeq?.let { f.getOrNull(it)?.trim()?.toIntOrNull() } ?: 0
+                                    val prevLast = lastStopByTrip[tid]
+                                    if (prevLast == null || seq >= prevLast.first) {
+                                        lastStopByTrip[tid] = seq to sid
+                                    }
+                                    val pickup = idxPickup?.let { f.getOrNull(it)?.trim() }
+                                    if (pickup != "1") {
                                         linesByStop.getOrPut(sid) { LinkedHashSet(4) }.add(meta.lineCode)
-                                        if (meta.headsign.isNotBlank()) {
-                                            val cleanHead = com.example.data.model.shortTurinPlaceName(meta.headsign)
-                                            if (cleanHead.isNotBlank()) {
-                                                headsignsByStop.getOrPut(sid) { LinkedHashSet(3) }.add(cleanHead)
-                                            }
-                                        }
+                                        repTripsByStop.getOrPut(sid) { LinkedHashSet(4) }.add(tid)
                                     }
                                 }
                             }
@@ -1173,12 +1183,10 @@ class GttStaticRouteStore(context: Context) {
                 }
             }
 
-            // 4. Stream stops.txt and assemble StopSearchEntry list
-            val out = ArrayList<StopSearchEntry>(linesByStop.size.coerceAtLeast(256))
-            val lineSortComparator = compareBy<String>(
-                { it.takeWhile { c -> c.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE },
-                { it },
-            )
+            // 4. Stream stops.txt to collect stop names + metadata, then resolve exact terminus names
+            data class RawStopRow(val id: String, val code: String, val name: String, val lat: Double, val lon: Double)
+            val rawStops = ArrayList<RawStopRow>(linesByStop.size.coerceAtLeast(256))
+            val stopNameById = HashMap<String, String>(4096)
             zip.getInputStream(stopsEntry).use { stream ->
                 BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 32 * 1024).use { reader ->
                     val cols = parseCsvHeader(reader.readLine() ?: return@use)
@@ -1192,34 +1200,58 @@ class GttStaticRouteStore(context: Context) {
                         if (line.isNotBlank()) {
                             val f = parseCsvLine(line)
                             val sid = f.getOrNull(idxId)?.trim().orEmpty()
-                            val scode = idxCode?.let { f.getOrNull(it)?.trim() }.orEmpty().ifBlank { sid }
                             val name = f.getOrNull(idxName)?.trim().orEmpty()
-                            val lat = f.getOrNull(idxLat)?.trim()?.toDoubleOrNull()
-                            val lon = f.getOrNull(idxLon)?.trim()?.toDoubleOrNull()
-                            if (sid.isNotEmpty() && name.isNotEmpty() && lat != null && lon != null &&
-                                lat in 44.80..45.35 && lon in 7.30..8.00
-                            ) {
-                                val stopLines = linesByStop[sid]?.sortedWith(lineSortComparator).orEmpty()
-                                // Keep stops that actually have at least one bus/tram line serving them
-                                if (stopLines.isNotEmpty()) {
-                                    val heads = headsignsByStop[sid]?.take(2).orEmpty()
-                                    out.add(
-                                        StopSearchEntry(
-                                            stopId = sid,
-                                            stopCode = scode,
-                                            name = name,
-                                            lat = lat,
-                                            lon = lon,
-                                            lines = stopLines,
-                                            headsigns = heads,
-                                        ),
-                                    )
+                            if (sid.isNotEmpty() && name.isNotEmpty()) {
+                                stopNameById[sid] = name
+                                val scode = idxCode?.let { f.getOrNull(it)?.trim() }.orEmpty().ifBlank { sid }
+                                val lat = f.getOrNull(idxLat)?.trim()?.toDoubleOrNull()
+                                val lon = f.getOrNull(idxLon)?.trim()?.toDoubleOrNull()
+                                if (lat != null && lon != null && lat in 44.80..45.35 && lon in 7.30..8.00 &&
+                                    linesByStop.containsKey(sid)
+                                ) {
+                                    rawStops.add(RawStopRow(sid, scode, name, lat, lon))
                                 }
                             }
                         }
                         line = reader.readLine()
                     }
                 }
+            }
+
+            val out = ArrayList<StopSearchEntry>(rawStops.size)
+            val lineSortComparator = compareBy<String>(
+                { it.takeWhile { c -> c.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE },
+                { it },
+            )
+            for (row in rawStops) {
+                val stopLines = linesByStop[row.id]?.sortedWith(lineSortComparator).orEmpty()
+                if (stopLines.isEmpty()) continue
+                val heads = LinkedHashSet<String>(3)
+                repTripsByStop[row.id]?.forEach { tid ->
+                    val meta = repByTripId[tid] ?: return@forEach
+                    val finalStopId = lastStopByTrip[tid]?.second
+                    val finalStopName = if (finalStopId != null && finalStopId != row.id) {
+                        stopNameById[finalStopId]
+                    } else {
+                        null
+                    }
+                    val chosen = finalStopName?.takeIf { it.isNotBlank() }
+                        ?: meta.headsign.takeIf { it.isNotBlank() }
+                        ?: return@forEach
+                    val clean = com.example.data.model.shortTurinPlaceName(chosen)
+                    if (clean.isNotBlank()) heads.add(clean)
+                }
+                out.add(
+                    StopSearchEntry(
+                        stopId = row.id,
+                        stopCode = row.code,
+                        name = row.name,
+                        lat = row.lat,
+                        lon = row.lon,
+                        lines = stopLines,
+                        headsigns = heads.take(2),
+                    ),
+                )
             }
             return out
         }

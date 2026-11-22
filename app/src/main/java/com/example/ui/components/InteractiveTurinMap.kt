@@ -683,6 +683,7 @@ fun InteractiveTurinMap(
         MapStyle.DARK -> Color(0xFF121824)
         MapStyle.POSITRON -> Color(0xFFECEFF5)
         MapStyle.VOYAGER -> Color(0xFFF3EFE7)
+        MapStyle.SATELLITE -> Color(0xFF0B1218)
     }
 
     Box(

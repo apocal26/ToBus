@@ -179,6 +179,7 @@ fun ToBusApp(
             MapStyle.DARK -> AccentCyan
             MapStyle.POSITRON -> Color(0xFF60A5FA)
             MapStyle.VOYAGER -> AccentGold
+            MapStyle.SATELLITE -> AccentEmerald
         }
     }
 

@@ -84,6 +84,16 @@ class MapTileManager private constructor(context: Context) {
                 return@withContext (bmp to false)
             }
 
+            if (style == MapStyle.SATELLITE) {
+                val key = tileKey("gsat", z, wrappedX, y)
+                val satBmp = loadWithDeduplication(key) {
+                    buildSatelliteUrls(z, wrappedX, y)
+                }
+                if (satBmp != null) {
+                    return@withContext (satBmp to false)
+                }
+            }
+
             val prefix = if (style.isDark) "wdark" else "wlight"
             val key = tileKey(prefix, z, wrappedX, y)
             val cleanBmp = loadWithDeduplication(key) {
@@ -169,6 +179,15 @@ class MapTileManager private constructor(context: Context) {
         return listOf(
             "https://tile.openstreetmap.org/$z/$x/$y.png",
             "https://$sub.tile.openstreetmap.fr/osmfr/$z/$x/$y.png",
+        )
+    }
+
+    private fun buildSatelliteUrls(z: Int, x: Int, y: Int): List<String> {
+        val sub = (x + y) and 3
+        return listOf(
+            "https://mt$sub.google.com/vt/lyrs=y&hl=it&x=$x&y=$y&z=$z",
+            "https://mt$sub.google.com/vt/lyrs=s&hl=it&x=$x&y=$y&z=$z",
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$x",
         )
     }
 
@@ -268,7 +287,8 @@ class MapTileManager private constructor(context: Context) {
                     desat.postConcat(brighten)
                     desat.array
                 }
-                MapStyle.VOYAGER -> null
+                MapStyle.VOYAGER,
+                MapStyle.SATELLITE -> null
             }
         }
     }

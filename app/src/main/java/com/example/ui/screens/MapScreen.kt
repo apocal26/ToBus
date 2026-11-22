@@ -1732,10 +1732,14 @@ private fun SelectedStopArrivalsCard(
                         groupedLines.forEach { (lineCode, lineArrivals) ->
                             val isTrackedLine = lineCode.equals(selectedLine, ignoreCase = true)
                             val headsign = lineArrivals
-                                .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
+                                .firstOrNull { !com.example.data.model.isGenericDirectionLabel(it.headsign) }
                                 ?.headsign
                                 ?.let(::shortTurinPlaceName)
-                                ?: if (isTrackedLine) shortTerminus else null
+                                ?: (if (isTrackedLine) shortTerminus else null)
+                                ?: lineArrivals
+                                    .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
+                                    ?.headsign
+                                    ?.let(::shortTurinPlaceName)
 
                             Column(
                                 modifier = Modifier

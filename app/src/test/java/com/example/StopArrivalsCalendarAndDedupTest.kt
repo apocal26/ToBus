@@ -805,4 +805,57 @@ class StopArrivalsCalendarAndDedupTest {
             zipFile.delete()
         }
     }
+
+    @Test
+    fun terminusNameAndShortPlaceNamePreserveExactCapolineaInsteadOfGenericCentro() {
+        // Line 5: GTFS trip_headsign says generic "CENTRO", while the actual final stop is "SICCARDI CAP"
+        val line5Stops = listOf(
+            TransitStop("100", "100", "ORBAZZANO CAP", 45.0080, 7.5370, directionId = 0, sequence = 1),
+            TransitStop("101", "101", "SANTA RITA", 45.0500, 7.6500, directionId = 0, sequence = 12),
+            TransitStop("102", "102", "SICCARDI CAP", 45.0725, 7.6765, directionId = 0, sequence = 25),
+        )
+        val line5Pattern = RoutePattern(
+            id = "5_dir0",
+            name = "5 to CENTRO",
+            directionId = 0,
+            segments = listOf(line5Stops.map { GeoPoint(it.lat, it.lon) }),
+            stops = line5Stops,
+        )
+
+        // Must resolve exact capolinea "Siccardi Cap", NEVER generic "Centro"!
+        assertEquals("Siccardi Cap", line5Pattern.terminusName())
+        assertEquals("Siccardi Cap", com.example.data.model.shortTurinPlaceName("SICCARDI CAP"))
+
+        // Non-essential boilerplate cleaned, specific street/square ALWAYS preserved:
+        assertEquals("Via Siccardi", com.example.data.model.shortTurinPlaceName("CENTRO, Via Siccardi"))
+        assertEquals("Piazza Arbarello", com.example.data.model.shortTurinPlaceName("TORINO, Piazza Arbarello"))
+        assertEquals("Mirafiori Nord, Via Allason", com.example.data.model.shortTurinPlaceName("MIRAFIORI NORD, Via Allason"))
+        assertEquals("Politecnico", com.example.data.model.shortTurinPlaceName("Fermata 3284 - POLITECNICO"))
+        assertEquals("Porta Nuova", com.example.data.model.shortTurinPlaceName("PORTA NUOVA (TO)"))
+
+        // Reconciliation upgrades generic GTT Palina "CENTRO" arrival for Line 5 to "Siccardi Cap"
+        val nowMillis = 1_795_334_400_000L
+        val nowSec = nowMillis / 1000L
+        val rawFeed = listOf(
+            StopArrival(
+                lineCode = "5",
+                headsign = "CENTRO",
+                arrivalEpochSeconds = nowSec + 5L * 60L,
+                isRealtime = true,
+                sourceLabel = "GTT Palina",
+            ),
+        )
+        val reconciled = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = line5Stops[1],
+            preferredLine = "12",
+            liveVehicles = emptyList(),
+            allLivePool = emptyList(),
+            routePatterns = emptyList(),
+            rawArrivals = rawFeed,
+            nowMillis = nowMillis,
+            otherLinePatterns = mapOf("5" to listOf(line5Pattern)),
+        )
+        assertEquals(1, reconciled.size)
+        assertEquals("Siccardi Cap", reconciled.first().headsign)
+    }
 }

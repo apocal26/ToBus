@@ -2806,6 +2806,22 @@ class GttRealtimeRepository private constructor(context: Context) {
                 }
 
                 true
+            }.map { arr ->
+                if (!com.example.data.model.isGenericDirectionLabel(arr.headsign)) {
+                    arr
+                } else {
+                    val lineKey = arr.lineCode.trim().uppercase()
+                    val exactTerminus = if (lineKey.equals(normPref, ignoreCase = true)) {
+                        dirTerminus
+                    } else {
+                        otherLineContexts[lineKey]?.terminusName
+                    }
+                    if (!exactTerminus.isNullOrBlank() && !com.example.data.model.isGenericDirectionLabel(exactTerminus)) {
+                        arr.copy(headsign = exactTerminus)
+                    } else {
+                        arr
+                    }
+                }
             }
         }
 
@@ -2858,8 +2874,9 @@ class GttRealtimeRepository private constructor(context: Context) {
                     val existing = out[existingIdx]
                     val mergedVehicleId = existing.vehicleId ?: item.vehicleId
                     val mergedTripId = existing.tripId ?: item.tripId
-                    val mergedHeadsign = if (existing.headsign.startsWith("Linea ", ignoreCase = true) &&
-                        !item.headsign.startsWith("Linea ", ignoreCase = true)
+                    val mergedHeadsign = if (
+                        com.example.data.model.isGenericDirectionLabel(existing.headsign) &&
+                        !com.example.data.model.isGenericDirectionLabel(item.headsign)
                     ) {
                         item.headsign
                     } else {

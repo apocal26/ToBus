@@ -447,7 +447,7 @@ fun <T> SlidingGlassSegmentedControl(
                         color = if (isSelected) TextPrimary else TextSubtitle,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 6.dp),
+                        modifier = Modifier.padding(horizontal = 4.dp),
                     )
                 }
             }

@@ -20,8 +20,15 @@ import org.json.JSONObject
 internal object TurinVectorStyleBuilder {
 
     const val VECTOR_SOURCE_ID = "openmaptiles"
+    const val SATELLITE_SOURCE_ID = "google_satellite"
     const val TILEJSON_URL = "https://tiles.openfreemap.org/planet"
     const val GLYPHS_URL = "https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf"
+    val SATELLITE_TILE_URLS = listOf(
+        "https://mt0.google.com/vt/lyrs=s&hl=it&x={x}&y={y}&z={z}",
+        "https://mt1.google.com/vt/lyrs=s&hl=it&x={x}&y={y}&z={z}",
+        "https://mt2.google.com/vt/lyrs=s&hl=it&x={x}&y={y}&z={z}",
+        "https://mt3.google.com/vt/lyrs=s&hl=it&x={x}&y={y}&z={z}",
+    )
 
     private data class Palette(
         val background: String,
@@ -155,10 +162,44 @@ internal object TurinVectorStyleBuilder {
             cityText = "#26211C",
             placeHalo = "rgba(247, 244, 238, 0.96)",
         )
+
+        MapStyle.SATELLITE -> Palette(
+            background = "#0B1218",
+            residentialZone = "#0B1218",
+            industrialZone = "#0B1218",
+            hospitalZone = "#0B1218",
+            campusZone = "#0B1218",
+            stadiumZone = "#0B1218",
+            parkGreen = "#1B5238",
+            woodGreen = "#14422C",
+            parkOutline = "#2B7451",
+            waterFill = "#12426E",
+            waterwayLine = "rgba(116, 184, 232, 0.35)",
+            buildingFill = "rgba(255, 255, 255, 0.03)",
+            buildingOutline = "rgba(255, 255, 255, 0.14)",
+            railLine = "rgba(220, 230, 242, 0.45)",
+            pathLine = "rgba(255, 255, 255, 0.22)",
+            minorCasing = "rgba(0, 0, 0, 0.42)",
+            minorFill = "rgba(255, 255, 255, 0.18)",
+            secondaryCasing = "rgba(0, 0, 0, 0.50)",
+            secondaryFill = "rgba(255, 255, 255, 0.26)",
+            primaryCasing = "rgba(0, 0, 0, 0.56)",
+            primaryFill = "rgba(255, 235, 165, 0.34)",
+            motorwayCasing = "rgba(0, 0, 0, 0.65)",
+            motorwayFill = "rgba(252, 198, 98, 0.48)",
+            boundaryLine = "rgba(255, 255, 255, 0.45)",
+            waterText = "#9BD5FF",
+            streetText = "#FFFFFF",
+            streetHalo = "rgba(8, 12, 18, 0.94)",
+            neighborhoodText = "#F3F7FC",
+            cityText = "#FFFFFF",
+            placeHalo = "rgba(6, 10, 16, 0.96)",
+        )
     }
 
     fun buildStyleJson(mapStyle: MapStyle): String {
         val p = paletteFor(mapStyle)
+        val isSatellite = mapStyle == MapStyle.SATELLITE
         val layers = JSONArray()
 
         // 1. Background canvas
@@ -170,110 +211,132 @@ internal object TurinVectorStyleBuilder {
             },
         )
 
-        // 2. Urban zoning (residential / industrial / hospitals / universities / stadiums)
-        layers.put(
-            fillLayer(
-                id = "landuse-residential",
-                sourceLayer = "landuse",
-                filter = inFilter("class", "residential", "suburb", "neighbourhood"),
-                color = p.residentialZone,
-                opacity = 0.72,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "landuse-industrial",
-                sourceLayer = "landuse",
-                filter = inFilter("class", "industrial", "commercial", "retail", "railway", "military", "quarry"),
-                color = p.industrialZone,
-                opacity = 0.70,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "landuse-hospital",
-                sourceLayer = "landuse",
-                filter = eqFilter("class", "hospital"),
-                color = p.hospitalZone,
-                opacity = 0.85,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "landuse-campus",
-                sourceLayer = "landuse",
-                filter = inFilter("class", "university", "college", "school"),
-                color = p.campusZone,
-                opacity = 0.82,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "landuse-stadium",
-                sourceLayer = "landuse",
-                filter = eqFilter("class", "stadium"),
-                color = p.stadiumZone,
-                opacity = 0.85,
-            ),
-        )
+        if (isSatellite) {
+            layers.put(
+                JSONObject().apply {
+                    put("id", "satellite-imagery")
+                    put("type", "raster")
+                    put("source", SATELLITE_SOURCE_ID)
+                    put("minzoom", 0)
+                    put("maxzoom", 21)
+                    put(
+                        "paint",
+                        JSONObject()
+                            .put("raster-opacity", 1.0)
+                            .put("raster-fade-duration", 180)
+                            .put("raster-contrast", 0.04)
+                            .put("raster-saturation", 0.05),
+                    )
+                },
+            )
+        }
 
-        // 3. Parks, green areas, grass, woods & nature reserves — unmistakable urban green
-        layers.put(
-            fillLayer(
-                id = "landcover-grass",
-                sourceLayer = "landcover",
-                filter = inFilter("class", "grass", "wetland", "farmland"),
-                color = p.parkGreen,
-                opacity = 0.88,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "landcover-wood",
-                sourceLayer = "landcover",
-                filter = eqFilter("class", "wood"),
-                color = p.woodGreen,
-                opacity = 0.90,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "landuse-green",
-                sourceLayer = "landuse",
-                filter = inFilter(
-                    "class",
-                    "park",
-                    "cemetery",
-                    "pitch",
-                    "playground",
-                    "recreation_ground",
-                    "village_green",
+        if (!isSatellite) {
+            // 2. Urban zoning (residential / industrial / hospitals / universities / stadiums)
+            layers.put(
+                fillLayer(
+                    id = "landuse-residential",
+                    sourceLayer = "landuse",
+                    filter = inFilter("class", "residential", "suburb", "neighbourhood"),
+                    color = p.residentialZone,
+                    opacity = 0.72,
                 ),
-                color = p.parkGreen,
-                opacity = 0.90,
-            ),
-        )
-        layers.put(
-            fillLayer(
-                id = "park-fill",
-                sourceLayer = "park",
-                filter = null,
-                color = p.parkGreen,
-                opacity = 0.65,
-                outlineColor = p.parkOutline,
-            ),
-        )
+            )
+            layers.put(
+                fillLayer(
+                    id = "landuse-industrial",
+                    sourceLayer = "landuse",
+                    filter = inFilter("class", "industrial", "commercial", "retail", "railway", "military", "quarry"),
+                    color = p.industrialZone,
+                    opacity = 0.70,
+                ),
+            )
+            layers.put(
+                fillLayer(
+                    id = "landuse-hospital",
+                    sourceLayer = "landuse",
+                    filter = eqFilter("class", "hospital"),
+                    color = p.hospitalZone,
+                    opacity = 0.85,
+                ),
+            )
+            layers.put(
+                fillLayer(
+                    id = "landuse-campus",
+                    sourceLayer = "landuse",
+                    filter = inFilter("class", "university", "college", "school"),
+                    color = p.campusZone,
+                    opacity = 0.82,
+                ),
+            )
+            layers.put(
+                fillLayer(
+                    id = "landuse-stadium",
+                    sourceLayer = "landuse",
+                    filter = eqFilter("class", "stadium"),
+                    color = p.stadiumZone,
+                    opacity = 0.85,
+                ),
+            )
 
-        // 4. Water bodies & waterways (Po, Dora Riparia, Stura, Sangone)
-        layers.put(
-            fillLayer(
-                id = "water-fill",
-                sourceLayer = "water",
-                filter = null,
-                color = p.waterFill,
-                opacity = 1.0,
-            ),
-        )
+            // 3. Parks, green areas, grass, woods & nature reserves — unmistakable urban green
+            layers.put(
+                fillLayer(
+                    id = "landcover-grass",
+                    sourceLayer = "landcover",
+                    filter = inFilter("class", "grass", "wetland", "farmland"),
+                    color = p.parkGreen,
+                    opacity = 0.88,
+                ),
+            )
+            layers.put(
+                fillLayer(
+                    id = "landcover-wood",
+                    sourceLayer = "landcover",
+                    filter = eqFilter("class", "wood"),
+                    color = p.woodGreen,
+                    opacity = 0.90,
+                ),
+            )
+            layers.put(
+                fillLayer(
+                    id = "landuse-green",
+                    sourceLayer = "landuse",
+                    filter = inFilter(
+                        "class",
+                        "park",
+                        "cemetery",
+                        "pitch",
+                        "playground",
+                        "recreation_ground",
+                        "village_green",
+                    ),
+                    color = p.parkGreen,
+                    opacity = 0.90,
+                ),
+            )
+            layers.put(
+                fillLayer(
+                    id = "park-fill",
+                    sourceLayer = "park",
+                    filter = null,
+                    color = p.parkGreen,
+                    opacity = 0.65,
+                    outlineColor = p.parkOutline,
+                ),
+            )
+
+            // 4. Water bodies & waterways (Po, Dora Riparia, Stura, Sangone)
+            layers.put(
+                fillLayer(
+                    id = "water-fill",
+                    sourceLayer = "water",
+                    filter = null,
+                    color = p.waterFill,
+                    opacity = 1.0,
+                ),
+            )
+        }
         layers.put(
             JSONObject().apply {
                 put("id", "waterway-line")
@@ -295,23 +358,25 @@ internal object TurinVectorStyleBuilder {
             },
         )
 
-        // 5. Crisp architectural building footprints (palazzi & courtyards)
-        layers.put(
-            JSONObject().apply {
-                put("id", "buildings")
-                put("type", "fill")
-                put("source", VECTOR_SOURCE_ID)
-                put("source-layer", "building")
-                put("minzoom", 12.2)
-                put(
-                    "paint",
-                    JSONObject()
-                        .put("fill-color", p.buildingFill)
-                        .put("fill-outline-color", p.buildingOutline)
-                        .put("fill-opacity", zoomInterp(12.2 to 0.0, 13.3 to 0.82, 14.5 to 0.94)),
-                )
-            },
-        )
+        if (!isSatellite) {
+            // 5. Crisp architectural building footprints (palazzi & courtyards)
+            layers.put(
+                JSONObject().apply {
+                    put("id", "buildings")
+                    put("type", "fill")
+                    put("source", VECTOR_SOURCE_ID)
+                    put("source-layer", "building")
+                    put("minzoom", 12.2)
+                    put(
+                        "paint",
+                        JSONObject()
+                            .put("fill-color", p.buildingFill)
+                            .put("fill-outline-color", p.buildingOutline)
+                            .put("fill-opacity", zoomInterp(12.2 to 0.0, 13.3 to 0.82, 14.5 to 0.94)),
+                    )
+                },
+            )
+        }
 
         // 6. Subtle administrative borders
         layers.put(
@@ -600,18 +665,29 @@ internal object TurinVectorStyleBuilder {
             },
         )
 
+        val sourcesObj = JSONObject().put(
+            VECTOR_SOURCE_ID,
+            JSONObject()
+                .put("type", "vector")
+                .put("url", TILEJSON_URL),
+        )
+        if (isSatellite) {
+            val tilesArr = JSONArray()
+            SATELLITE_TILE_URLS.forEach { tilesArr.put(it) }
+            sourcesObj.put(
+                SATELLITE_SOURCE_ID,
+                JSONObject()
+                    .put("type", "raster")
+                    .put("tiles", tilesArr)
+                    .put("tileSize", 256)
+                    .put("maxzoom", 20),
+            )
+        }
+
         val root = JSONObject().apply {
             put("version", 8)
             put("name", "ToBus-${mapStyle.name}")
-            put(
-                "sources",
-                JSONObject().put(
-                    VECTOR_SOURCE_ID,
-                    JSONObject()
-                        .put("type", "vector")
-                        .put("url", TILEJSON_URL),
-                ),
-            )
+            put("sources", sourcesObj)
             put("glyphs", GLYPHS_URL)
             put("layers", layers)
         }

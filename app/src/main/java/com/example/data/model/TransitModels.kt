@@ -384,14 +384,27 @@ data class RoutePattern(
         get() = segments.flatten()
 
     /**
-     * Returns the real human-readable terminus (capolinea) name for this direction,
-     * preferring a genuine direction headsign or falling back to the final stop name.
+     * Returns the real human-readable terminus (capolinea) stop name for this direction.
+     * Prefers the actual final stop name of the route (e.g. "Siccardi Cap", "Allamano Cap")
+     * whenever the pattern has its ordered stop sequence, avoiding overly generic zone headsigns
+     * like "Centro" or "Torino".
      */
     fun terminusName(): String? {
+        val lastStop = if (stops.size >= 2) {
+            stops.lastOrNull()?.name?.trim()
+                ?.takeIf { it.isNotBlank() && !it.all { ch -> ch.isDigit() || ch == '#' } }
+        } else {
+            null
+        }
+        if (lastStop != null) {
+            return formatTurinLabel(lastStop)
+        }
+
         val rawName = name.trim()
         val cleanedHeadsign = rawName
             .substringAfter(" to ", rawName)
-            .replace(Regex("\\s*\\([^)]*\\)\\s*$"), "")
+            .substringAfter(" -> ", rawName)
+            .replace(Regex("\\s*\\(TO\\)\\s*$", RegexOption.IGNORE_CASE), "")
             .trim()
         val isGeneric = cleanedHeadsign.isBlank() ||
             cleanedHeadsign.startsWith("Linea ", ignoreCase = true) ||
@@ -407,16 +420,60 @@ data class RoutePattern(
 }
 
 /**
+ * Returns true when a direction/headsign label is too generic (e.g. "Centro", "Torino", "Linea 5")
+ * to tell a commuter the actual terminus stop name (such as "Siccardi Cap").
+ */
+fun isGenericDirectionLabel(raw: String?): Boolean {
+    val cleaned = raw?.trim()?.replace(Regex("\\s+"), " ")?.lowercase(java.util.Locale.ITALY)
+        ?: return true
+    if (cleaned.isEmpty() || cleaned == "?" || cleaned.startsWith("linea ")) return true
+    val genericZones = setOf(
+        "centro",
+        "torino",
+        "torino centro",
+        "nord",
+        "sud",
+        "est",
+        "ovest",
+        "andata",
+        "ritorno",
+        "circolare",
+        "mirafiori",
+        "mirafiori nord",
+        "mirafiori sud",
+        "grugliasco",
+        "collegno",
+        "orbassano",
+        "moncalieri",
+        "nichelino",
+        "venaria",
+        "settimo",
+        "rivoli",
+        "beinasco",
+        "san mauro",
+    )
+    return cleaned in genericZones
+}
+
+/**
  * Formats ALL-CAPS Turin GTT stop/terminus labels into clean readable Title Case
  * while preserving abbreviations like FS, GTT, M1 and already mixed-case names.
  */
 fun formatTurinLabel(raw: String): String {
     val trimmed = raw.trim().replace(Regex("\\s+"), " ")
     if (trimmed.isEmpty()) return trimmed
+    if (trimmed.contains(',')) {
+        val formattedParts = trimmed.split(",")
+            .map { formatTurinLabel(it) }
+            .filter { it.isNotEmpty() }
+        if (formattedParts.isNotEmpty()) {
+            return formattedParts.joinToString(", ")
+        }
+    }
     val hasLower = trimmed.any { it.isLowerCase() }
     if (hasLower) return trimmed
 
-    val keepUpper = setOf("FS", "GTT", "M1", "TO", "CAP", "II", "III", "IV", "VI", "XX", "XXI")
+    val keepUpper = setOf("FS", "GTT", "M1", "TO", "II", "III", "IV", "VI", "XX", "XXI")
     val smallWords = setOf("di", "da", "del", "della", "delle", "dei", "degli", "dello", "in", "su", "per", "a", "e", "al", "alla", "alle", "ai")
     val italianAbbr = mapOf(
         "p.za" to "P.za",
@@ -454,23 +511,32 @@ fun formatTurinLabel(raw: String): String {
 }
 
 /**
- * Produces a concise, crisp Turin stop/terminus name for compact rounded direction pills
- * and favorite stop chips:
+ * Cleans non-essential boilerplate from Turin GTT stop/terminus names while ALWAYS preserving
+ * the exact recognizable stop/capolinea name:
+ * - "SICCARDI CAP" -> "Siccardi Cap" (keeps "Cap"!)
  * - "Fermata 3284 - POLITECNICO" -> "Politecnico"
- * - "Mirafiori Nord, Via Allason" -> "Mirafiori Nord"
- * - "Porta Nuova, C. Vittorio Emanuele II" -> "Porta Nuova"
+ * - "CENTRO, Via Siccardi" -> "Via Siccardi" (never discards the street to show generic "Centro")
+ * - "TORINO, Piazza Arbarello" -> "Piazza Arbarello"
+ * - "MIRAFIORI NORD, Via Allason" -> "Mirafiori Nord, Via Allason"
  */
 fun shortTurinPlaceName(raw: String): String {
     val stripped = raw.trim()
         .replace(Regex("^Fermata\\s+\\d+\\s*[-–:]\\s*", RegexOption.IGNORE_CASE), "")
         .replace(Regex("^#?\\d{2,5}\\s*[-–:]\\s*"), "")
-        .replace(Regex("^(?:Cap\\.?|Capolinea)\\s+", RegexOption.IGNORE_CASE), "")
-        .replace(Regex("\\s+(?:Cap\\.?|Capolinea)$", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("^Linea\\s+[A-Za-z0-9/]+\\s*(?:->|→)\\s*", RegexOption.IGNORE_CASE), "")
+        .replace(Regex("\\s*\\(TO\\)\\s*$", RegexOption.IGNORE_CASE), "")
         .trim()
     val formatted = formatTurinLabel(stripped)
-    val beforeComma = formatted.substringBefore(",").trim()
-    val candidate = if (beforeComma.length >= 4) beforeComma else formatted
-    return candidate.replace(Regex("\\s*\\([^)]*\\)\\s*$"), "").trim().ifBlank { formatted }
+    val commaIdx = formatted.indexOf(',')
+    if (commaIdx > 0) {
+        val left = formatted.substring(0, commaIdx).trim()
+        val right = formatted.substring(commaIdx + 1).trim()
+        val leftLower = left.lowercase(java.util.Locale.ITALY)
+        if (right.length >= 3 && (leftLower == "torino" || leftLower == "centro" || leftLower == "torino centro")) {
+            return right
+        }
+    }
+    return formatted
 }
 
 data class LineSummary(
@@ -516,7 +582,7 @@ enum class MapStyle(
 ) {
     DARK(
         id = "dark",
-        labelIt = "Notte Vetro",
+        labelIt = "Scuro",
         subtitleIt = "Contrasto scuro OLED",
         isDark = true,
     ),
@@ -531,6 +597,12 @@ enum class MapStyle(
         labelIt = "Classico",
         subtitleIt = "Vettoriale a colori",
         isDark = false,
+    ),
+    SATELLITE(
+        id = "satellite",
+        labelIt = "Satellite",
+        subtitleIt = "Vista aerea ibrida HD",
+        isDark = true,
     );
 
     companion object {

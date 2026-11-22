@@ -156,6 +156,7 @@ object TransitMapBitmapRenderer {
             MapStyle.DARK -> 0xFF0E1117.toInt()
             MapStyle.POSITRON -> 0xFFECEFF3.toInt()
             MapStyle.VOYAGER -> 0xFFF2EFE9.toInt()
+            MapStyle.SATELLITE -> 0xFF0B1218.toInt()
         }
         canvas.drawColor(bg)
     }

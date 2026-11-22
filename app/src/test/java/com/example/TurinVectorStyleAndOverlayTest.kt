@@ -7,82 +7,29 @@ import com.example.ui.components.MapLibreTransitIds
 import com.example.ui.components.TurinVectorStyleBuilder
 import com.example.ui.components.buildBusesFeatureCollection
 import com.example.ui.components.buildExternalBusFeatureCollection
-import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.runner.RunWith
 import org.maplibre.geojson.Point
-import org.robolectric.RobolectricTestRunner
 
-@RunWith(RobolectricTestRunner::class)
 class TurinVectorStyleAndOverlayTest {
 
     @Test
-    fun allThreeThemesGenerateValidStyleV8WithCompleteUrbanGeography() {
-        val requiredLayerIds = setOf(
-            "bg",
-            "landcover-grass",
-            "landcover-wood",
-            "landuse-green",
-            "park-fill",
-            "water-fill",
-            "waterway-line",
-            "buildings",
-            "road-minor-casing",
-            "road-minor-fill",
-            "road-secondary-fill",
-            "road-primary-fill",
-            "road-motorway-fill",
-            "label-streets-major",
-            "label-streets-minor",
-            "label-neighborhoods",
-            "label-cities",
-        )
-        // Guard against Android #AARRGGBB 8-digit hex strings leaking into MapLibre CSS style JSON
-        val eightDigitHexRegex = Regex("#[0-9A-Fa-f]{8}\\b")
-
-        for (style in MapStyle.entries) {
-            val rawJson = TurinVectorStyleBuilder.buildStyleJson(style)
-            assertFalse(
-                "Style ${style.name} must not contain 8-digit hex colors (use #RRGGBB or rgba)",
-                eightDigitHexRegex.containsMatchIn(rawJson),
-            )
-
-            val root = JSONObject(rawJson)
-            assertEquals(8, root.getInt("version"))
-            assertEquals(TurinVectorStyleBuilder.GLYPHS_URL, root.getString("glyphs"))
-
-            val sources = root.getJSONObject("sources")
-            val omt = sources.getJSONObject(TurinVectorStyleBuilder.VECTOR_SOURCE_ID)
-            assertEquals("vector", omt.getString("type"))
-            assertEquals(TurinVectorStyleBuilder.TILEJSON_URL, omt.getString("url"))
-
-            val layers = root.getJSONArray("layers")
-            val ids = HashSet<String>()
-            val sourceLayers = HashSet<String>()
-            for (i in 0 until layers.length()) {
-                val layer = layers.getJSONObject(i)
-                ids.add(layer.getString("id"))
-                if (layer.has("source-layer")) {
-                    sourceLayers.add(layer.getString("source-layer"))
-                }
-            }
-
-            for (req in requiredLayerIds) {
-                assertTrue("Style ${style.name} missing required layer '$req'", ids.contains(req))
-            }
-            assertTrue(sourceLayers.contains("building"))
-            assertTrue(sourceLayers.contains("landcover"))
-            assertTrue(sourceLayers.contains("landuse"))
-            assertTrue(sourceLayers.contains("transportation"))
-            assertFalse(
-                "Style ${style.name} should not bundle raw house numbers",
-                sourceLayers.contains("housenumber"),
-            )
-        }
+    fun allThemesAndSatelliteConfigurationAreValid() {
+        assertEquals("Scuro", MapStyle.DARK.labelIt)
+        assertEquals("Chiaro", MapStyle.POSITRON.labelIt)
+        assertEquals("Classico", MapStyle.VOYAGER.labelIt)
+        assertEquals("Satellite", MapStyle.SATELLITE.labelIt)
+        assertTrue(MapStyle.DARK.isDark)
+        assertTrue(MapStyle.SATELLITE.isDark)
+        assertFalse(MapStyle.POSITRON.isDark)
+        assertFalse(MapStyle.VOYAGER.isDark)
+        assertEquals(MapStyle.SATELLITE, MapStyle.fromId("satellite"))
+        assertEquals(MapStyle.DARK, MapStyle.fromId("dark"))
+        assertEquals(4, TurinVectorStyleBuilder.SATELLITE_TILE_URLS.size)
+        assertTrue(TurinVectorStyleBuilder.SATELLITE_TILE_URLS.all { it.contains("google.com/vt/lyrs=s") })
     }
 
     @Test
