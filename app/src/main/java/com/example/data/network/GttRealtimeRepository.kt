@@ -50,28 +50,43 @@ class GttRealtimeRepository private constructor(context: Context) {
 
     private val appContext = context.applicationContext
 
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .build()
+    private val httpClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        OkHttpClient.Builder()
+            .connectTimeout(7, TimeUnit.SECONDS)
+            .readTimeout(9, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+    }
 
-    private val routeHttpClient: OkHttpClient = httpClient.newBuilder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(24, TimeUnit.SECONDS)
-        .build()
+    private val routeHttpClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        httpClient.newBuilder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(18, TimeUnit.SECONDS)
+            .build()
+    }
 
-    private val matoFastHttpClient: OkHttpClient = httpClient.newBuilder()
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
-        .build()
+    private val matoFastHttpClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        httpClient.newBuilder()
+            .connectTimeout(4, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build()
+    }
 
-    private val matoMqttClient = MatoMqttLiveClient(httpClient)
+    private val matoMqttClient: MatoMqttLiveClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        MatoMqttLiveClient { httpClient }
+    }
 
-    private val staticRouteStore = GttStaticRouteStore(appContext)
+    private val staticRouteStore: GttStaticRouteStore by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        GttStaticRouteStore(appContext)
+    }
     private val routeMemoryCache = ConcurrentHashMap<String, List<RoutePattern>>()
     private val stopNameMemoryCache = ConcurrentHashMap<String, String>()
-    private val routeCacheDir = File(appContext.cacheDir, "gtt_routes").apply { mkdirs() }
+    private val routeCacheDir: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(appContext.cacheDir, "gtt_routes").apply { mkdirs() }
+    }
+    private val widgetVehiclesCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(appContext.cacheDir, "widget_line_vehicles_v1.json")
+    }
 
     private data class MovementRecord(
         val lat: Double,
@@ -97,6 +112,12 @@ class GttRealtimeRepository private constructor(context: Context) {
 
     @Volatile
     private var lastAlertsFetchMillis: Long = 0L
+
+    @Volatile
+    private var preferredMatoVpEndpointIdx: Int = 0
+
+    @Volatile
+    private var preferredMatoVpQueryIdx: Int = 0
 
     fun startMatoLiveStream(lineCode: String, onFocusedUpdate: () -> Unit) {
         matoMqttClient.start(lineCode, onFocusedUpdate)
@@ -186,26 +207,73 @@ class GttRealtimeRepository private constructor(context: Context) {
     ): Result<LiveFeedSnapshot> =
         withContext(Dispatchers.IO) {
             val nowMillis = System.currentTimeMillis()
+            if (!widgetFastMode) {
+                matoMqttClient.ensureHealthyConnection(nowMillis)
+            }
+
+            val gttTimeoutMs = if (widgetFastMode) 5_000L else 8_000L
+            val busOneTimeoutMs = if (widgetFastMode) 5_000L else 7_000L
+            val matoGqlTimeoutMs = if (widgetFastMode) 4_800L else 6_000L
 
             coroutineScope {
-                val gttJob = async { fetchVehicleSource("gtt_official", "GTT Ufficiale", GTT_VP_URLS, nowMillis) }
+                val gttJob = async {
+                    withTimeoutOrNull(gttTimeoutMs) {
+                        fetchVehicleSource("gtt_official", "GTT Ufficiale", GTT_VP_URLS, nowMillis)
+                    } ?: VehicleSourceResult(
+                        snapshot = null,
+                        status = DataSourceStatus(
+                            id = "gtt_official",
+                            name = "GTT Ufficiale",
+                            isOnline = false,
+                            latencyMs = gttTimeoutMs,
+                            itemCount = 0,
+                            detail = "Timeout",
+                        ),
+                        error = IOException("Timeout GTT Ufficiale"),
+                    )
+                }
                 val busOneJob = if (includeSecondaryFeeds || widgetFastMode) {
-                    async { fetchVehicleSource("busone_proxy", "BusOne Proxy", BUSONE_VP_URLS, nowMillis) }
+                    async {
+                        withTimeoutOrNull(busOneTimeoutMs) {
+                            fetchVehicleSource("busone_proxy", "BusOne Proxy", BUSONE_VP_URLS, nowMillis)
+                        } ?: VehicleSourceResult(
+                            snapshot = null,
+                            status = DataSourceStatus(
+                                id = "busone_proxy",
+                                name = "BusOne Proxy",
+                                isOnline = false,
+                                latencyMs = busOneTimeoutMs,
+                                itemCount = 0,
+                                detail = "Timeout",
+                            ),
+                            error = IOException("Timeout BusOne Proxy"),
+                        )
+                    }
                 } else {
                     null
                 }
-                val matoGqlJob = if (!widgetFastMode && !focusLine.isNullOrBlank()) {
-                    async { fetchMatoGraphQlVehiclePositions(focusLine, nowMillis) }
+                // Always query MaTO GraphQL when focusLine is set — BOTH in foreground AND in widgetFastMode!
+                // This ensures widgets and map stay live whenever GTT GTFS-RT drops a line or lags.
+                val matoGqlJob = if (!focusLine.isNullOrBlank()) {
+                    async {
+                        withTimeoutOrNull(matoGqlTimeoutMs) {
+                            fetchMatoGraphQlVehiclePositions(focusLine, nowMillis)
+                        }.orEmpty()
+                    }
                 } else {
                     null
                 }
                 val tripUpdatesJob = if (includeSecondaryFeeds && !widgetFastMode) {
-                    async { fetchTripUpdatesSource() }
+                    async {
+                        withTimeoutOrNull(6_000L) { fetchTripUpdatesSource() }
+                    }
                 } else {
                     null
                 }
                 val alertsJob = if (includeSecondaryFeeds && !widgetFastMode && nowMillis - lastAlertsFetchMillis > ALERTS_TTL_MS) {
-                    async { fetchAlertsSource() }
+                    async {
+                        withTimeoutOrNull(5_000L) { fetchAlertsSource() }
+                    }
                 } else {
                     null
                 }
@@ -216,7 +284,11 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val tripRes = tripUpdatesJob?.await()
                 val alertsRes = alertsJob?.await()
 
-                val matoMqttVehicles = matoMqttClient.snapshotFreshVehicles(nowMillis)
+                val matoMqttVehicles = if (!widgetFastMode) {
+                    matoMqttClient.snapshotFreshVehicles(nowMillis)
+                } else {
+                    emptyList()
+                }
                 val matoCombined = mergeMultiSourceVehicles(
                     matoVehicles = matoMqttVehicles,
                     gttVehicles = matoGqlVehicles,
@@ -225,13 +297,13 @@ class GttRealtimeRepository private constructor(context: Context) {
                 )
 
                 val statuses = mutableListOf<DataSourceStatus>()
-                if (!widgetFastMode) {
-                    val matoOnline = matoMqttClient.isConnected() || matoCombined.isNotEmpty()
+                if (!widgetFastMode || matoGqlVehicles.isNotEmpty()) {
+                    val matoOnline = (!widgetFastMode && matoMqttClient.isConnected()) || matoCombined.isNotEmpty()
                     val matoMode = when {
                         matoMqttVehicles.isNotEmpty() && matoGqlVehicles.isNotEmpty() -> "MQTT + GraphQL"
                         matoMqttVehicles.isNotEmpty() -> "MQTT Live"
                         matoGqlVehicles.isNotEmpty() -> "GraphQL Live"
-                        matoMqttClient.isConnected() -> "Stream attivo"
+                        !widgetFastMode && matoMqttClient.isConnected() -> "Stream attivo"
                         else -> matoMqttClient.lastError() ?: "In connessione…"
                     }
                     statuses.add(
@@ -313,6 +385,16 @@ class GttRealtimeRepository private constructor(context: Context) {
                     alerts = cachedAlerts,
                 )
                 lastSnapshot = finalSnapshot
+                if (!focusLine.isNullOrBlank()) {
+                    val normFocus = focusLine.trim().uppercase()
+                    val lineBuses = enriched.filter {
+                        it.lineCode.equals(normFocus, ignoreCase = true) ||
+                            it.rawRouteId.equals(normFocus, ignoreCase = true)
+                    }
+                    if (lineBuses.isNotEmpty()) {
+                        saveWidgetLineVehiclesCache(normFocus, nowMillis, lineBuses)
+                    }
+                }
                 Result.success(finalSnapshot)
             }
         }
@@ -451,8 +533,16 @@ class GttRealtimeRepository private constructor(context: Context) {
             "https://mato.muoversiatorino.it/otp/routers/default/index/graphql",
         )
 
-        for (endpoint in vpEndpoints) {
-            for (query in queries) {
+        // Order endpoints & query variants starting from the last known working pair
+        val endpointOrder = vpEndpoints.indices.sortedBy { if (it == preferredMatoVpEndpointIdx) 0 else 1 }
+        val queryOrder = queries.indices.sortedBy { if (it == preferredMatoVpQueryIdx) 0 else 1 }
+
+        for (epIdx in endpointOrder) {
+            val endpoint = vpEndpoints[epIdx]
+            var endpointHttpFailed = false
+            for (qIdx in queryOrder) {
+                if (endpointHttpFailed) break
+                val query = queries[qIdx]
                 try {
                     val payloadJson = JSONObject().put("query", query).toString()
                     val req = Request.Builder()
@@ -464,7 +554,12 @@ class GttRealtimeRepository private constructor(context: Context) {
                         .build()
 
                     matoFastHttpClient.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) continue
+                        if (!resp.isSuccessful) {
+                            if (resp.code == 404 || resp.code == 405 || resp.code >= 500) {
+                                endpointHttpFailed = true
+                            }
+                            continue
+                        }
                         val body = resp.body?.string() ?: continue
                         val root = JSONObject(body)
                         val routes = root.optJSONObject("data")?.optJSONArray("routes") ?: continue
@@ -548,14 +643,114 @@ class GttRealtimeRepository private constructor(context: Context) {
                                 }
                             }
                         }
-                        if (out.isNotEmpty()) return out
+                        if (out.isNotEmpty()) {
+                            preferredMatoVpEndpointIdx = epIdx
+                            preferredMatoVpQueryIdx = qIdx
+                            return out
+                        }
                     }
                 } catch (e: Exception) {
+                    endpointHttpFailed = true
                     Log.d(TAG, "MaTO GraphQL VP skip $endpoint: ${e.message}")
                 }
             }
         }
         return emptyList()
+    }
+
+    /**
+     * On-demand fast MaTO GraphQL lookup for a single line (used when the user taps a "Live" arrival
+     * of another line inside a stop card and its vehicle was not in the general GTFS-RT pool).
+     */
+    suspend fun fetchLiveVehiclesForSingleLine(lineCode: String): List<BusVehicle> = withContext(Dispatchers.IO) {
+        val nowMillis = System.currentTimeMillis()
+        withTimeoutOrNull(3_800L) {
+            fetchMatoGraphQlVehiclePositions(lineCode, nowMillis)
+        }.orEmpty()
+    }
+
+    /**
+     * Persists the latest non-empty vehicle list for [lineCode] so Home Screen Widgets survive
+     * process death + transient Doze network timeouts without flashing "0 mezzi".
+     */
+    fun saveWidgetLineVehiclesCache(lineCode: String, fetchedAtMillis: Long, vehicles: List<BusVehicle>) {
+        runCatching {
+            val arr = JSONArray()
+            vehicles.forEach { v ->
+                arr.put(
+                    JSONObject().apply {
+                        put("entityId", v.entityId)
+                        put("vehicleId", v.vehicleId)
+                        put("label", v.label)
+                        put("rawRouteId", v.rawRouteId)
+                        put("lineCode", v.lineCode)
+                        if (v.tripId != null) put("tripId", v.tripId)
+                        if (v.directionId != null) put("directionId", v.directionId)
+                        put("lat", v.latitude)
+                        put("lon", v.longitude)
+                        if (v.bearing != null) put("bearing", v.bearing.toDouble())
+                        if (v.speedKmh != null) put("speedKmh", v.speedKmh.toDouble())
+                        put("ts", v.timestampSeconds)
+                        if (v.stopId != null) put("stopId", v.stopId)
+                        put("sourceName", v.sourceName)
+                    },
+                )
+            }
+            val root = JSONObject().apply {
+                put("lineCode", lineCode.trim().uppercase())
+                put("fetchedAtMillis", fetchedAtMillis)
+                put("vehicles", arr)
+            }
+            widgetVehiclesCacheFile.writeText(root.toString())
+        }
+    }
+
+    /**
+     * Loads the last persisted widget vehicles for [lineCode] if still fresh (within [maxAgeMillis]).
+     */
+    fun loadFreshWidgetLineVehicles(
+        lineCode: String,
+        maxAgeMillis: Long = 12 * 60_000L,
+    ): Pair<Long, List<BusVehicle>>? {
+        return runCatching {
+            val file = widgetVehiclesCacheFile
+            if (!file.exists()) return null
+            val root = JSONObject(file.readText())
+            val cachedLine = root.optString("lineCode").trim().uppercase()
+            if (!cachedLine.equals(lineCode.trim().uppercase(), ignoreCase = true)) return null
+            val fetchedAt = root.optLong("fetchedAtMillis", 0L)
+            if (fetchedAt <= 0L || System.currentTimeMillis() - fetchedAt > maxAgeMillis) return null
+            val arr = root.optJSONArray("vehicles") ?: return null
+            val list = ArrayList<BusVehicle>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val lat = obj.optDouble("lat", Double.NaN)
+                val lon = obj.optDouble("lon", Double.NaN)
+                if (!lat.isFinite() || !lon.isFinite()) continue
+                list.add(
+                    BusVehicle(
+                        entityId = obj.optString("entityId"),
+                        vehicleId = obj.optString("vehicleId"),
+                        label = obj.optString("label"),
+                        rawRouteId = obj.optString("rawRouteId"),
+                        lineCode = obj.optString("lineCode"),
+                        tripId = obj.optString("tripId").takeIf { it.isNotBlank() },
+                        directionId = if (obj.has("directionId")) obj.optInt("directionId") else null,
+                        latitude = lat,
+                        longitude = lon,
+                        bearing = if (obj.has("bearing")) obj.optDouble("bearing").toFloat() else null,
+                        speedKmh = if (obj.has("speedKmh")) obj.optDouble("speedKmh").toFloat() else null,
+                        timestampSeconds = obj.optLong("ts", fetchedAt / 1000L),
+                        stopId = obj.optString("stopId").takeIf { it.isNotBlank() },
+                        status = VehicleStopStatus.IN_TRANSIT_TO,
+                        sourceName = obj.optString("sourceName", "Cache"),
+                        contributingSources = setOf(obj.optString("sourceName", "Cache")),
+                        fetchedAtMillis = fetchedAt,
+                    ),
+                )
+            }
+            if (list.isEmpty()) null else fetchedAt to list
+        }.getOrNull()
     }
 
     fun getLastCachedSnapshot(): LiveFeedSnapshot? = lastSnapshot

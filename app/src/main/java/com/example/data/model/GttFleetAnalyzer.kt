@@ -21,6 +21,8 @@ data class VehicleHealthAssessment(
     val isOffRoute: Boolean,
     val gpsAgeSeconds: Long?,
     val stationarySeconds: Long?,
+    val isAtTerminus: Boolean = false,
+    val terminusStopName: String? = null,
 ) {
     val isInDepot: Boolean
         get() = depotName != null
@@ -34,25 +36,44 @@ data class VehicleHealthAssessment(
     fun warningMessage(): String? {
         return when {
             depotName != null ->
-                "Vettura rilevata al $depotName — probabilmente ferma o fuori servizio."
+                "Vettura al $depotName — in sosta o fuori servizio."
             isStaleGps && gpsAgeSeconds != null -> {
                 val mins = (gpsAgeSeconds / 60L).coerceAtLeast(1L)
                 "Segnale GPS vecchio ($mins min fa) — la posizione potrebbe non essere più reale."
             }
+            isOffRoute ->
+                "Vettura fuori percorso — probabile rientro in deposito o deviazione."
             isStuck && stationarySeconds != null -> {
                 val mins = (stationarySeconds / 60L).coerceAtLeast(1L)
-                "Mezzo fermo nello stesso punto da $mins min — possibile blocco o capolinea."
+                "Mezzo fermo lungo il percorso da $mins min — possibile traffico o rallentamento."
             }
-            isOffRoute ->
-                "Vettura distante dal tracciato della linea — possibile rientro in deposito o deviazione."
             else -> null
+        }
+    }
+
+    fun terminusMessage(): String? {
+        if (!isAtTerminus || isInactiveOrSuspicious) return null
+        val stopLabel = terminusStopName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
+        return if (stopLabel != null) {
+            "Al capolinea ($stopLabel) — in attesa della prossima partenza."
+        } else {
+            "Al capolinea — in attesa della prossima partenza."
         }
     }
 }
 
+data class VehicleSpatialStatus(
+    val depotName: String?,
+    val isOffRoute: Boolean,
+    val isNearTerminus: Boolean = false,
+    val distanceToTerminusMeters: Double = Double.POSITIVE_INFINITY,
+    val terminusStopName: String? = null,
+)
+
 /**
  * Turin GTT domain intelligence:
  * - Real geofences for all major GTT bus & tram depots in Turin
+ * - Terminus layover detection (cleanly separated from depot & mid-route stalls)
  * - Stale GPS & stationary/stuck detection
  * - Off-route check against active line geometry
  * - Real Turin GTT fleet series vehicle type decoder (electric BYD/Iveco, articulated, trams)
@@ -62,6 +83,9 @@ object GttFleetAnalyzer {
     private const val STALE_GPS_SECONDS = 150L
     private const val STUCK_STATIONARY_SECONDS = 240L
     private const val OFF_ROUTE_METERS = 500.0
+    private const val TERMINUS_NEAR_METERS = 125.0
+    private const val TERMINUS_BAY_METERS = 65.0
+    private const val TERMINUS_STATIONARY_SECONDS = 20L
 
     val TURIN_DEPOTS: List<GttDepot> = listOf(
         GttDepot("Deposito Gerbido", 45.0398, 7.6022, 290.0),
@@ -72,32 +96,106 @@ object GttFleetAnalyzer {
         GttDepot("Deposito Fiochetto", 45.0846, 7.6844, 160.0),
     )
 
-    fun assess(
+    fun assessSpatial(
         bus: BusVehicle,
         routePatterns: List<RoutePattern>,
-        nowMillis: Long,
-    ): VehicleHealthAssessment {
+    ): VehicleSpatialStatus {
         val depot = findDepot(bus.latitude, bus.longitude)
-        val ageSec = bus.gpsAgeSeconds(nowMillis)
-        val isStale = ageSec != null && ageSec > STALE_GPS_SECONDS
-        val statSec = bus.stationarySinceMillis?.let { ((nowMillis - it) / 1000L).coerceAtLeast(0L) }
-        val isStuck = statSec != null && statSec >= STUCK_STATIONARY_SECONDS
-
         val isOffRoute = if (depot == null && routePatterns.isNotEmpty()) {
             val minDist = minDistanceToRouteMeters(bus.latitude, bus.longitude, routePatterns)
             minDist != null && minDist > OFF_ROUTE_METERS
         } else {
             false
         }
+        var bestTerminusDist = Double.POSITIVE_INFINITY
+        var bestTerminusName: String? = null
+        if (depot == null && !isOffRoute && routePatterns.isNotEmpty()) {
+            for (pattern in routePatterns) {
+                val firstStop = pattern.stops.firstOrNull()
+                val lastStop = pattern.stops.lastOrNull()
+                if (firstStop != null) {
+                    val d = haversineMeters(bus.latitude, bus.longitude, firstStop.lat, firstStop.lon)
+                    if (d < bestTerminusDist) {
+                        bestTerminusDist = d
+                        bestTerminusName = firstStop.name
+                    }
+                } else {
+                    pattern.points.firstOrNull()?.let { pt ->
+                        val d = haversineMeters(bus.latitude, bus.longitude, pt.lat, pt.lon)
+                        if (d < bestTerminusDist) {
+                            bestTerminusDist = d
+                            bestTerminusName = null
+                        }
+                    }
+                }
+                if (lastStop != null) {
+                    val d = haversineMeters(bus.latitude, bus.longitude, lastStop.lat, lastStop.lon)
+                    if (d < bestTerminusDist) {
+                        bestTerminusDist = d
+                        bestTerminusName = lastStop.name
+                    }
+                } else {
+                    pattern.points.lastOrNull()?.let { pt ->
+                        val d = haversineMeters(bus.latitude, bus.longitude, pt.lat, pt.lon)
+                        if (d < bestTerminusDist) {
+                            bestTerminusDist = d
+                            bestTerminusName = null
+                        }
+                    }
+                }
+            }
+        }
+        val isNearTerminus = bestTerminusDist <= TERMINUS_NEAR_METERS
+        return VehicleSpatialStatus(
+            depotName = depot?.name,
+            isOffRoute = isOffRoute,
+            isNearTerminus = isNearTerminus,
+            distanceToTerminusMeters = bestTerminusDist,
+            terminusStopName = if (isNearTerminus) bestTerminusName?.let(::formatTurinLabel) else null,
+        )
+    }
+
+    fun assessWithSpatial(
+        bus: BusVehicle,
+        spatial: VehicleSpatialStatus,
+        nowMillis: Long,
+    ): VehicleHealthAssessment {
+        val ageSec = bus.gpsAgeSeconds(nowMillis)
+        val isStale = ageSec != null && ageSec > STALE_GPS_SECONDS
+        val statSec = bus.stationarySinceMillis?.let { ((nowMillis - it) / 1000L).coerceAtLeast(0L) }
+        val isMovingFast = bus.speedKmh != null && bus.speedKmh >= 12f
+        val isAtTerminus = spatial.depotName == null &&
+            !spatial.isOffRoute &&
+            !isStale &&
+            spatial.isNearTerminus &&
+            !isMovingFast &&
+            (
+                spatial.distanceToTerminusMeters <= TERMINUS_BAY_METERS ||
+                    (statSec != null && statSec >= TERMINUS_STATIONARY_SECONDS) ||
+                    bus.bearing == null ||
+                    (bus.speedKmh != null && bus.speedKmh < 4f)
+                )
+        // Never misclassify a bus waiting normally at its terminus as "stuck"
+        val isStuck = !spatial.isNearTerminus && statSec != null && statSec >= STUCK_STATIONARY_SECONDS
 
         return VehicleHealthAssessment(
-            depotName = depot?.name,
+            depotName = spatial.depotName,
             isStaleGps = isStale,
             isStuck = isStuck,
-            isOffRoute = isOffRoute,
+            isOffRoute = spatial.isOffRoute,
             gpsAgeSeconds = ageSec,
             stationarySeconds = statSec,
+            isAtTerminus = isAtTerminus,
+            terminusStopName = if (isAtTerminus) spatial.terminusStopName else null,
         )
+    }
+
+    fun assess(
+        bus: BusVehicle,
+        routePatterns: List<RoutePattern>,
+        nowMillis: Long,
+    ): VehicleHealthAssessment {
+        return assessWithSpatial(bus, assessSpatial(bus, routePatterns), nowMillis)
     }
 
     fun findDepot(lat: Double, lon: Double): GttDepot? {

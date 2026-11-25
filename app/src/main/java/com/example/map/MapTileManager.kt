@@ -27,12 +27,25 @@ import java.util.concurrent.TimeUnit
  */
 class MapTileManager private constructor(context: Context) {
 
-    private val tileCacheDir = File(context.applicationContext.cacheDir, "map_tiles_v6").apply { mkdirs() }
+    private val appContext = context.applicationContext
 
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
-        .build()
+    private val tileCacheDir: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        val dir = File(appContext.cacheDir, "map_tiles_v6").apply { mkdirs() }
+        runCatching {
+            listOf("map_tiles", "map_tiles_v3", "map_tiles_v4", "map_tiles_v5").forEach { legacy ->
+                val legacyDir = File(appContext.cacheDir, legacy)
+                if (legacyDir.exists()) legacyDir.deleteRecursively()
+            }
+        }
+        dir
+    }
+
+    private val httpClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(6, TimeUnit.SECONDS)
+            .build()
+    }
 
     // Generous 40 MB RAM cache keeps multiple zoom levels warm -> zero flashes when zooming
     private val memoryCache: LruCache<String, Bitmap> = object : LruCache<String, Bitmap>(40 * 1024) {
@@ -40,15 +53,6 @@ class MapTileManager private constructor(context: Context) {
     }
 
     private val inFlightRequests = ConcurrentHashMap<String, CompletableDeferred<Bitmap?>>()
-
-    init {
-        runCatching {
-            listOf("map_tiles", "map_tiles_v3", "map_tiles_v4", "map_tiles_v5").forEach { legacy ->
-                val legacyDir = File(context.applicationContext.cacheDir, legacy)
-                if (legacyDir.exists()) legacyDir.deleteRecursively()
-            }
-        }
-    }
 
     /**
      * Strictly RAM-only lookup safe to call on the Main Thread during Compose layout/draw.

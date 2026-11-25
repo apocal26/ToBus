@@ -74,6 +74,11 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/stop_arrivals_widget_info" />
         </receiver>
+
+        <service
+            android:name=".widget.StopArrivalsWidgetService"
+            android:exported="false"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
     </application>
 
 </manifest>

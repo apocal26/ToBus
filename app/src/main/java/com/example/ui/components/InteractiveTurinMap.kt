@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -73,6 +74,15 @@ private data class AnimatedBusPose(
     val bearing: Float?,
 )
 
+@Immutable
+private data class BusMapVisualHealth(
+    val isInDepot: Boolean,
+    val isStaleGps: Boolean,
+    val isStuck: Boolean,
+    val isOffRoute: Boolean,
+    val isAtTerminus: Boolean,
+)
+
 private fun lerpAngleDeg(from: Float?, to: Float?, t: Float): Float? {
     if (to == null) return from
     if (from == null) return to
@@ -99,6 +109,7 @@ fun InteractiveTurinMap(
     showVehicleLabels: Boolean,
     showRouteLine: Boolean,
     colorByDirection: Boolean,
+    focusedDirectionFilter: Int? = null,
     shiftCameraForBottomSheet: Boolean = true,
     onCameraChange: (CameraState) -> Unit,
     onViewportSizeChange: (Int, Int) -> Unit,
@@ -125,23 +136,45 @@ fun InteractiveTurinMap(
         if (activeExternalBus != null) vehicles + activeExternalBus else vehicles
     }
 
-    val visibleStops = remember(routePatterns, selectedStop) {
-        val base = routePatterns
+    val baseVisibleStops = remember(routePatterns, focusedDirectionFilter) {
+        routePatterns
             .flatMap { it.stops }
+            .filter { focusedDirectionFilter == null || it.directionId == focusedDirectionFilter }
             .distinctBy { "${it.stopId}_${it.directionId}" }
-        if (selectedStop != null && base.none { it.stopId == selectedStop.stopId }) {
-            base + selectedStop
+    }
+    val visibleStops = remember(baseVisibleStops, selectedStop) {
+        if (selectedStop != null && baseVisibleStops.none { it.stopId == selectedStop.stopId }) {
+            baseVisibleStops + selectedStop
         } else {
-            base
+            baseVisibleStops
         }
     }
 
-    val busHealthById = remember(vehicles, routePatterns, nowMillis) {
+    val spatialById = remember(vehicles, routePatterns) {
         vehicles.associate { bus ->
-            bus.vehicleId to GttFleetAnalyzer.assess(
+            bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, routePatterns)
+        }
+    }
+
+    val busHealthById = remember(vehicles, spatialById, nowMillis) {
+        vehicles.associate { bus ->
+            val spatial = spatialById[bus.vehicleId] ?: GttFleetAnalyzer.assessSpatial(bus, routePatterns)
+            bus.vehicleId to GttFleetAnalyzer.assessWithSpatial(
                 bus = bus,
-                routePatterns = routePatterns,
+                spatial = spatial,
                 nowMillis = nowMillis,
+            )
+        }
+    }
+
+    val busVisualHealthById = remember(busHealthById) {
+        busHealthById.mapValues { (_, h) ->
+            BusMapVisualHealth(
+                isInDepot = h.isInDepot,
+                isStaleGps = h.isStaleGps,
+                isStuck = h.isStuck,
+                isOffRoute = h.isOffRoute,
+                isAtTerminus = h.isAtTerminus,
             )
         }
     }
@@ -153,12 +186,20 @@ fun InteractiveTurinMap(
     }
 
     val hasExternalRouteFocus = activeExternalBus != null && focusedExternalRoutePatterns.isNotEmpty()
-    val highlightedMainDirectionId = remember(selectedVehicleId, activeExternalBus, resolvedDirectionById, vehicles) {
-        if (selectedVehicleId == null || activeExternalBus != null) {
-            null
-        } else {
-            resolvedDirectionById[selectedVehicleId]
-                ?: vehicles.firstOrNull { it.vehicleId == selectedVehicleId }?.directionId
+    val highlightedMainDirectionId = remember(
+        selectedVehicleId,
+        activeExternalBus,
+        resolvedDirectionById,
+        vehicles,
+        focusedDirectionFilter,
+    ) {
+        when {
+            activeExternalBus != null -> null
+            selectedVehicleId != null -> {
+                resolvedDirectionById[selectedVehicleId]
+                    ?: vehicles.firstOrNull { it.vehicleId == selectedVehicleId }?.directionId
+            }
+            else -> focusedDirectionFilter
         }
     }
 
@@ -178,6 +219,7 @@ fun InteractiveTurinMap(
     val latestColorByDirection by rememberUpdatedState(colorByDirection)
     val latestShowVehicleLabels by rememberUpdatedState(showVehicleLabels)
     val latestShowRouteLine by rememberUpdatedState(showRouteLine)
+    val latestFocusedDirectionFilter by rememberUpdatedState(focusedDirectionFilter)
     val latestVisibleStops by rememberUpdatedState(visibleStops)
     val latestOnCameraChange by rememberUpdatedState(onCameraChange)
     val latestOnVehicleTap by rememberUpdatedState(onVehicleTap)
@@ -200,8 +242,17 @@ fun InteractiveTurinMap(
     fun pushLineBusesToStyle(style: Style, t: Float = busMotionProgress.value) {
         if (!style.isFullyLoaded) return
         val source = style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.BUSES_SOURCE) ?: return
+        val dirFilter = latestFocusedDirectionFilter
+        val filteredVehicles = if (dirFilter == null) {
+            latestVehicles
+        } else {
+            latestVehicles.filter { bus ->
+                bus.vehicleId == latestSelectedVehicleId ||
+                    (latestResolvedDirectionById[bus.vehicleId] ?: bus.directionId) == dirFilter
+            }
+        }
         val fc = buildBusesFeatureCollection(
-            vehicles = latestVehicles,
+            vehicles = filteredVehicles,
             poseForBus = { bus -> currentPoseForBus(bus, t) },
             selectedVehicleId = latestSelectedVehicleId,
             busHealthById = latestBusHealthById,
@@ -242,11 +293,14 @@ fun InteractiveTurinMap(
         }
     }
 
-    // Robust lifecycle sync (handles both initial Activity launch and tab switching while RESUMED)
+    val latestIsForegroundActive by rememberUpdatedState(isForegroundActive)
+    var isLifecycleResumed by remember { mutableStateOf(false) }
+    var isMapResumed by remember { mutableStateOf(false) }
+
+    // Robust lifecycle sync (handles Activity launch, tab switching, AND pausing MapLibre GL behind overlays)
     DisposableEffect(lifecycleOwner, mapView) {
         var created = false
         var started = false
-        var resumed = false
 
         fun syncUpTo(state: Lifecycle.State) {
             if (!created && state.isAtLeast(Lifecycle.State.CREATED)) {
@@ -257,9 +311,12 @@ fun InteractiveTurinMap(
                 mapView.onStart()
                 started = true
             }
-            if (!resumed && state.isAtLeast(Lifecycle.State.RESUMED)) {
-                mapView.onResume()
-                resumed = true
+            if (state.isAtLeast(Lifecycle.State.RESUMED)) {
+                isLifecycleResumed = true
+                if (!isMapResumed && latestIsForegroundActive) {
+                    mapView.onResume()
+                    isMapResumed = true
+                }
             }
         }
 
@@ -275,13 +332,19 @@ fun InteractiveTurinMap(
                     mapView.onStart()
                     started = true
                 }
-                Lifecycle.Event.ON_RESUME -> if (!resumed) {
-                    mapView.onResume()
-                    resumed = true
+                Lifecycle.Event.ON_RESUME -> {
+                    isLifecycleResumed = true
+                    if (!isMapResumed && latestIsForegroundActive) {
+                        mapView.onResume()
+                        isMapResumed = true
+                    }
                 }
-                Lifecycle.Event.ON_PAUSE -> if (resumed) {
-                    mapView.onPause()
-                    resumed = false
+                Lifecycle.Event.ON_PAUSE -> {
+                    isLifecycleResumed = false
+                    if (isMapResumed) {
+                        mapView.onPause()
+                        isMapResumed = false
+                    }
                 }
                 Lifecycle.Event.ON_STOP -> if (started) {
                     mapView.onStop()
@@ -291,7 +354,8 @@ fun InteractiveTurinMap(
                     mapView.onDestroy()
                     created = false
                     started = false
-                    resumed = false
+                    isLifecycleResumed = false
+                    isMapResumed = false
                 }
                 else -> Unit
             }
@@ -308,10 +372,11 @@ fun InteractiveTurinMap(
             lifecycleOwner.lifecycle.removeObserver(observer)
             activeStyle = null
             mapLibreMap = null
-            if (resumed) {
+            if (isMapResumed) {
                 mapView.onPause()
-                resumed = false
+                isMapResumed = false
             }
+            isLifecycleResumed = false
             if (started) {
                 mapView.onStop()
                 started = false
@@ -320,6 +385,18 @@ fun InteractiveTurinMap(
                 mapView.onDestroy()
                 created = false
             }
+        }
+    }
+
+    // Pause MapLibre OpenGL RenderThread while full-screen overlays (e.g. LinePickerSheet) cover the map
+    LaunchedEffect(isForegroundActive, isLifecycleResumed, mapView) {
+        val shouldBeResumed = isForegroundActive && isLifecycleResumed
+        if (shouldBeResumed && !isMapResumed) {
+            mapView.onResume()
+            isMapResumed = true
+        } else if (!shouldBeResumed && isMapResumed) {
+            mapView.onPause()
+            isMapResumed = false
         }
     }
 
@@ -492,6 +569,7 @@ fun InteractiveTurinMap(
         style.getLayer(MapLibreTransitIds.ROUTE_CASING_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.ROUTE_GLOW_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.ROUTE_CORE_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+        style.getLayer(MapLibreTransitIds.ROUTE_ARROWS_LAYER)?.setProperties(PropertyFactory.visibility(vis))
     }
 
     // Update Focused External Bus Route Overlay (e.g. showing Line 55's exact path when focusing a Line 55 bus)
@@ -522,6 +600,7 @@ fun InteractiveTurinMap(
         activeStyle,
         styleReadyTick,
         visibleStops,
+        routePatterns,
         favoriteStopIds,
         selectedStopId,
         colorByDirection,
@@ -535,6 +614,7 @@ fun InteractiveTurinMap(
         source?.setGeoJson(
             buildStopsFeatureCollection(
                 stops = visibleStops,
+                routePatterns = routePatterns,
                 favoriteStopIds = favoriteStopIds,
                 selectedStopId = selectedStopId,
                 colorByDirection = colorByDirection,
@@ -545,6 +625,7 @@ fun InteractiveTurinMap(
         val vis = if (showRouteLine || selectedStopId != null) Property.VISIBLE else Property.NONE
         style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.STOPS_DOT_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+        style.getLayer(MapLibreTransitIds.STOPS_FAV_STAR_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.STOPS_SELECTED_LABEL_LAYER)?.setProperties(PropertyFactory.visibility(vis))
     }
 
@@ -564,12 +645,13 @@ fun InteractiveTurinMap(
         }
     }
 
-    // Subtle pulsing GPS halo ONLY while GPS is enabled and app is in foreground
+    // Subtle pulsing GPS halo ONLY while GPS is enabled and app is in foreground (~24fps JNI update)
     LaunchedEffect(activeStyle, styleReadyTick, userLocation != null, isForegroundActive) {
         val style = activeStyle ?: return@LaunchedEffect
         if (userLocation == null || !isForegroundActive) return@LaunchedEffect
         val pulseLayer = style.getLayerAs<CircleLayer>(MapLibreTransitIds.USER_PULSE_LAYER) ?: return@LaunchedEffect
         val pulseAnim = Animatable(0f)
+        var lastPulsePushNs = 0L
         pulseAnim.animateTo(
             targetValue = 1f,
             animationSpec = infiniteRepeatable(
@@ -577,7 +659,9 @@ fun InteractiveTurinMap(
                 repeatMode = RepeatMode.Restart,
             ),
         ) {
-            if (style.isFullyLoaded) {
+            val nowNs = System.nanoTime()
+            if (style.isFullyLoaded && nowNs - lastPulsePushNs >= 42_000_000L) {
+                lastPulsePushNs = nowNs
                 val radius = 10f + value * 16f
                 val alpha = ((1f - value) * 0.34f).coerceIn(0f, 0.34f)
                 pulseLayer.setProperties(
@@ -638,13 +722,26 @@ fun InteractiveTurinMap(
 
         if (anyMoved) {
             busMotionProgress.snapTo(0f)
+            var lastBusPushNs = 0L
             busMotionProgress.animateTo(
                 targetValue = 1f,
                 animationSpec = tween(durationMillis = 1000, easing = FastOutSlowInEasing),
             ) {
-                activeStyle?.let { style ->
-                    pushLineBusesToStyle(style, value)
-                    pushExternalBusToStyle(style, value)
+                val nowNs = System.nanoTime()
+                if (nowNs - lastBusPushNs >= 32_000_000L || value >= 0.999f) {
+                    lastBusPushNs = nowNs
+                    activeStyle?.let { style ->
+                        pushLineBusesToStyle(style, value)
+                        if (latestExternalBus != null) {
+                            pushExternalBusToStyle(style, value)
+                        }
+                    }
+                }
+            }
+            activeStyle?.let { style ->
+                pushLineBusesToStyle(style, 1f)
+                if (latestExternalBus != null) {
+                    pushExternalBusToStyle(style, 1f)
                 }
             }
         } else {
@@ -662,10 +759,11 @@ fun InteractiveTurinMap(
         styleReadyTick,
         vehicles,
         selectedVehicleId,
-        busHealthById,
+        busVisualHealthById,
         resolvedDirectionById,
         colorByDirection,
         showVehicleLabels,
+        focusedDirectionFilter,
     ) {
         activeStyle?.let { style -> pushLineBusesToStyle(style, busMotionProgress.value) }
     }
@@ -680,7 +778,7 @@ fun InteractiveTurinMap(
     }
 
     val containerBg = when (mapStyle) {
-        MapStyle.DARK -> Color(0xFF121824)
+        MapStyle.DARK -> Color(0xFF0F141E)
         MapStyle.POSITRON -> Color(0xFFECEFF5)
         MapStyle.VOYAGER -> Color(0xFFF3EFE7)
         MapStyle.SATELLITE -> Color(0xFF0B1218)

@@ -64,6 +64,7 @@ enum class WidgetPreviewSize(
     STOPS_LIVE("Fermate", 340, 178, false),
 }
 
+@androidx.compose.runtime.Immutable
 data class UserLocationState(
     val lat: Double,
     val lon: Double,
@@ -71,11 +72,13 @@ data class UserLocationState(
     val updatedAtMillis: Long,
 )
 
+@androidx.compose.runtime.Immutable
 data class CameraFlyRequest(
     val target: CameraState,
     val id: Long,
 )
 
+@androidx.compose.runtime.Immutable
 data class ToBusUiState(
     val settings: UserWidgetSettings = UserWidgetSettings(),
     val camera: CameraState = CameraState(),
@@ -100,6 +103,8 @@ data class ToBusUiState(
     val stopSearchResults: List<StopSearchEntry> = emptyList(),
     val isLoadingStopIndex: Boolean = false,
     val favoriteStops: List<FavoriteStop> = emptyList(),
+    val favoriteStopIds: Set<String> = emptySet(),
+    val favoriteLines: List<String> = emptyList(),
     val stopWidgetPreviewByStopId: Map<String, List<StopArrival>> = emptyMap(),
     val isLoadingStopWidgetPreview: Boolean = false,
     val isLoadingFeed: Boolean = true,
@@ -107,7 +112,6 @@ data class ToBusUiState(
     val lastUpdatedMillis: Long? = null,
     val feedTimestampSeconds: Long = 0L,
     val nowMillis: Long = System.currentTimeMillis(),
-    val nextPollProgress: Float = 0f,
     val errorMessage: String? = null,
     val totalCityVehicles: Int = 0,
     val previewSize: WidgetPreviewSize = WidgetPreviewSize.SQUARE_2X2,
@@ -121,9 +125,6 @@ data class ToBusUiState(
 
     val onlineSourcesCount: Int
         get() = sourceStatuses.count { it.isOnline }
-
-    val favoriteStopIds: Set<String>
-        get() = favoriteStops.map { it.stopId }.toSet()
 
     fun isFavoriteStop(stopId: String): Boolean =
         favoriteStops.any { it.stopId.equals(stopId, ignoreCase = true) }
@@ -155,19 +156,33 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = ToBusPreferences.getInstance(appContext)
     private val repository = GttRealtimeRepository.getInstance(appContext)
 
+    private val initialSettings = preferences.currentSettings()
+    private val initialFavoriteStops = preferences.currentFavoriteStops()
     private val _uiState = MutableStateFlow(
         ToBusUiState(
-            settings = preferences.currentSettings(),
-            camera = preferences.currentSettings().fixedCamera,
-            favoriteStops = preferences.currentFavoriteStops(),
+            settings = initialSettings,
+            camera = initialSettings.fixedCamera,
+            favoriteStops = initialFavoriteStops,
+            favoriteStopIds = initialFavoriteStops.map { it.stopId }.toSet(),
+            favoriteLines = preferences.currentFavoriteLines(),
         ),
     )
     val uiState: StateFlow<ToBusUiState> = _uiState.asStateFlow()
+
+    // Isolated 1Hz poll countdown flow so RefreshProgressGlassButton animates independently
+    // without forcing full-screen recompositions on MapScreen / LinePickerSheet every second.
+    private val _pollProgress = MutableStateFlow(0f)
+    val pollProgress: StateFlow<Float> = _pollProgress.asStateFlow()
 
     private var hasAutoCenteredCurrentLine = false
     private var needsRouteRefit = true
     private var hasVerifiedLiveRouteForLine: String? = null
     private var isStudioTabActive = false
+    @Volatile
+    private var isLinePickerOpen = false
+    @Volatile
+    private var pendingMatoSyncOnPickerClose = false
+    private var consecutivePollFailures = 0
     private var previewDirty = true
     private var lastViewportPx: Pair<Int, Int> = 1000 to 1400
     private var previewRenderJob: Job? = null
@@ -190,9 +205,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadRouteGeometry(_uiState.value.settings.selectedLine)
-        // Warm static GTFS zip silently in background so future line switches are instant (~100ms)
+        // Warm static GTFS zip & compact stop index silently in background so line switches
+        // and the Fermate search tab open instantaneously (~0ms wait).
         viewModelScope.launch(Dispatchers.IO) {
             repository.prefetchStaticGtfsInBackground()
+            runCatching { repository.getStopSearchIndex() }
         }
     }
 
@@ -203,8 +220,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun setForegroundActive(active: Boolean) {
         if (active) {
-            // Re-arm periodic widget updates in case Android cleared alarms after reboot or update
-            BusMapWidgetProvider.schedulePeriodicUpdates(appContext, _uiState.value.settings.refreshInterval)
+            // Re-arm periodic widget updates off main thread so ON_START never blocks on Binder IPC
+            val interval = _uiState.value.settings.refreshInterval
+            viewModelScope.launch(Dispatchers.IO) {
+                BusMapWidgetProvider.schedulePeriodicUpdates(appContext, interval)
+            }
             repository.startMatoLiveStream(_uiState.value.settings.selectedLine) { onMatoLivePush() }
             startForegroundJobs()
             if (_uiState.value.isUserLocationEnabled && hasLocationPermission()) {
@@ -227,6 +247,19 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         if (active && (previewDirty || _uiState.value.widgetPreviewBitmap == null)) {
             previewDirty = false
             regenerateWidgetPreview(force = true)
+        }
+    }
+
+    fun setLinePickerOpen(open: Boolean) {
+        if (isLinePickerOpen == open) return
+        isLinePickerOpen = open
+        if (!open) {
+            if (pendingMatoSyncOnPickerClose) {
+                pendingMatoSyncOnPickerClose = false
+                onMatoLivePush()
+            } else {
+                _uiState.update { it.copy(nowMillis = System.currentTimeMillis()) }
+            }
         }
     }
 
@@ -365,7 +398,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
         primaryProviders.forEach { provider ->
             runCatching {
-                lm.requestLocationUpdates(provider, 4_000L, 6f, listener, Looper.getMainLooper())
+                lm.requestLocationUpdates(provider, 9_000L, 10f, listener, Looper.getMainLooper())
             }
         }
 
@@ -456,8 +489,10 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     lastPollElapsedMs = startMs
                     while (isActive) {
                         val elapsed = System.currentTimeMillis() - startMs
-                        val progress = (elapsed.toFloat() / POLL_INTERVAL_MS.toFloat()).coerceIn(0f, 1f)
-                        _uiState.update { it.copy(nextPollProgress = progress) }
+                        if (!isLinePickerOpen) {
+                            val progress = (elapsed.toFloat() / POLL_INTERVAL_MS.toFloat()).coerceIn(0f, 1f)
+                            _pollProgress.value = progress
+                        }
                         if (elapsed >= POLL_INTERVAL_MS) break
                         delay(1000L)
                     }
@@ -467,9 +502,13 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         if (clockTickerJob?.isActive != true) {
             clockTickerJob = viewModelScope.launch {
                 while (isActive) {
-                    _uiState.update { it.copy(nowMillis = System.currentTimeMillis()) }
+                    if (!isLinePickerOpen) {
+                        _uiState.update { it.copy(nowMillis = System.currentTimeMillis()) }
+                    }
                     // Tick every 1s when inspecting a bus or stop so ages/countdowns update live, else every 5s
-                    val interval = if (_uiState.value.selectedVehicleId != null || _uiState.value.selectedStop != null) {
+                    val interval = if (isLinePickerOpen) {
+                        1000L
+                    } else if (_uiState.value.selectedVehicleId != null || _uiState.value.selectedStop != null) {
                         1000L
                     } else {
                         5000L
@@ -482,11 +521,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshLiveData(isInitial: Boolean = false) {
         viewModelScope.launch {
+            _pollProgress.value = 0f
             _uiState.update {
                 it.copy(
                     isLoadingFeed = isInitial && it.lastUpdatedMillis == null,
                     isRefreshing = true,
-                    nextPollProgress = 0f,
                 )
             }
 
@@ -564,21 +603,34 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                         loadRouteGeometry(line, activeTripIds = liveTripIds, forceRefresh = true)
                     }
                     regenerateWidgetPreview()
+                    consecutivePollFailures = 0
                     val nowSync = System.currentTimeMillis()
                     if (nowSync - lastWidgetSyncMillis >= 60_000L) {
                         lastWidgetSyncMillis = nowSync
-                        BusMapWidgetProvider.syncWidgetsWithCachedSnapshot(appContext)
+                        viewModelScope.launch(Dispatchers.IO) {
+                            BusMapWidgetProvider.syncWidgetsWithCachedSnapshot(appContext)
+                        }
                     }
                     if (_uiState.value.selectedStop != null) {
                         refreshSelectedStopArrivals(silent = true)
                     }
                 },
                 onFailure = { err ->
+                    consecutivePollFailures++
+                    val now = System.currentTimeMillis()
                     _uiState.update { state ->
+                        val hasRecentLiveData = state.lastUpdatedMillis != null &&
+                            (now - state.lastUpdatedMillis) < 95_000L &&
+                            (state.lineVehicles.isNotEmpty() || state.totalCityVehicles > 0)
+                        val showOfflineBanner = !hasRecentLiveData || consecutivePollFailures >= 2
                         state.copy(
                             isLoadingFeed = false,
                             isRefreshing = false,
-                            errorMessage = err.message ?: "Errore di connessione ai feed GTT",
+                            errorMessage = if (showOfflineBanner) {
+                                err.message ?: "Errore di connessione ai feed GTT"
+                            } else {
+                                state.errorMessage
+                            },
                         )
                     }
                     regenerateWidgetPreview()
@@ -588,6 +640,10 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun onMatoLivePush() {
+        if (isLinePickerOpen) {
+            pendingMatoSyncOnPickerClose = true
+            return
+        }
         viewModelScope.launch(Dispatchers.Default) {
             val snapshot = repository.getLiveMatoOverlaySnapshot() ?: return@launch
             val currentSettings = _uiState.value.settings
@@ -599,6 +655,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 .sortedBy { it.vehicleId }
 
+            if (snapshot.allVehicles.isNotEmpty()) {
+                consecutivePollFailures = 0
+            }
             _uiState.update { state ->
                 val updatedExternal = state.focusedExternalVehicle?.let { ext ->
                     snapshot.allVehicles.firstOrNull { it.vehicleId == ext.vehicleId } ?: ext
@@ -618,7 +677,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     feedTimestampSeconds = snapshot.feedTimestampSeconds,
                     nowMillis = System.currentTimeMillis(),
                     totalCityVehicles = snapshot.allVehicles.size,
-                    errorMessage = if (filtered.isNotEmpty()) null else state.errorMessage,
+                    errorMessage = if (snapshot.allVehicles.isNotEmpty()) null else state.errorMessage,
                 )
             }
             resolveMissingVehicleStopNames(filtered)
@@ -679,7 +738,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         loadRouteGeometry(cleaned)
         resolveMissingVehicleStopNames(filtered)
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeStops = false)
     }
 
     private fun filterAlertsForLine(
@@ -759,7 +818,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 regenerateWidgetPreview()
-                BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+                requestWidgetUpdatesAsync(includeStops = false)
             }
         }
     }
@@ -874,7 +933,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             // Re-check if user closed/switched stop while loading target line geometry
             if (_uiState.value.selectedStop?.stopId != stop.stopId) return@launch
 
-            val matched = GttRealtimeRepository.findExactBusForArrival(
+            var matched = GttRealtimeRepository.findExactBusForArrival(
                 arrival = arrival,
                 stop = stop,
                 allLivePool = allLive,
@@ -883,13 +942,31 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 nowMillis = System.currentTimeMillis(),
             )
 
+            // If a "Live" arrival (especially on another line like 55/5) wasn't in the general GTFS-RT pool,
+            // run an instant on-demand MaTO GraphQL query for that exact line before giving up.
+            if (matched == null && arrival.isRealtime) {
+                val onDemandLineBuses = repository.fetchLiveVehiclesForSingleLine(targetLine)
+                if (_uiState.value.selectedStop?.stopId != stop.stopId) return@launch
+                if (onDemandLineBuses.isNotEmpty()) {
+                    val expandedPool = allLive + onDemandLineBuses
+                    matched = GttRealtimeRepository.findExactBusForArrival(
+                        arrival = arrival,
+                        stop = stop,
+                        allLivePool = expandedPool,
+                        targetLinePatterns = targetLinePatterns,
+                        claimedVehicleIds = claimedVehicleIds,
+                        nowMillis = System.currentTimeMillis(),
+                    )
+                }
+            }
+
             if (matched == null) {
                 val clockStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.ITALY)
                     .format(java.util.Date(arrival.arrivalEpochSeconds * 1000L))
                 _uiState.update {
                     it.copy(
                         statusToast = if (arrival.isRealtime) {
-                            "Posizione GPS esatta di questa corsa (linea $targetLine, $clockStr) non disponibile"
+                            "Orario live AVM confermato (linea $targetLine, $clockStr) · GPS del mezzo non trasmesso da GTT"
                         } else {
                             "Corsa programmata linea $targetLine ($clockStr) · mezzo non ancora tracciato dal vivo"
                         },
@@ -1067,6 +1144,24 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun requestWidgetUpdatesAsync(
+        includeMap: Boolean = true,
+        includeStops: Boolean = false,
+        rescheduleInterval: RefreshInterval? = null,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            if (rescheduleInterval != null) {
+                BusMapWidgetProvider.schedulePeriodicUpdates(appContext, rescheduleInterval)
+            }
+            if (includeMap) {
+                BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+            }
+            if (includeStops) {
+                StopArrivalsWidgetProvider.requestUpdateAll(appContext)
+            }
+        }
+    }
+
     fun toggleFavoriteStop(stop: TransitStop) {
         val state = _uiState.value
         val fav = FavoriteStop(
@@ -1084,13 +1179,13 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 favoriteStops = updated,
+                favoriteStopIds = updated.map { favStop -> favStop.stopId }.toSet(),
                 statusToast = if (added) "Fermata \"$label\" salvata nei preferiti" else "Rimossa dai preferiti",
             )
         }
         regenerateWidgetPreview()
         refreshStopWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
-        StopArrivalsWidgetProvider.requestUpdateAll(appContext)
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = true)
     }
 
     fun removeFavoriteStop(stopId: String) {
@@ -1098,13 +1193,28 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 favoriteStops = updated,
+                favoriteStopIds = updated.map { favStop -> favStop.stopId }.toSet(),
                 statusToast = "Fermata rimossa dai preferiti",
             )
         }
         regenerateWidgetPreview()
         refreshStopWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
-        StopArrivalsWidgetProvider.requestUpdateAll(appContext)
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = true)
+    }
+
+    fun toggleFavoriteLine(lineCode: String) {
+        val cleaned = lineCode.trim().uppercase().ifBlank { return }
+        val (updated, added) = preferences.toggleFavoriteLine(cleaned)
+        _uiState.update {
+            it.copy(
+                favoriteLines = updated,
+                statusToast = if (added) {
+                    "Linea $cleaned aggiunta ai preferiti"
+                } else {
+                    "Linea $cleaned rimossa dai preferiti"
+                },
+            )
+        }
     }
 
     fun openFavoriteStop(fav: FavoriteStop) {
@@ -1132,14 +1242,14 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         val updated = preferences.updateSettings { it.copy(mapStyle = style) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun setCameraMode(mode: WidgetCameraMode) {
         val updated = preferences.updateSettings { it.copy(cameraMode = mode) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun saveCurrentMapAsWidgetArea() {
@@ -1157,42 +1267,41 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun setShowVehicleLabels(show: Boolean) {
         val updated = preferences.updateSettings { it.copy(showVehicleLabels = show) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun setShowRouteLine(show: Boolean) {
         val updated = preferences.updateSettings { it.copy(showRouteLine = show) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun setColorByDirection(enabled: Boolean) {
         val updated = preferences.updateSettings { it.copy(colorByDirection = enabled) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun setHideInactiveInWidget(hide: Boolean) {
         val updated = preferences.updateSettings { it.copy(hideInactiveInWidget = hide) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true)
     }
 
     fun setRefreshInterval(interval: RefreshInterval) {
         val updated = preferences.updateSettings { it.copy(refreshInterval = interval) }
         _uiState.update { it.copy(settings = updated) }
-        BusMapWidgetProvider.schedulePeriodicUpdates(appContext, interval)
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
+        requestWidgetUpdatesAsync(includeMap = true, rescheduleInterval = interval)
     }
 
     fun setPreviewSize(size: WidgetPreviewSize) {
@@ -1209,8 +1318,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun triggerHomeWidgetSync() {
-        BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
-        StopArrivalsWidgetProvider.requestUpdateAll(appContext)
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = true)
         if (_uiState.value.previewSize == WidgetPreviewSize.STOPS_LIVE) {
             refreshStopWidgetPreview()
         } else {
@@ -1219,9 +1327,18 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(statusToast = "Widget sulla Home aggiornati") }
     }
 
+    fun openFavoriteStopById(stopId: String) {
+        val cleaned = stopId.trim()
+        if (cleaned.isEmpty()) return
+        val fav = _uiState.value.favoriteStops.firstOrNull {
+            it.stopId.equals(cleaned, ignoreCase = true)
+        } ?: return
+        openFavoriteStop(fav)
+    }
+
     fun refreshStopWidgetPreview() {
-        val visibleFavorites = _uiState.value.favoriteStops.take(3)
-        if (visibleFavorites.isEmpty()) {
+        val allFavorites = _uiState.value.favoriteStops
+        if (allFavorites.isEmpty()) {
             _uiState.update { it.copy(stopWidgetPreviewByStopId = emptyMap(), isLoadingStopWidgetPreview = false) }
             return
         }
@@ -1230,7 +1347,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(isLoadingStopWidgetPreview = true) }
             val cachedAll = repository.getLastCachedSnapshot()?.allVehicles ?: _uiState.value.lineVehicles
             val byStopId: Map<String, List<StopArrival>> = coroutineScope {
-                visibleFavorites.map { fav ->
+                allFavorites.map { fav ->
                     async {
                         val lineVehicles = cachedAll.filter {
                             it.lineCode.equals(fav.lineCode, ignoreCase = true)

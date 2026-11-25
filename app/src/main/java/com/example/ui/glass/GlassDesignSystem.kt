@@ -4,6 +4,9 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RadialGradient
 import android.graphics.Shader
+import android.os.Build
+import android.view.HapticFeedbackConstants
+import android.view.View
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -53,7 +56,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -69,7 +71,12 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.semantics.Role
+import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.GlassBandBorder
 import com.example.ui.theme.GlassBandFill
 import com.example.ui.theme.GlassCardBorder
@@ -79,14 +86,22 @@ import com.example.ui.theme.GlassPillActiveFill
 import com.example.ui.theme.GlassPillBorder
 import com.example.ui.theme.GlassPillFill
 import com.example.ui.theme.GlassRootBlack
+import com.example.ui.theme.GlassRowBorder
+import com.example.ui.theme.GlassRowFill
 import com.example.ui.theme.GlassSliderBorder
 import com.example.ui.theme.GlassSliderBottom
 import com.example.ui.theme.GlassSliderMid
 import com.example.ui.theme.GlassSliderTop
+import com.example.ui.theme.OverlayCardDarkBottom
+import com.example.ui.theme.OverlayCardDarkTop
+import com.example.ui.theme.OverlayCardLightBottom
+import com.example.ui.theme.OverlayCardLightTop
 import com.example.ui.theme.OverlayPillBorder
 import com.example.ui.theme.OverlayPillFill
 import com.example.ui.theme.OverlayPillPressedBorder
 import com.example.ui.theme.OverlayPillPressedFill
+import com.example.ui.theme.OverlayShimmerBase
+import com.example.ui.theme.OverlayShimmerHighlight
 import com.example.ui.theme.TextBody
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSubtitle
@@ -95,6 +110,39 @@ import com.example.ui.theme.TextSubtitle
  * Exact spring physics spec: stiffness = 380f, dampingRatio = 0.86f.
  */
 fun <T> glassSpring() = spring<T>(dampingRatio = 0.86f, stiffness = 380f)
+
+private val BandShape = RoundedCornerShape(26.dp)
+private val CardDefaultShape = RoundedCornerShape(16.dp)
+private val BadgeDefaultShape = RoundedCornerShape(12.dp)
+private val DirectionBadgeShape = RoundedCornerShape(10.dp)
+private val PillShape = RoundedCornerShape(999.dp)
+private val ProgressPillShape = RoundedCornerShape(99.dp)
+private val ModalDialogShape = RoundedCornerShape(28.dp)
+
+private val PillTopSheenBrush = Brush.verticalGradient(
+    colors = listOf(Color(0x16FFFFFF), Color.Transparent),
+)
+private val SliderGlassBrush = Brush.verticalGradient(
+    colors = listOf(GlassSliderTop, GlassSliderMid, GlassSliderBottom),
+)
+private val SliderGlassRimBrush = liquidGlassRimBrush(
+    topAlpha = 0.48f,
+    midAlpha = 0.14f,
+    bottomAlpha = 0.24f,
+)
+private val ModalGlassSurfaceBrush = Brush.verticalGradient(
+    colors = listOf(
+        Color(0xEB1E212E),
+        Color(0xE812141D),
+        Color(0xEB0E1017),
+    ),
+)
+private val SwitchThumbCheckedBrush = Brush.verticalGradient(
+    colors = listOf(Color.White, Color(0xFFE6F6FF)),
+)
+private val SwitchThumbUncheckedBrush = Brush.verticalGradient(
+    colors = listOf(Color(0xD8FFFFFF), Color(0x9CB8C4D4)),
+)
 
 /**
  * Normalizes any accent color to HSV saturation [0.50..0.90] and value = 0.95 for rich ambient glow.
@@ -216,13 +264,11 @@ fun GlassBand(
     contentPadding: Dp = 16.dp,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    val shape = RoundedCornerShape(26.dp)
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .clip(shape)
-            .background(GlassBandFill)
-            .border(1.dp, GlassBandBorder, shape)
+            .background(GlassBandFill, BandShape)
+            .border(1.dp, GlassBandBorder, BandShape)
             .padding(contentPadding),
         content = content,
     )
@@ -238,11 +284,12 @@ fun GlassCard(
     borderColor: Color = GlassCardBorder,
     content: @Composable BoxScope.() -> Unit,
 ) {
-    val shape = RoundedCornerShape(cornerRadius)
+    val shape = remember(cornerRadius) {
+        if (cornerRadius == 16.dp) CardDefaultShape else RoundedCornerShape(cornerRadius)
+    }
     Box(
         modifier = modifier
-            .clip(shape)
-            .background(GlassCardFill)
+            .background(GlassCardFill, shape)
             .border(1.dp, borderColor, shape),
         content = content,
     )
@@ -259,13 +306,11 @@ fun AccentIconBadge(
     size: Dp = 40.dp,
     iconSize: Dp = 20.dp,
 ) {
-    val shape = RoundedCornerShape(12.dp)
     Box(
         modifier = Modifier
             .size(size)
-            .clip(shape)
-            .background(accent.copy(alpha = 0.18f))
-            .border(1.dp, accent.copy(alpha = 0.45f), shape),
+            .background(accent.copy(alpha = 0.18f), BadgeDefaultShape)
+            .border(1.dp, accent.copy(alpha = 0.45f), BadgeDefaultShape),
         contentAlignment = Alignment.Center,
     ) {
         Icon(
@@ -287,12 +332,10 @@ fun RecessedMetricPill(
     valueColor: Color = TextPrimary,
     modifier: Modifier = Modifier,
 ) {
-    val shape = RoundedCornerShape(12.dp)
     Column(
         modifier = modifier
-            .clip(shape)
-            .background(Color(0x12FFFFFF))
-            .border(1.dp, Color(0x18FFFFFF), shape)
+            .background(Color(0x12FFFFFF), BadgeDefaultShape)
+            .border(1.dp, Color(0x18FFFFFF), BadgeDefaultShape)
             .padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
         Text(
@@ -364,8 +407,7 @@ fun GlassCircleIconButton(
         modifier = modifier
             .size(48.dp)
             .glassInteractive(interactionSource = interactionSource, onClick = onClick)
-            .clip(CircleShape)
-            .background(fillColor)
+            .background(fillColor, CircleShape)
             .border(borderWidth, borderColor, CircleShape),
         contentAlignment = Alignment.Center,
     ) {
@@ -399,9 +441,8 @@ fun <T> SlidingGlassSegmentedControl(
         modifier = modifier
             .fillMaxWidth()
             .height(48.dp)
-            .clip(RoundedCornerShape(999.dp))
-            .background(GlassPillFill)
-            .border(1.dp, GlassPillBorder, RoundedCornerShape(999.dp))
+            .background(GlassPillFill, PillShape)
+            .border(1.dp, GlassPillBorder, PillShape)
             .padding(4.dp),
     ) {
         val slotWidth = maxWidth / items.size
@@ -417,13 +458,15 @@ fun <T> SlidingGlassSegmentedControl(
                 .offset(x = indicatorOffset)
                 .width(slotWidth)
                 .fillMaxHeight()
-                .clip(RoundedCornerShape(999.dp))
                 .background(
-                    Brush.verticalGradient(
-                        colors = listOf(GlassSliderTop, GlassSliderMid, GlassSliderBottom),
-                    ),
+                    brush = SliderGlassBrush,
+                    shape = PillShape,
                 )
-                .border(1.5.dp, GlassSliderBorder, RoundedCornerShape(999.dp)),
+                .border(
+                    width = 1.dp,
+                    brush = SliderGlassRimBrush,
+                    shape = PillShape,
+                ),
         )
 
         Row(modifier = Modifier.fillMaxSize()) {
@@ -468,8 +511,7 @@ fun GlassProgressBar(
         modifier = modifier
             .fillMaxWidth()
             .height(3.5.dp)
-            .clip(RoundedCornerShape(99.dp))
-            .background(Color(0x26FFFFFF)),
+            .background(Color(0x26FFFFFF), ProgressPillShape),
     ) {
         Box(
             modifier = Modifier
@@ -478,8 +520,7 @@ fun GlassProgressBar(
                     scaleX = clamped
                     transformOrigin = TransformOrigin(0f, 0.5f)
                 }
-                .clip(RoundedCornerShape(99.dp))
-                .background(Color(0xE6FFFFFF)),
+                .background(Color(0xE6FFFFFF), ProgressPillShape),
         )
     }
 }
@@ -522,11 +563,27 @@ fun HeroEntranceText(
 }
 
 /**
- * High-contrast Smoked Glass pill surface for controls floating directly over the live map.
+ * Vertical specular border brush reminiscent of Apple Liquid Glass edge refraction.
+ */
+fun liquidGlassRimBrush(
+    topAlpha: Float = 0.44f,
+    midAlpha: Float = 0.14f,
+    bottomAlpha: Float = 0.24f,
+): Brush = Brush.verticalGradient(
+    colors = listOf(
+        Color.White.copy(alpha = topAlpha),
+        Color.White.copy(alpha = midAlpha),
+        Color.White.copy(alpha = bottomAlpha),
+    ),
+)
+
+/**
+ * High-contrast Smoked / Liquid Glass pill surface for controls floating directly over the live map.
  */
 @Composable
 fun MapOverlayGlassPill(
     onClick: (() -> Unit)? = null,
+    isLightBasemap: Boolean = false,
     modifier: Modifier = Modifier,
     content: @Composable BoxScope.() -> Unit,
 ) {
@@ -534,8 +591,18 @@ fun MapOverlayGlassPill(
     val pressed by interactionSource.collectIsPressedAsState()
     val hovered by interactionSource.collectIsHoveredAsState()
 
-    val fill = if (pressed) OverlayPillPressedFill else OverlayPillFill
-    val border = if (pressed || hovered) OverlayPillPressedBorder else OverlayPillBorder
+    val fill = when {
+        pressed -> OverlayPillPressedFill
+        isLightBasemap -> com.example.ui.theme.OverlayPillLightMapFill
+        else -> OverlayPillFill
+    }
+    val borderBrush = remember(pressed, hovered) {
+        if (pressed || hovered) {
+            liquidGlassRimBrush(topAlpha = 0.72f, midAlpha = 0.30f, bottomAlpha = 0.46f)
+        } else {
+            liquidGlassRimBrush(topAlpha = 0.46f, midAlpha = 0.15f, bottomAlpha = 0.26f)
+        }
+    }
     val borderW = if (pressed) 1.5.dp else 1.dp
 
     val baseMod = if (onClick != null) {
@@ -546,11 +613,14 @@ fun MapOverlayGlassPill(
 
     Surface(
         modifier = baseMod,
-        shape = RoundedCornerShape(999.dp),
+        shape = PillShape,
         color = fill,
-        border = BorderStroke(borderW, border),
+        border = BorderStroke(borderW, borderBrush),
     ) {
-        Box(content = content)
+        Box(
+            modifier = Modifier.background(PillTopSheenBrush),
+            content = content,
+        )
     }
 }
 
@@ -565,12 +635,10 @@ fun DirectionColorBadge(
     modifier: Modifier = Modifier,
     prefix: String? = null,
 ) {
-    val shape = RoundedCornerShape(10.dp)
     Row(
         modifier = modifier
-            .clip(shape)
-            .background(accent.copy(alpha = 0.16f))
-            .border(1.dp, accent.copy(alpha = 0.50f), shape)
+            .background(accent.copy(alpha = 0.16f), DirectionBadgeShape)
+            .border(1.dp, accent.copy(alpha = 0.50f), DirectionBadgeShape)
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -578,8 +646,7 @@ fun DirectionColorBadge(
         Box(
             modifier = Modifier
                 .size(6.dp)
-                .clip(CircleShape)
-                .background(accent),
+                .background(accent, CircleShape),
         )
         Text(
             text = if (prefix != null) "$prefix $label" else label,
@@ -606,45 +673,38 @@ fun GlassModalDialog(
         onDismissRequest = onDismissRequest,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        val shape = RoundedCornerShape(28.dp)
-        val glassSurfaceBrush = Brush.verticalGradient(
-            colors = listOf(
-                Color(0xEB1E212E),
-                Color(0xE812141D),
-                Color(0xEB0E1017),
-            ),
-        )
-        val borderBrush = Brush.verticalGradient(
-            colors = listOf(
-                accentTint?.copy(alpha = 0.55f) ?: Color(0x52FFFFFF),
-                Color(0x24FFFFFF),
-                Color(0x14FFFFFF),
-            ),
-        )
+        val borderBrush = remember(accentTint) {
+            Brush.verticalGradient(
+                colors = listOf(
+                    accentTint?.copy(alpha = 0.55f) ?: Color(0x52FFFFFF),
+                    Color(0x24FFFFFF),
+                    Color(0x14FFFFFF),
+                ),
+            )
+        }
+        val accentWashBrush = remember(accentTint) {
+            accentTint?.let { tint ->
+                Brush.verticalGradient(
+                    colors = listOf(tint.copy(alpha = 0.14f), Color.Transparent),
+                    endY = 260f,
+                )
+            }
+        }
 
         Box(
             modifier = modifier
                 .fillMaxWidth()
                 .padding(horizontal = 18.dp)
                 .widthIn(max = 520.dp)
-                .clip(shape)
-                .background(glassSurfaceBrush)
+                .background(ModalGlassSurfaceBrush, ModalDialogShape)
                 .then(
-                    if (accentTint != null) {
-                        Modifier.background(
-                            Brush.verticalGradient(
-                                colors = listOf(
-                                    accentTint.copy(alpha = 0.14f),
-                                    Color.Transparent,
-                                ),
-                                endY = 260f,
-                            ),
-                        )
+                    if (accentWashBrush != null) {
+                        Modifier.background(accentWashBrush, ModalDialogShape)
                     } else {
                         Modifier
                     },
                 )
-                .border(1.2.dp, borderBrush, shape),
+                .border(1.2.dp, borderBrush, ModalDialogShape),
         ) {
             Column(
                 modifier = Modifier
@@ -655,3 +715,225 @@ fun GlassModalDialog(
         }
     }
 }
+
+/**
+ * Cohesive Liquid Glass pop-up / inspector container calibrated for both dark and light basemaps.
+ * Shares the exact refractive specular rim and translucent smoked tint as the floating map pills.
+ */
+@Composable
+fun LiquidGlassOverlaySurface(
+    isLightBasemap: Boolean,
+    accentTint: Color? = null,
+    modifier: Modifier = Modifier,
+    shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(24.dp),
+    content: @Composable BoxScope.() -> Unit,
+) {
+    val baseTop = if (isLightBasemap) OverlayCardLightTop else OverlayCardDarkTop
+    val baseBottom = if (isLightBasemap) OverlayCardLightBottom else OverlayCardDarkBottom
+    val baseBrush = remember(isLightBasemap) {
+        Brush.verticalGradient(colors = listOf(baseTop, baseBottom))
+    }
+    val topSheenBrush = remember(accentTint, isLightBasemap) {
+        val topHighlight = accentTint?.copy(alpha = if (isLightBasemap) 0.14f else 0.11f)
+            ?: Color(if (isLightBasemap) 0x1EFFFFFF else 0x14FFFFFF)
+        Brush.verticalGradient(
+            colors = listOf(topHighlight, Color.Transparent),
+            endY = 210f,
+        )
+    }
+    val borderBrush = remember(accentTint, isLightBasemap) {
+        if (accentTint != null) {
+            Brush.verticalGradient(
+                colors = listOf(
+                    Color.White.copy(alpha = if (isLightBasemap) 0.62f else 0.50f),
+                    accentTint.copy(alpha = 0.44f),
+                    Color.White.copy(alpha = 0.22f),
+                ),
+            )
+        } else {
+            liquidGlassRimBrush(
+                topAlpha = if (isLightBasemap) 0.62f else 0.50f,
+                midAlpha = 0.16f,
+                bottomAlpha = 0.28f,
+            )
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .background(baseBrush, shape)
+            .background(topSheenBrush, shape)
+            .border(1.2.dp, borderBrush, shape),
+        content = content,
+    )
+}
+
+/**
+ * Elastic Liquid Glass Switch with spring thumb travel, translucent track refraction,
+ * and specular white-glass orb (48dp minimum touch target, full Switch accessibility semantics).
+ */
+@Composable
+fun LiquidGlassSwitch(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    accentColor: Color = AccentCyan,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+
+    val thumbOffset by animateDpAsState(
+        targetValue = if (checked) 22.dp else 0.dp,
+        animationSpec = glassSpring(),
+        label = "liquid_switch_thumb_x",
+    )
+    val thumbScale by animateFloatAsState(
+        targetValue = if (pressed) 0.92f else 1f,
+        animationSpec = tween(durationMillis = 90),
+        label = "liquid_switch_thumb_scale",
+    )
+    val trackTopColor by animateColorAsState(
+        targetValue = if (checked) accentColor.copy(alpha = 0.42f) else GlassPillFill,
+        animationSpec = tween(durationMillis = 220),
+        label = "liquid_switch_track_top",
+    )
+    val trackBottomColor by animateColorAsState(
+        targetValue = if (checked) accentColor.copy(alpha = 0.24f) else GlassRowFill,
+        animationSpec = tween(durationMillis = 220),
+        label = "liquid_switch_track_bottom",
+    )
+    val rimBottomColor by animateColorAsState(
+        targetValue = if (checked) accentColor.copy(alpha = 0.85f) else GlassRowBorder,
+        animationSpec = tween(durationMillis = 220),
+        label = "liquid_switch_rim_bottom",
+    )
+
+    Box(
+        modifier = modifier
+            .defaultMinSize(minWidth = 52.dp, minHeight = 48.dp)
+            .toggleable(
+                value = checked,
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Switch,
+                onValueChange = onCheckedChange,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .width(52.dp)
+                .height(30.dp)
+                .background(
+                    Brush.verticalGradient(listOf(trackTopColor, trackBottomColor)),
+                    PillShape,
+                )
+                .border(
+                    width = if (checked) 1.25.dp else 1.dp,
+                    brush = Brush.verticalGradient(
+                        listOf(
+                            Color.White.copy(alpha = if (checked) 0.65f else 0.36f),
+                            rimBottomColor,
+                        ),
+                    ),
+                    shape = PillShape,
+                )
+                .padding(3.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .offset(x = thumbOffset)
+                    .size(24.dp)
+                    .graphicsLayer {
+                        scaleX = thumbScale
+                        scaleY = thumbScale
+                    }
+                    .background(
+                        if (checked) SwitchThumbCheckedBrush else SwitchThumbUncheckedBrush,
+                        CircleShape,
+                    )
+                    .border(
+                        width = 0.8.dp,
+                        color = if (checked) Color.White else Color(0x66FFFFFF),
+                        shape = CircleShape,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (checked) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .background(accentColor.copy(alpha = 0.72f), CircleShape),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private val ShimmerGradientColors = listOf(
+    OverlayShimmerBase,
+    OverlayShimmerHighlight,
+    OverlayShimmerBase,
+)
+
+/**
+ * Lightweight animated diagonal specular shimmer brush for loading widget previews.
+ */
+@Composable
+fun rememberGlassShimmerBrush(): Brush {
+    val transition = rememberInfiniteTransition(label = "widget_glass_shimmer")
+    val shift by transition.animateFloat(
+        initialValue = -320f,
+        targetValue = 960f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1350, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "widget_shimmer_shift",
+    )
+    return Brush.linearGradient(
+        colors = ShimmerGradientColors,
+        start = Offset(shift, shift * 0.45f),
+        end = Offset(shift + 340f, shift * 0.45f + 220f),
+    )
+}
+
+@Composable
+fun GlassShimmerBox(
+    modifier: Modifier = Modifier,
+    shape: androidx.compose.ui.graphics.Shape = RoundedCornerShape(14.dp),
+    brush: Brush = rememberGlassShimmerBrush(),
+) {
+    Box(
+        modifier = modifier
+            .background(brush, shape)
+            .border(1.dp, Color(0x18FFFFFF), shape),
+    )
+}
+
+enum class LightHapticKind {
+    /** Crisp single-impulse click when locking onto a bus on the map or bottom pill. */
+    SELECT_BUS,
+    /** Feather-light discrete tick when switching to another stop. */
+    SWITCH_STOP,
+}
+
+/**
+ * Triggers a subtle, zero-permission hardware haptic primitive tailored for devices
+ * with linear resonant actuators (HD haptics), while automatically respecting system settings.
+ */
+fun performLightHaptic(view: View, kind: LightHapticKind) {
+    val constant = when (kind) {
+        LightHapticKind.SELECT_BUS -> HapticFeedbackConstants.CONTEXT_CLICK
+        LightHapticKind.SWITCH_STOP -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                HapticFeedbackConstants.SEGMENT_TICK
+            } else {
+                HapticFeedbackConstants.CLOCK_TICK
+            }
+        }
+    }
+    view.performHapticFeedback(constant)
+}
+

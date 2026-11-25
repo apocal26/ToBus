@@ -65,36 +65,36 @@ internal object TurinVectorStyleBuilder {
 
     private fun paletteFor(mapStyle: MapStyle): Palette = when (mapStyle) {
         MapStyle.DARK -> Palette(
-            background = "#121824",
-            residentialZone = "#161E2D",
-            industrialZone = "#1A2232",
-            hospitalZone = "#2B1D2C",
-            campusZone = "#1F243B",
-            stadiumZone = "#1A3242",
-            parkGreen = "#1B5238",
-            woodGreen = "#14422C",
-            parkOutline = "#2B7451",
-            waterFill = "#12426E",
-            waterwayLine = "#1D5E96",
-            buildingFill = "#253349",
-            buildingOutline = "#3D5170",
-            railLine = "#3A4963",
-            pathLine = "#2B3A52",
-            minorCasing = "#0B1018",
-            minorFill = "#303F58",
-            secondaryCasing = "#0A0F17",
-            secondaryFill = "#425677",
-            primaryCasing = "#090D14",
-            primaryFill = "#546D94",
-            motorwayCasing = "#080C12",
-            motorwayFill = "#6B87B3",
-            boundaryLine = "#36465E",
-            waterText = "#78C2F4",
-            streetText = "#D2DCEB",
-            streetHalo = "rgba(13, 18, 28, 0.92)",
-            neighborhoodText = "#C4D1E3",
-            cityText = "#EDF3FC",
-            placeHalo = "rgba(12, 16, 26, 0.94)",
+            background = "#0F141E",
+            residentialZone = "#131924",
+            industrialZone = "#161D2A",
+            hospitalZone = "#231926",
+            campusZone = "#191E30",
+            stadiumZone = "#162836",
+            parkGreen = "#16442E",
+            woodGreen = "#113624",
+            parkOutline = "#236043",
+            waterFill = "#10395E",
+            waterwayLine = "#194F80",
+            buildingFill = "#1C2433",
+            buildingOutline = "#2B374D",
+            railLine = "#2E3A4E",
+            pathLine = "#232E40",
+            minorCasing = "#090D14",
+            minorFill = "#242E40",
+            secondaryCasing = "#080C12",
+            secondaryFill = "#2F3C52",
+            primaryCasing = "#070B10",
+            primaryFill = "#3B4B66",
+            motorwayCasing = "#06090E",
+            motorwayFill = "#485C7D",
+            boundaryLine = "#2C394D",
+            waterText = "#6BB3E6",
+            streetText = "#BCC8DA",
+            streetHalo = "rgba(11, 15, 23, 0.94)",
+            neighborhoodText = "#AEBCD0",
+            cityText = "#E6EEF8",
+            placeHalo = "rgba(10, 14, 22, 0.95)",
         )
 
         MapStyle.POSITRON -> Palette(
@@ -602,6 +602,145 @@ internal object TurinVectorStyleBuilder {
                         .put("text-color", p.streetText)
                         .put("text-halo-color", p.streetHalo)
                         .put("text-halo-width", 1.5),
+                )
+            },
+        )
+
+        layers.put(
+            JSONObject().apply {
+                put("id", "label-piazze")
+                put("type", "symbol")
+                put("source", VECTOR_SOURCE_ID)
+                put("source-layer", "transportation_name")
+                put("minzoom", 15.2)
+                put(
+                    "filter",
+                    JSONArray()
+                        .put("all")
+                        .put(eqFilter("subclass", "pedestrian"))
+                        .put(
+                            JSONArray()
+                                .put("match")
+                                .put(
+                                    JSONArray().put("downcase").put(
+                                        JSONArray()
+                                            .put("coalesce")
+                                            .put(JSONArray().put("get").put("name:it"))
+                                            .put(JSONArray().put("get").put("name:latin"))
+                                            .put(JSONArray().put("get").put("name"))
+                                            .put(""),
+                                    ),
+                                )
+                                .put("piazza castello").put(false)
+                                .put("piazza vittorio veneto").put(false)
+                                .put("piazza san carlo").put(false)
+                                .put("piazza statuto").put(false)
+                                .put("piazza solferino").put(false)
+                                .put("piazza arbarello").put(false)
+                                .put("piazza bernini").put(false)
+                                .put("piazza lorenzo bernini").put(false)
+                                .put("piazza sabotino").put(false)
+                                .put("piazza rivoli").put(false)
+                                .put("piazza massaua").put(false)
+                                .put("piazza carducci").put(false)
+                                .put("piazza giosuè carducci").put(false)
+                                .put("piazza bengasi").put(false)
+                                .put("piazza sofia").put(false)
+                                .put("piazza rebaudengo").put(false)
+                                .put("piazza conti di rebaudengo").put(false)
+                                .put("piazza gran madre").put(false)
+                                .put("piazza della gran madre").put(false)
+                                .put(true),
+                        ),
+                )
+                put(
+                    "layout",
+                    JSONObject()
+                        .put("symbol-placement", "point")
+                        .put("text-field", nameCoalesceExpr())
+                        .put("text-font", JSONArray().put("Noto Sans Bold"))
+                        .put("text-size", zoomInterp(15.2 to 10.6, 17.5 to 12.0))
+                        .put("text-max-width", 8)
+                        .put("text-padding", 8),
+                )
+                put(
+                    "paint",
+                    JSONObject()
+                        .put("text-color", p.cityText)
+                        .put("text-halo-color", p.placeHalo)
+                        .put("text-halo-width", 1.8),
+                )
+            },
+        )
+
+        layers.put(
+            JSONObject().apply {
+                put("id", "label-parks")
+                put("type", "symbol")
+                put("source", VECTOR_SOURCE_ID)
+                put("source-layer", "park")
+                put("minzoom", 15.8)
+                put(
+                    "filter",
+                    JSONArray()
+                        .put("all")
+                        .put(JSONArray().put("has").put("name"))
+                        .put(
+                            JSONArray()
+                                .put("match")
+                                .put(
+                                    JSONArray().put("downcase").put(
+                                        JSONArray()
+                                            .put("coalesce")
+                                            .put(JSONArray().put("get").put("name:it"))
+                                            .put(JSONArray().put("get").put("name:latin"))
+                                            .put(JSONArray().put("get").put("name"))
+                                            .put(""),
+                                    ),
+                                )
+                                .put("parco del valentino").put(false)
+                                .put("parco della pellerina").put(false)
+                                .put("parco mario carrà").put(false)
+                                .put("parco ruffini").put(false)
+                                .put("parco dora").put(false)
+                                .put("giardini reali").put(false)
+                                .put("parco della colletta").put(false)
+                                .put("parco rignon").put(false)
+                                .put("parco cavalieri di vittorio veneto").put(false)
+                                .put("piazza d'armi").put(false)
+                                .put("parco della tesoriera").put(false)
+                                .put("parco europa").put(false)
+                                .put("parco colonnetti").put(false)
+                                .put("parco gino colonnetti").put(false)
+                                .put(true),
+                        ),
+                )
+                put(
+                    "layout",
+                    JSONObject()
+                        .put("text-field", nameCoalesceExpr())
+                        .put("text-font", JSONArray().put("Noto Sans Bold"))
+                        .put("text-size", zoomInterp(15.8 to 10.6, 17.8 to 12.4))
+                        .put("text-max-width", 9)
+                        .put("text-padding", 12)
+                        .put(
+                            "symbol-sort-key",
+                            JSONArray()
+                                .put("to-number")
+                                .put(
+                                    JSONArray()
+                                        .put("coalesce")
+                                        .put(JSONArray().put("get").put("rank"))
+                                        .put(50),
+                                ),
+                        ),
+                )
+                put(
+                    "paint",
+                    JSONObject()
+                        .put("text-color", if (mapStyle.isDark) "#8DE2B9" else "#1F6B43")
+                        .put("text-halo-color", p.placeHalo)
+                        .put("text-halo-width", 1.9),
                 )
             },
         )

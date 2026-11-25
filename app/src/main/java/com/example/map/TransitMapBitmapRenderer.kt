@@ -21,6 +21,7 @@ import com.example.data.model.WidgetCameraMode
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.floor
@@ -198,8 +199,10 @@ object TransitMapBitmapRenderer {
         val tiles = coroutineScope {
             coords.map { (tx, ty) ->
                 async {
-                    val (bmp, needsFilter) = tileManager.loadCleanWidgetTile(tileZoom, tx, ty, style)
-                    QuadTile(tx, ty, bmp, needsFilter)
+                    val loaded = withTimeoutOrNull(1_800L) {
+                        tileManager.loadCleanWidgetTile(tileZoom, tx, ty, style)
+                    }
+                    QuadTile(tx, ty, loaded?.first, loaded?.second ?: false)
                 }
             }.awaitAll()
         }
@@ -396,26 +399,42 @@ object TransitMapBitmapRenderer {
             haloPaint.color = (accentColor and 0x00FFFFFF) or (if (health.isInactiveOrSuspicious) 0x20000000 else 0x42000000)
             canvas.drawCircle(sx, sy, haloRadius, haloPaint)
 
-            // Crisp ring + fill
+            // Crisp ring + fill (Terminus uses dark center + direction-colored upright pause bars)
             ringPaint.alpha = alphaInt
             canvas.drawCircle(sx, sy, ringRadius, ringPaint)
 
-            fillPaint.color = accentColor
-            fillPaint.alpha = alphaInt
-            canvas.drawCircle(sx, sy, radius, fillPaint)
+            if (health.isAtTerminus && !health.isInactiveOrSuspicious) {
+                fillPaint.color = accentColor
+                fillPaint.alpha = 255
+                canvas.drawCircle(sx, sy, radius, fillPaint)
+                fillPaint.color = COLOR_INK_DARK
+                canvas.drawCircle(sx, sy, radius * 0.78f, fillPaint)
 
-            // Direction chevron
-            arrowPaint.color = COLOR_INK_DARK
-            arrowPaint.alpha = alphaInt
-            val bearing = bus.bearing
-            if (bearing != null) {
-                drawDirectionalChevron(canvas, sx, sy, bearing, radius * 0.62f, arrowPaint)
+                arrowPaint.color = accentColor
+                arrowPaint.alpha = 255
+                val bw = radius * 0.20f
+                val bh = radius * 0.72f
+                val gap = radius * 0.14f
+                canvas.drawRoundRect(sx - gap - bw, sy - bh / 2f, sx - gap, sy + bh / 2f, bw * 0.4f, bw * 0.4f, arrowPaint)
+                canvas.drawRoundRect(sx + gap, sy - bh / 2f, sx + gap + bw, sy + bh / 2f, bw * 0.4f, bw * 0.4f, arrowPaint)
             } else {
-                canvas.drawCircle(sx, sy, radius * 0.32f, arrowPaint)
+                fillPaint.color = accentColor
+                fillPaint.alpha = alphaInt
+                canvas.drawCircle(sx, sy, radius, fillPaint)
+
+                // Direction chevron ONLY for moving active buses; upright dot otherwise
+                arrowPaint.color = COLOR_INK_DARK
+                arrowPaint.alpha = alphaInt
+                val bearing = bus.bearing
+                if (bearing != null && !health.isInactiveOrSuspicious) {
+                    drawDirectionalChevron(canvas, sx, sy, bearing, radius * 0.62f, arrowPaint)
+                } else {
+                    canvas.drawCircle(sx, sy, radius * 0.30f, arrowPaint)
+                }
             }
 
             // Red corner dot if GPS is stale or bus is in depot (when shown)
-            if (freshness == VehicleFreshness.STALE || health.isInDepot) {
+            if (freshness == VehicleFreshness.STALE || health.isInDepot || health.isOffRoute) {
                 canvas.drawCircle(sx + radius * 0.72f, sy - radius * 0.72f, 2.7f * scale, ringPaint)
                 canvas.drawCircle(sx + radius * 0.72f, sy - radius * 0.72f, 1.9f * scale, staleDotPaint)
             }

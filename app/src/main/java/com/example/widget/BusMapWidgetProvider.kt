@@ -158,7 +158,7 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
         const val ACTION_WIDGET_REFRESH = "com.example.tobus.ACTION_WIDGET_REFRESH"
         private const val EXTRA_MANUAL_TAP = "extra_manual_tap"
         private const val PERIODIC_REQUEST_CODE = 4041
-        private const val WIDGET_NETWORK_TIMEOUT_MS = 5_500L
+        private const val WIDGET_NETWORK_TIMEOUT_MS = 6_800L
         private const val WIDGET_RENDER_TIMEOUT_MS = 3_000L
 
         private val widgetScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -213,12 +213,16 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             return coroutineScope {
                 val feedDeferred = async {
                     withTimeoutOrNull(WIDGET_NETWORK_TIMEOUT_MS) {
-                        repo.fetchLiveVehicles(includeSecondaryFeeds = false, widgetFastMode = true)
+                        repo.fetchLiveVehicles(
+                            includeSecondaryFeeds = false,
+                            widgetFastMode = true,
+                            focusLine = lineCode,
+                        )
                     }
                 }
                 val patternsDeferred = async {
                     if (settings.showRouteLine) {
-                        withTimeoutOrNull(WIDGET_NETWORK_TIMEOUT_MS) {
+                        withTimeoutOrNull(3_500L) {
                             runCatching { repo.fetchRoutePatterns(lineCode) }.getOrDefault(emptyList())
                         }.orEmpty()
                     } else {
@@ -305,18 +309,26 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             if (!hasWide && !hasSquare && !hasStops) return
 
             val intervalMillis = interval.minutes * 60_000L
-            val windowMillis = (intervalMillis / 3L).coerceIn(15_000L, 60_000L)
             val triggerAtMillis = SystemClock.elapsedRealtime() + intervalMillis
 
-            // Self-rescheduling non-wakeup setWindow: never wakes sleeping device, requires no exact-alarm
-            // permission, and is far more reliable than setInexactRepeating on Android 12–15 for 2–10 min intervals.
+            // Self-rescheduling non-wakeup alarm: never wakes a sleeping screen, requires no exact-alarm
+            // permission, and uses setAndAllowWhileIdle on Android M+ so Doze batching doesn't starve updates.
             try {
-                alarmManager.setWindow(
-                    AlarmManager.ELAPSED_REALTIME,
-                    triggerAtMillis,
-                    windowMillis,
-                    pi,
-                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME,
+                        triggerAtMillis,
+                        pi,
+                    )
+                } else {
+                    val windowMillis = (intervalMillis / 3L).coerceIn(15_000L, 60_000L)
+                    alarmManager.setWindow(
+                        AlarmManager.ELAPSED_REALTIME,
+                        triggerAtMillis,
+                        windowMillis,
+                        pi,
+                    )
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Fallback AlarmManager.set: ${e.message}")
                 alarmManager.set(AlarmManager.ELAPSED_REALTIME, triggerAtMillis, pi)
@@ -429,10 +441,25 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             }
 
             val lineCode = settings.selectedLine.trim().uppercase()
-            val vehicles = snapshot?.allVehicles?.filter {
+            var vehicles = snapshot?.allVehicles?.filter {
                 it.lineCode.equals(lineCode, ignoreCase = true) ||
                     it.rawRouteId.equals(lineCode, ignoreCase = true)
             }.orEmpty()
+            var effectiveTimestampMillis: Long? = snapshot?.fetchedAtMillis
+            var usedDiskCacheFallback = false
+
+            // Protect against process-death + Doze cold-wake timeouts or transient single-source empty glitches:
+            // if live fetch failed OR returned 0 vehicles on the selected line while not all feeds answered cleanly,
+            // fall back to fresh (<12 min) disk-cached vehicles rather than wiping the widget to "0 mezzi".
+            val onlineSourceCount = snapshot?.sourceStatuses?.count { it.isOnline } ?: 0
+            if (vehicles.isEmpty() && (failed || snapshot == null || onlineSourceCount < 2)) {
+                val diskCached = repo.loadFreshWidgetLineVehicles(lineCode)
+                if (diskCached != null && diskCached.second.isNotEmpty()) {
+                    effectiveTimestampMillis = diskCached.first
+                    vehicles = diskCached.second
+                    usedDiskCacheFallback = true
+                }
+            }
 
             val favorites = prefs.currentFavoriteStops()
             val nowMillis = System.currentTimeMillis()
@@ -471,7 +498,7 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             views.setTextViewText(R.id.widget_line_badge, lineCode)
 
             val statusLabel = when {
-                failed && snapshot == null -> context.getString(R.string.widget_error)
+                failed && snapshot == null && !usedDiskCacheFallback -> context.getString(R.string.widget_error)
                 compactVisual -> "$displayedVehiclesCount"
                 displayedVehiclesCount == 0 -> context.getString(R.string.widget_no_buses)
                 displayedVehiclesCount == 1 -> "1 mezzo"
@@ -480,8 +507,8 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             views.setTextViewText(R.id.widget_status_text, statusLabel)
 
             val timeFormat = SimpleDateFormat("HH:mm", Locale.ITALY)
-            val timestampText = if (snapshot != null) {
-                timeFormat.format(Date(snapshot.fetchedAtMillis))
+            val timestampText = if (effectiveTimestampMillis != null) {
+                timeFormat.format(Date(effectiveTimestampMillis))
             } else {
                 "--:--"
             }

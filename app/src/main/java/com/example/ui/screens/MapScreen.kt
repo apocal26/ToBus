@@ -5,23 +5,36 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Canvas
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -64,18 +77,24 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.flow.StateFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -98,12 +117,15 @@ import com.example.ui.glass.AccentIconBadge
 import com.example.ui.glass.DirectionColorBadge
 import com.example.ui.glass.GlassCircleIconButton
 import com.example.ui.glass.GlassModalDialog
-import com.example.ui.glass.GlassProgressBar
 import com.example.ui.glass.HeroEntranceText
+import com.example.ui.glass.LightHapticKind
+import com.example.ui.glass.LiquidGlassOverlaySurface
 import com.example.ui.glass.MapOverlayGlassPill
 import com.example.ui.glass.RecessedMetricPill
 import com.example.ui.glass.glassInteractive
 import com.example.ui.glass.glassSpring
+import com.example.ui.glass.liquidGlassRimBrush
+import com.example.ui.glass.performLightHaptic
 import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
@@ -111,8 +133,13 @@ import com.example.ui.theme.AccentRed
 import com.example.ui.theme.DarkInkOnAccent
 import com.example.ui.theme.GlassRowBorder
 import com.example.ui.theme.GlassRowFill
+import com.example.ui.theme.LightMapScrimBottom
+import com.example.ui.theme.LightMapScrimTop
+import com.example.ui.theme.OverlayBusPillLightBottom
+import com.example.ui.theme.OverlayBusPillLightTop
 import com.example.ui.theme.OverlayPillBorder
 import com.example.ui.theme.OverlayPillFill
+import com.example.ui.theme.OverlayPillLightMapFill
 import com.example.ui.theme.ScrimBottomEnd
 import com.example.ui.theme.ScrimTopStart
 import com.example.ui.theme.SmokedGlassBorder
@@ -126,9 +153,16 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 
+private sealed interface MapInspectorTarget {
+    data object None : MapInspectorTarget
+    data class Bus(val vehicle: BusVehicle) : MapInspectorTarget
+    data class Stop(val stop: TransitStop) : MapInspectorTarget
+}
+
 @Composable
 fun MapScreen(
     uiState: ToBusUiState,
+    pollProgressFlow: StateFlow<Float>,
     isForegroundActive: Boolean,
     isWideScreen: Boolean = false,
     bottomNavClearance: Dp,
@@ -148,7 +182,51 @@ fun MapScreen(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     var showAlertsDialog by rememberSaveable { mutableStateOf(false) }
+
+    val latestSelectedVehicleId by rememberUpdatedState(uiState.selectedVehicleId)
+    val latestSelectedStopId by rememberUpdatedState(uiState.selectedStop?.stopId)
+    val latestOnSelectVehicle by rememberUpdatedState(onSelectVehicle)
+    val latestOnSelectStop by rememberUpdatedState(onSelectStop)
+    val latestOnOpenFavoriteStop by rememberUpdatedState(onOpenFavoriteStop)
+    val latestOnFocusArrivalBus by rememberUpdatedState(onFocusArrivalBus)
+    val latestOnUserLocationClick by rememberUpdatedState(onUserLocationClick)
+
+    val handleSelectVehicle: (BusVehicle?) -> Unit = remember(view) {
+        { vehicle ->
+            if (vehicle != null && vehicle.vehicleId != latestSelectedVehicleId) {
+                performLightHaptic(view, LightHapticKind.SELECT_BUS)
+            }
+            latestOnSelectVehicle(vehicle)
+        }
+    }
+    val handleSelectStop: (TransitStop?) -> Unit = remember(view) {
+        { stop ->
+            if (stop != null && !stop.stopId.equals(latestSelectedStopId, ignoreCase = true)) {
+                performLightHaptic(view, LightHapticKind.SWITCH_STOP)
+            }
+            latestOnSelectStop(stop)
+        }
+    }
+    val handleOpenFavoriteStop: (FavoriteStop) -> Unit = remember(view) {
+        { fav ->
+            if (!fav.stopId.equals(latestSelectedStopId, ignoreCase = true)) {
+                performLightHaptic(view, LightHapticKind.SWITCH_STOP)
+            }
+            latestOnOpenFavoriteStop(fav)
+        }
+    }
+    val handleFocusArrivalBus: (StopArrival, Int) -> Unit = remember(view) {
+        { arrival, indexInLine ->
+            val hasLiveTarget = arrival.isRealtime &&
+                (!arrival.vehicleId.isNullOrBlank() || !arrival.tripId.isNullOrBlank())
+            if (hasLiveTarget) {
+                performLightHaptic(view, LightHapticKind.SELECT_BUS)
+            }
+            latestOnFocusArrivalBus(arrival, indexInLine)
+        }
+    }
 
     BackHandler(enabled = uiState.selectedVehicle != null || uiState.selectedStop != null) {
         if (uiState.selectedVehicle != null) onSelectVehicle(null)
@@ -163,26 +241,35 @@ fun MapScreen(
         onLocationPermissionResult(granted)
     }
 
-    val handleUserLocationTap = {
-        val hasFine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-        val hasCoarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-        if (hasFine || hasCoarse) {
-            onUserLocationClick()
-        } else {
-            locationPermissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION,
-                ),
-            )
+    val handleUserLocationTap = remember(context, locationPermissionLauncher) {
+        {
+            val hasFine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            val hasCoarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            if (hasFine || hasCoarse) {
+                latestOnUserLocationClick()
+            } else {
+                locationPermissionLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION,
+                    ),
+                )
+            }
         }
     }
 
-    val healthByVehicleId = remember(uiState.lineVehicles, uiState.routePatterns, uiState.nowMillis) {
+    val spatialByVehicleId = remember(uiState.lineVehicles, uiState.routePatterns) {
         uiState.lineVehicles.associate { bus ->
-            bus.vehicleId to GttFleetAnalyzer.assess(bus, uiState.routePatterns, uiState.nowMillis)
+            bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
+        }
+    }
+    val healthByVehicleId = remember(uiState.lineVehicles, spatialByVehicleId, uiState.nowMillis) {
+        uiState.lineVehicles.associate { bus ->
+            val spatial = spatialByVehicleId[bus.vehicleId]
+                ?: GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
+            bus.vehicleId to GttFleetAnalyzer.assessWithSpatial(bus, spatial, uiState.nowMillis)
         }
     }
     val resolvedDirectionById = remember(uiState.lineVehicles, uiState.routePatterns) {
@@ -202,14 +289,38 @@ fun MapScreen(
     val staleOrStuckCount = remember(healthByVehicleId) {
         healthByVehicleId.values.count { !it.isInDepot && (it.isStaleGps || it.isStuck) }
     }
-    val sortedVehicles = remember(uiState.lineVehicles, healthByVehicleId) {
-        uiState.lineVehicles.sortedWith(
-            compareBy<BusVehicle> { healthByVehicleId[it.vehicleId]?.isInDepot == true }
-                .thenBy { healthByVehicleId[it.vehicleId]?.isOffRoute == true }
-                .thenBy { healthByVehicleId[it.vehicleId]?.isStaleGps == true }
-                .thenBy { healthByVehicleId[it.vehicleId]?.isStuck == true }
-                .thenBy { it.vehicleId },
-        )
+    var focusedDirectionFilter by remember(uiState.settings.selectedLine) { mutableStateOf<Int?>(null) }
+    val directionTermini = remember(uiState.routePatterns) {
+        uiState.routePatterns
+            .groupBy { it.directionId }
+            .mapValues { (_, patterns) ->
+                val raw = patterns.firstNotNullOfOrNull { pat ->
+                    pat.terminusName()?.takeIf { it.isNotBlank() && !it.startsWith("Linea ") }
+                } ?: patterns.firstOrNull()?.terminusName().orEmpty()
+                shortTurinPlaceName(raw)
+            }
+            .filterValues { it.isNotBlank() }
+    }
+    val sortedVehicles = remember(
+        uiState.lineVehicles,
+        healthByVehicleId,
+        resolvedDirectionById,
+        focusedDirectionFilter,
+        uiState.selectedVehicleId,
+    ) {
+        uiState.lineVehicles
+            .filter { bus ->
+                focusedDirectionFilter == null ||
+                    bus.vehicleId == uiState.selectedVehicleId ||
+                    (resolvedDirectionById[bus.vehicleId] ?: bus.directionId) == focusedDirectionFilter
+            }
+            .sortedWith(
+                compareBy<BusVehicle> { healthByVehicleId[it.vehicleId]?.isInDepot == true }
+                    .thenBy { healthByVehicleId[it.vehicleId]?.isOffRoute == true }
+                    .thenBy { healthByVehicleId[it.vehicleId]?.isStaleGps == true }
+                    .thenBy { healthByVehicleId[it.vehicleId]?.isStuck == true }
+                    .thenBy { it.vehicleId },
+            )
     }
 
     Box(modifier = modifier.fillMaxSize()) {
@@ -232,30 +343,49 @@ fun MapScreen(
             showVehicleLabels = uiState.settings.showVehicleLabels,
             showRouteLine = uiState.settings.showRouteLine,
             colorByDirection = uiState.settings.colorByDirection,
+            focusedDirectionFilter = focusedDirectionFilter,
             shiftCameraForBottomSheet = !isWideScreen,
             onCameraChange = onCameraChange,
             onViewportSizeChange = onViewportSizeChange,
-            onVehicleTap = onSelectVehicle,
-            onStopTap = onSelectStop,
+            onVehicleTap = handleSelectVehicle,
+            onStopTap = handleSelectStop,
         )
 
-        // 2. Top & Bottom Scrims (#BF000000 -> transparent, #D9000000 -> transparent)
+        val isLightBasemap = !uiState.settings.mapStyle.isDark
+
+        // 2. Calibrated Top & Bottom Scrims (lighter & airy on Positron/Voyager, deeper on Dark/Satellite)
+        val topScrimBrush = remember(isLightBasemap) {
+            Brush.verticalGradient(
+                listOf(
+                    if (isLightBasemap) LightMapScrimTop else ScrimTopStart,
+                    Color.Transparent,
+                ),
+            )
+        }
+        val bottomScrimBrush = remember(isLightBasemap) {
+            Brush.verticalGradient(
+                listOf(
+                    Color.Transparent,
+                    if (isLightBasemap) LightMapScrimBottom else ScrimBottomEnd,
+                ),
+            )
+        }
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(if (isWideScreen) 116.dp else 140.dp)
+                .height(if (isWideScreen) 104.dp else 124.dp)
                 .align(Alignment.TopCenter)
-                .background(Brush.verticalGradient(listOf(ScrimTopStart, Color.Transparent))),
+                .background(topScrimBrush),
         )
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(if (isWideScreen) 116.dp else 170.dp + bottomNavClearance)
+                .height(if (isWideScreen) 104.dp else 150.dp + bottomNavClearance)
                 .align(Alignment.BottomCenter)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, ScrimBottomEnd))),
+                .background(bottomScrimBrush),
         )
 
-        // 3. Top Floating Smoked Glass Bar + GPU Progress Bar + Edge-to-Edge Favorite Stops
+        // 3. Top Floating Liquid Glass Bar + Adaptive Direction & Favorite Stops Row
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -270,9 +400,10 @@ fun MapScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                // High-contrast Smoked Glass Line Selector Pill
+                // High-contrast Liquid Glass Line Selector Pill
                 MapOverlayGlassPill(
                     onClick = onOpenLinePicker,
+                    isLightBasemap = isLightBasemap,
                     modifier = Modifier
                         .weight(1f, fill = false)
                         .widthIn(max = 360.dp)
@@ -284,8 +415,7 @@ fun MapScreen(
                     ) {
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(AccentGold)
+                                .background(AccentGold, RoundedCornerShape(999.dp))
                                 .padding(horizontal = 12.dp, vertical = 5.dp),
                             contentAlignment = Alignment.Center,
                         ) {
@@ -301,13 +431,13 @@ fun MapScreen(
                                 Box(
                                     modifier = Modifier
                                         .size(7.dp)
-                                        .clip(CircleShape)
                                         .background(
-                                            when {
+                                            color = when {
                                                 uiState.errorMessage != null -> AccentRed
                                                 activeReliableCount == 0 -> AccentGold
                                                 else -> AccentEmerald
                                             },
+                                            shape = CircleShape,
                                         ),
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
@@ -370,6 +500,7 @@ fun MapScreen(
                         } else {
                             uiState.allAlerts.size
                         },
+                        isLightBasemap = isLightBasemap,
                         onClick = { showAlertsDialog = true },
                     )
 
@@ -377,37 +508,30 @@ fun MapScreen(
                     UserLocationGlassButton(
                         isEnabled = uiState.isUserLocationEnabled,
                         isLocating = uiState.isLocatingUser && isForegroundActive,
+                        isLightBasemap = isLightBasemap,
                         onClick = handleUserLocationTap,
                     )
 
-                    // Single clean Refresh button
-                    GlassCircleIconButton(
-                        icon = Icons.Rounded.Refresh,
-                        contentDescription = stringResource(R.string.cd_refresh_map),
+                    // Refresh button with integrated circular live-countdown progress ring
+                    RefreshProgressGlassButton(
+                        pollProgressFlow = pollProgressFlow,
+                        isRefreshing = uiState.isRefreshing && isForegroundActive,
+                        isLightBasemap = isLightBasemap,
                         onClick = onRefresh,
-                        highContrastOverlay = true,
-                        spinning = uiState.isRefreshing && isForegroundActive,
-                        tint = TextPrimary,
                         modifier = Modifier.testTag("refresh_map_button"),
                     )
                 }
             }
 
-            // Ultra-thin GPU scaleX progress bar counting down to next live refresh
-            // On wide tablets, constrain under the line selector pill instead of stretching 1000dp across the sky
-            GlassProgressBar(
-                progress = if (uiState.isRefreshing) 1f else uiState.nextPollProgress,
-                modifier = if (isWideScreen) {
-                    Modifier
-                        .padding(horizontal = 20.dp)
-                        .widthIn(max = 310.dp)
-                } else {
-                    Modifier.padding(horizontal = 20.dp)
-                },
-            )
-
-            // Unobtrusive Favorite Stops micro-pills bar (full-bleed horizontal scroll so pills never clip!)
-            if (uiState.favoriteStops.isNotEmpty()) {
+            // Unobtrusive Direction Filter + Favorite Stops micro-pills bar
+            val hasTwoDirections = directionTermini.size >= 2 && uiState.settings.showRouteLine
+            if (hasTwoDirections || uiState.favoriteStops.isNotEmpty()) {
+                val neutralPillRim = remember {
+                    liquidGlassRimBrush(topAlpha = 0.46f, midAlpha = 0.14f, bottomAlpha = 0.24f)
+                }
+                val neutralPillFillBrush = remember {
+                    Brush.verticalGradient(listOf(Color(0x16FFFFFF), Color.Transparent))
+                }
                 LazyRow(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -415,50 +539,170 @@ fun MapScreen(
                     contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    if (hasTwoDirections) {
+                        item(key = "direction_filter_chip") {
+                            val dir0Name = directionTermini[0] ?: "Andata"
+                            val dir1Name = directionTermini[1] ?: "Ritorno"
+                            val activeAccent = when (focusedDirectionFilter) {
+                                0 -> AccentGold
+                                1 -> if (uiState.settings.colorByDirection) AccentCyan else AccentGold
+                                else -> TextPrimary
+                            }
+                            val isFiltered = focusedDirectionFilter != null
+                            val dirInteraction = remember { MutableInteractionSource() }
+                            val pillBaseFill = if (isLightBasemap) OverlayPillLightMapFill else OverlayPillFill
+                            val dirBorderBrush = remember(isFiltered, activeAccent) {
+                                if (isFiltered) {
+                                    Brush.verticalGradient(
+                                        listOf(
+                                            Color.White.copy(alpha = 0.56f),
+                                            activeAccent.copy(alpha = 0.80f),
+                                        ),
+                                    )
+                                } else {
+                                    neutralPillRim
+                                }
+                            }
+                            val dirFillBrush = remember(isFiltered, activeAccent) {
+                                if (isFiltered) {
+                                    Brush.verticalGradient(
+                                        listOf(activeAccent.copy(alpha = 0.22f), activeAccent.copy(alpha = 0.05f)),
+                                    )
+                                } else {
+                                    neutralPillFillBrush
+                                }
+                            }
+                            Surface(
+                                modifier = Modifier
+                                    .glassInteractive(dirInteraction) {
+                                        focusedDirectionFilter = when (focusedDirectionFilter) {
+                                            null -> 0
+                                            0 -> 1
+                                            else -> null
+                                        }
+                                    }
+                                    .testTag("direction_focus_chip"),
+                                shape = RoundedCornerShape(999.dp),
+                                color = pillBaseFill,
+                                border = BorderStroke(
+                                    width = if (isFiltered) 1.3.dp else 1.dp,
+                                    brush = dirBorderBrush,
+                                ),
+                            ) {
+                                Box(modifier = Modifier.background(dirFillBrush)) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        if (focusedDirectionFilter == null) {
+                                            // Dual Gold + Cyan dots indicating both directions active
+                                            Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(7.dp)
+                                                        .background(AccentGold, CircleShape),
+                                                )
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(7.dp)
+                                                        .background(
+                                                            color = if (uiState.settings.colorByDirection) AccentCyan else AccentGold,
+                                                            shape = CircleShape,
+                                                        ),
+                                                )
+                                            }
+                                            Text(
+                                                text = "2 direzioni",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextPrimary,
+                                                maxLines = 1,
+                                            )
+                                        } else {
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(7.dp)
+                                                    .background(activeAccent, CircleShape),
+                                            )
+                                            Text(
+                                                text = "→ ${if (focusedDirectionFilter == 0) dir0Name else dir1Name}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = activeAccent,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.widthIn(max = 280.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     items(uiState.favoriteStops, key = { it.stopId }) { fav ->
                         val isSelectedFav = uiState.selectedStop?.stopId.equals(fav.stopId, ignoreCase = true)
                         val favInteraction = remember { MutableInteractionSource() }
+                        val favLabel = remember(fav.name) { shortTurinPlaceName(fav.name) }
+                        val favBorderBrush = remember(isSelectedFav) {
+                            if (isSelectedFav) {
+                                Brush.verticalGradient(
+                                    listOf(Color.White.copy(alpha = 0.60f), AccentGold.copy(alpha = 0.85f)),
+                                )
+                            } else {
+                                neutralPillRim
+                            }
+                        }
+                        val favFillBrush = remember(isSelectedFav) {
+                            if (isSelectedFav) {
+                                Brush.verticalGradient(
+                                    listOf(AccentGold.copy(alpha = 0.24f), AccentGold.copy(alpha = 0.06f)),
+                                )
+                            } else {
+                                neutralPillFillBrush
+                            }
+                        }
                         Surface(
                             modifier = Modifier
-                                .glassInteractive(favInteraction) { onOpenFavoriteStop(fav) }
+                                .glassInteractive(favInteraction) { handleOpenFavoriteStop(fav) }
                                 .testTag("favorite_stop_chip_${fav.stopId}"),
                             shape = RoundedCornerShape(999.dp),
-                            color = if (isSelectedFav) Color(0xEC2E2614) else Color(0xCC12131A),
+                            color = if (isLightBasemap) OverlayPillLightMapFill else OverlayPillFill,
                             border = BorderStroke(
-                                width = if (isSelectedFav) 1.2.dp else 1.dp,
-                                color = if (isSelectedFav) AccentGold.copy(alpha = 0.85f) else OverlayPillBorder,
+                                width = if (isSelectedFav) 1.25.dp else 1.dp,
+                                brush = favBorderBrush,
                             ),
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Star,
-                                    contentDescription = null,
-                                    tint = AccentGold,
-                                    modifier = Modifier.size(13.dp),
-                                )
-                                Text(
-                                    text = shortTurinPlaceName(fav.name),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TextPrimary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.widthIn(max = 128.dp),
-                                )
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(999.dp))
-                                        .background(AccentGold.copy(alpha = 0.20f))
-                                        .padding(horizontal = 5.dp, vertical = 1.dp),
+                            Box(modifier = Modifier.background(favFillBrush)) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
                                 ) {
-                                    Text(
-                                        text = fav.lineCode,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = AccentGold,
+                                    Icon(
+                                        imageVector = Icons.Rounded.Star,
+                                        contentDescription = null,
+                                        tint = AccentGold,
+                                        modifier = Modifier.size(13.dp),
                                     )
+                                    Text(
+                                        text = favLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 128.dp),
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .background(AccentGold.copy(alpha = 0.20f), RoundedCornerShape(999.dp))
+                                            .padding(horizontal = 5.dp, vertical = 1.dp),
+                                    ) {
+                                        Text(
+                                            text = fav.lineCode,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = AccentGold,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -481,11 +725,11 @@ fun MapScreen(
                     fadeOut() + slideOutVertically { it / 2 }
                 },
             ) {
-                Surface(
-                    modifier = cardModifier,
+                LiquidGlassOverlaySurface(
+                    isLightBasemap = isLightBasemap,
+                    accentTint = AccentRed,
                     shape = RoundedCornerShape(20.dp),
-                    color = SmokedGlassFill,
-                    border = BorderStroke(1.2.dp, AccentRed.copy(alpha = 0.65f)),
+                    modifier = cardModifier,
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
@@ -511,109 +755,135 @@ fun MapScreen(
             }
         }
 
-        val vehicleInspectorContent: @Composable (Modifier) -> Unit = { cardModifier ->
-            AnimatedVisibility(
-                visible = uiState.selectedVehicle != null,
-                enter = if (isWideScreen) {
-                    fadeIn() + slideInHorizontally(animationSpec = glassSpring()) { it / 2 }
-                } else {
-                    fadeIn() + slideInVertically(animationSpec = glassSpring()) { it / 2 }
-                },
-                exit = if (isWideScreen) {
-                    fadeOut() + slideOutHorizontally { it / 2 }
-                } else {
-                    fadeOut() + slideOutVertically { it / 2 }
-                },
-            ) {
-                uiState.selectedVehicle?.let { bus ->
-                    val isExternal = uiState.focusedExternalVehicle?.vehicleId == bus.vehicleId &&
-                        uiState.lineVehicles.none { it.vehicleId == bus.vehicleId }
-                    val activePatterns = if (isExternal) uiState.focusedExternalRoutePatterns else uiState.routePatterns
-                    val resolvedDirectionId = if (isExternal) {
-                        GttFleetAnalyzer.resolveDirectionId(bus, activePatterns) ?: bus.directionId
-                    } else {
-                        resolvedDirectionById[bus.vehicleId]
-                            ?: GttFleetAnalyzer.resolveDirectionId(bus, activePatterns)
-                    }
-                    val currentStop = GttFleetAnalyzer.findCurrentStop(bus, activePatterns, resolvedDirectionId)
-                    val health = if (isExternal) {
-                        GttFleetAnalyzer.assess(bus, activePatterns, uiState.nowMillis)
-                    } else {
-                        healthByVehicleId[bus.vehicleId]
-                            ?: GttFleetAnalyzer.assess(bus, activePatterns, uiState.nowMillis)
-                    }
-                    SelectedBusInspectorCard(
-                        bus = bus,
-                        isExternal = isExternal,
-                        resolvedDirectionId = resolvedDirectionId,
-                        health = health,
-                        terminusName = if (isExternal) {
-                            uiState.focusedExternalTerminus
-                                ?: activePatterns.firstOrNull { it.directionId == resolvedDirectionId }?.terminusName()
-                        } else {
-                            uiState.terminusForDirection(resolvedDirectionId)
-                        },
-                        currentStopName = currentStop?.name,
-                        nowMillis = uiState.nowMillis,
-                        colorByDirection = uiState.settings.colorByDirection,
-                        onSwitchToLine = if (isExternal) {
-                            { onSelectLine(bus.lineCode) }
-                        } else {
-                            null
-                        },
-                        onClose = { onSelectVehicle(null) },
-                        modifier = cardModifier,
-                    )
-                }
+        val selBus = uiState.selectedVehicle
+        val selStop = uiState.selectedStop
+        val inspectorTarget = remember(selBus, selStop) {
+            when {
+                selBus != null -> MapInspectorTarget.Bus(selBus)
+                selStop != null -> MapInspectorTarget.Stop(selStop)
+                else -> MapInspectorTarget.None
             }
         }
 
-        val stopArrivalsContent: @Composable (Modifier, Dp) -> Unit = { cardModifier, maxScrollHeight ->
+        val inspectorCardSlot: @Composable (Modifier, Dp) -> Unit = { cardModifier, maxScrollHeight ->
+            var renderedTarget by remember { mutableStateOf<MapInspectorTarget>(MapInspectorTarget.None) }
+            if (inspectorTarget !is MapInspectorTarget.None) {
+                renderedTarget = inspectorTarget
+            }
+
             AnimatedVisibility(
-                visible = uiState.selectedStop != null,
-                enter = if (isWideScreen) {
-                    fadeIn() + slideInHorizontally(animationSpec = glassSpring()) { it / 2 }
-                } else {
-                    fadeIn() + slideInVertically(animationSpec = glassSpring()) { it / 2 }
-                },
-                exit = if (isWideScreen) {
-                    fadeOut() + slideOutHorizontally { it / 2 }
-                } else {
-                    fadeOut() + slideOutVertically { it / 2 }
-                },
+                visible = inspectorTarget !is MapInspectorTarget.None,
+                enter = fadeIn(tween(190, easing = FastOutSlowInEasing)) +
+                    slideInVertically(tween(230, easing = FastOutSlowInEasing)) { it / 6 },
+                exit = fadeOut(tween(145)) +
+                    slideOutVertically(tween(180, easing = FastOutSlowInEasing)) { it / 6 },
             ) {
-                uiState.selectedStop?.let { stop ->
-                    val isStopOnTrackedLine = remember(stop.stopId, stop.stopCode, uiState.routePatterns) {
-                        uiState.routePatterns.any { pat ->
-                            pat.stops.any {
-                                it.stopId.equals(stop.stopId, ignoreCase = true) ||
-                                    it.stopCode.equals(stop.stopCode, ignoreCase = true)
+                AnimatedContent(
+                    targetState = renderedTarget,
+                    contentAlignment = if (isWideScreen) Alignment.BottomEnd else Alignment.BottomCenter,
+                    contentKey = { target ->
+                        when (target) {
+                            MapInspectorTarget.None -> "none"
+                            is MapInspectorTarget.Bus -> "bus_${target.vehicle.vehicleId}"
+                            is MapInspectorTarget.Stop -> "stop_${target.stop.stopId}"
+                        }
+                    },
+                    transitionSpec = {
+                        val enterAnim = fadeIn(tween(190, delayMillis = 35, easing = FastOutSlowInEasing)) +
+                            scaleIn(initialScale = 0.985f, animationSpec = tween(210, easing = FastOutSlowInEasing))
+                        val exitAnim = fadeOut(tween(120))
+                        enterAnim.togetherWith(exitAnim).using(
+                            SizeTransform(clip = false) { _, _ ->
+                                tween(durationMillis = 210, easing = FastOutSlowInEasing)
+                            },
+                        )
+                    },
+                    label = "map_inspector_card_transition",
+                ) { target ->
+                    when (target) {
+                        MapInspectorTarget.None -> Unit
+
+                        is MapInspectorTarget.Bus -> {
+                            val bus = target.vehicle
+                            val isExternal = uiState.focusedExternalVehicle?.vehicleId == bus.vehicleId &&
+                                uiState.lineVehicles.none { it.vehicleId == bus.vehicleId }
+                            val activePatterns = if (isExternal) uiState.focusedExternalRoutePatterns else uiState.routePatterns
+                            val resolvedDirectionId = if (isExternal) {
+                                GttFleetAnalyzer.resolveDirectionId(bus, activePatterns) ?: bus.directionId
+                            } else {
+                                resolvedDirectionById[bus.vehicleId]
+                                    ?: GttFleetAnalyzer.resolveDirectionId(bus, activePatterns)
                             }
+                            val currentStop = remember(bus, activePatterns, resolvedDirectionId) {
+                                GttFleetAnalyzer.findCurrentStop(bus, activePatterns, resolvedDirectionId)
+                            }
+                            val health = if (isExternal) {
+                                GttFleetAnalyzer.assess(bus, activePatterns, uiState.nowMillis)
+                            } else {
+                                healthByVehicleId[bus.vehicleId]
+                                    ?: GttFleetAnalyzer.assess(bus, activePatterns, uiState.nowMillis)
+                            }
+                            SelectedBusInspectorCard(
+                                bus = bus,
+                                isExternal = isExternal,
+                                isLightBasemap = isLightBasemap,
+                                resolvedDirectionId = resolvedDirectionId,
+                                health = health,
+                                terminusName = if (isExternal) {
+                                    uiState.focusedExternalTerminus
+                                        ?: activePatterns.firstOrNull { it.directionId == resolvedDirectionId }?.terminusName()
+                                } else {
+                                    uiState.terminusForDirection(resolvedDirectionId)
+                                },
+                                currentStopName = currentStop?.name,
+                                nowMillis = uiState.nowMillis,
+                                colorByDirection = uiState.settings.colorByDirection,
+                                onSwitchToLine = if (isExternal) {
+                                    { onSelectLine(bus.lineCode) }
+                                } else {
+                                    null
+                                },
+                                onClose = { onSelectVehicle(null) },
+                                modifier = cardModifier,
+                            )
+                        }
+
+                        is MapInspectorTarget.Stop -> {
+                            val stop = target.stop
+                            val isStopOnTrackedLine = remember(stop.stopId, stop.stopCode, uiState.routePatterns) {
+                                uiState.routePatterns.any { pat ->
+                                    pat.stops.any {
+                                        it.stopId.equals(stop.stopId, ignoreCase = true) ||
+                                            it.stopCode.equals(stop.stopCode, ignoreCase = true)
+                                    }
+                                }
+                            }
+                            val stopTerminusName = if (isStopOnTrackedLine) {
+                                uiState.terminusForDirection(stop.directionId)
+                            } else {
+                                uiState.stopArrivals.firstOrNull {
+                                    it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", ignoreCase = true)
+                                }?.headsign
+                            }
+                            SelectedStopArrivalsCard(
+                                stop = stop,
+                                terminusName = stopTerminusName,
+                                selectedLine = uiState.settings.selectedLine,
+                                arrivals = uiState.stopArrivals,
+                                isLoading = uiState.isLoadingStopArrivals,
+                                isFavorite = uiState.isFavoriteStop(stop.stopId),
+                                isLightBasemap = isLightBasemap,
+                                nowMillis = uiState.nowMillis,
+                                colorByDirection = uiState.settings.colorByDirection,
+                                maxScrollHeight = maxScrollHeight,
+                                onToggleFavorite = { onToggleFavoriteStop(stop) },
+                                onRefresh = onRefreshStopArrivals,
+                                onArrivalTap = handleFocusArrivalBus,
+                                onClose = { onSelectStop(null) },
+                                modifier = cardModifier,
+                            )
                         }
                     }
-                    val stopTerminusName = if (isStopOnTrackedLine) {
-                        uiState.terminusForDirection(stop.directionId)
-                    } else {
-                        uiState.stopArrivals.firstOrNull {
-                            it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", ignoreCase = true)
-                        }?.headsign
-                    }
-                    SelectedStopArrivalsCard(
-                        stop = stop,
-                        terminusName = stopTerminusName,
-                        selectedLine = uiState.settings.selectedLine,
-                        arrivals = uiState.stopArrivals,
-                        isLoading = uiState.isLoadingStopArrivals,
-                        isFavorite = uiState.isFavoriteStop(stop.stopId),
-                        nowMillis = uiState.nowMillis,
-                        colorByDirection = uiState.settings.colorByDirection,
-                        maxScrollHeight = maxScrollHeight,
-                        onToggleFavorite = { onToggleFavoriteStop(stop) },
-                        onRefresh = onRefreshStopArrivals,
-                        onArrivalTap = onFocusArrivalBus,
-                        onClose = { onSelectStop(null) },
-                        modifier = cardModifier,
-                    )
                 }
             }
         }
@@ -641,12 +911,16 @@ fun MapScreen(
                             nowMillis = uiState.nowMillis,
                             directionAccent = directionAccent,
                             isSelected = isSelected,
-                            onClick = { onSelectVehicle(bus) },
+                            isLightBasemap = isLightBasemap,
+                            onClick = { handleSelectVehicle(bus) },
                         )
                     }
                 }
             } else if (!uiState.isLoadingFeed && uiState.errorMessage == null) {
-                MapOverlayGlassPill(modifier = Modifier.padding(horizontal = 16.dp)) {
+                MapOverlayGlassPill(
+                    isLightBasemap = isLightBasemap,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -668,6 +942,8 @@ fun MapScreen(
             }
         }
 
+        val isInspectingCard = uiState.selectedVehicle != null || uiState.selectedStop != null
+
         if (isWideScreen) {
             // Tablet / Foldable Layout:
             // - Inspector & stop arrivals dock cleanly to the bottom-end side panel so the map stays unobstructed
@@ -682,8 +958,7 @@ fun MapScreen(
                 horizontalAlignment = Alignment.End,
             ) {
                 errorCardContent(Modifier.fillMaxWidth())
-                vehicleInspectorContent(Modifier.fillMaxWidth())
-                stopArrivalsContent(Modifier.fillMaxWidth(), 356.dp)
+                inspectorCardSlot(Modifier.fillMaxWidth(), 356.dp)
             }
 
             Box(
@@ -697,6 +972,7 @@ fun MapScreen(
             }
         } else {
             // Smartphone Compact Layout: centered vertical stack above FloatingGlassBottomBar
+            // Automatically collapses bottom bus pills while reading a Stop/Bus card to free vertical map space!
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -711,9 +987,14 @@ fun MapScreen(
                     .widthIn(max = 560.dp)
                     .fillMaxWidth()
                 errorCardContent(compactCardModifier)
-                vehicleInspectorContent(compactCardModifier)
-                stopArrivalsContent(compactCardModifier, 246.dp)
-                activeBusChipsBar()
+                inspectorCardSlot(compactCardModifier, 332.dp)
+                AnimatedVisibility(
+                    visible = !isInspectingCard,
+                    enter = fadeIn(tween(200)) + expandVertically(tween(220)) + slideInVertically(tween(220)) { it / 2 },
+                    exit = fadeOut(tween(150)) + shrinkVertically(tween(180)) + slideOutVertically(tween(180)) { it / 2 },
+                ) {
+                    activeBusChipsBar()
+                }
             }
         }
     }
@@ -735,104 +1016,102 @@ private fun ActiveBusDirectionGlassPill(
     nowMillis: Long,
     directionAccent: Color?,
     isSelected: Boolean,
+    isLightBasemap: Boolean = false,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val freshness = bus.freshness(nowMillis)
     val indicatorColor = when {
-        health.isInDepot -> Color(0xFF94A3B8)
+        health.isInDepot -> Color(0xFFF59E0B)
+        health.isOffRoute -> Color(0xFFF59E0B)
         health.isStaleGps -> AccentRed
-        health.isOffRoute -> AccentGold
-        health.isStuck -> AccentGold
+        health.isStuck -> AccentRed
+        health.isAtTerminus -> directionAccent ?: AccentCyan
         freshness == VehicleFreshness.LIVE -> AccentEmerald
         freshness == VehicleFreshness.SLOW -> AccentGold
         else -> AccentRed
     }
     val statusTag = when {
         health.isInDepot -> "Deposito"
-        health.isOffRoute -> "fuori linea"
+        health.isOffRoute -> "Fuori linea"
         health.isStaleGps -> bus.gpsAgeSeconds(nowMillis)?.let {
             "agg. ${formatCompactAge(it)} fa"
         } ?: "GPS vecchio"
         health.isStuck -> health.stationarySeconds?.let {
             "fermo ${formatCompactAge(it)}"
         } ?: "fermo"
+        health.isAtTerminus -> "Capolinea"
         else -> bus.gpsAgeSeconds(nowMillis)?.let {
             "agg. ${formatCompactAge(it)} fa"
         } ?: "agg. N/D"
     }
 
-    val isDimmed = health.isStuck || health.isStaleGps || health.isOffRoute
+    val isDimmed = health.isInDepot || health.isStuck || health.isStaleGps || health.isOffRoute
     val pillShape = RoundedCornerShape(999.dp)
     val interaction = remember { MutableInteractionSource() }
 
-    val smokedBaseBrush = remember(isSelected) {
-        if (isSelected) {
-            Brush.verticalGradient(
-                colors = listOf(Color(0xEE1D2130), Color(0xEB10131C)),
+    val smokedBaseBrush = remember(isSelected, isLightBasemap) {
+        when {
+            isSelected && isLightBasemap -> Brush.verticalGradient(
+                colors = listOf(Color(0xE0212A3B), Color(0xD8151C29)),
             )
-        } else {
-            Brush.verticalGradient(
-                colors = listOf(Color(0xE6161923), Color(0xE00C0E15)),
+            isSelected -> Brush.verticalGradient(
+                colors = listOf(Color(0xEB1D2230), Color(0xE811141E)),
+            )
+            isLightBasemap -> Brush.verticalGradient(
+                colors = listOf(OverlayBusPillLightTop, OverlayBusPillLightBottom),
+            )
+            else -> Brush.verticalGradient(
+                colors = listOf(Color(0xDD171B26), Color(0xD80E1119)),
             )
         }
     }
 
-    val glassTintBrush = remember(directionAccent, isSelected, isDimmed) {
+    val glassTintBrush = remember(directionAccent, isSelected, isDimmed, isLightBasemap) {
         if (directionAccent == null) {
-            Brush.linearGradient(
+            Brush.verticalGradient(
                 colors = listOf(
-                    Color(if (isSelected) 0x26FFFFFF else 0x12FFFFFF),
-                    Color(0x05FFFFFF),
+                    Color(if (isSelected || isLightBasemap) 0x1EFFFFFF else 0x12FFFFFF),
+                    Color.Transparent,
                 ),
             )
         } else {
             val topAlpha = when {
-                isSelected && !isDimmed -> 0.42f
-                isSelected -> 0.26f
-                !isDimmed -> 0.30f
-                else -> 0.16f
-            }
-            val midAlpha = when {
-                isSelected && !isDimmed -> 0.20f
-                isSelected -> 0.12f
-                !isDimmed -> 0.13f
-                else -> 0.06f
+                isSelected && !isDimmed -> 0.28f
+                isSelected -> 0.18f
+                !isDimmed -> if (isLightBasemap) 0.20f else 0.16f
+                else -> 0.08f
             }
             val endAlpha = when {
-                isSelected && !isDimmed -> 0.09f
-                isSelected -> 0.04f
-                !isDimmed -> 0.04f
+                isSelected && !isDimmed -> 0.06f
                 else -> 0.01f
             }
-            Brush.linearGradient(
+            Brush.verticalGradient(
                 colors = listOf(
                     directionAccent.copy(alpha = topAlpha),
-                    directionAccent.copy(alpha = midAlpha),
                     directionAccent.copy(alpha = endAlpha),
                 ),
             )
         }
     }
 
-    val borderBrush = remember(directionAccent, isSelected, isDimmed) {
+    val borderBrush = remember(directionAccent, isSelected, isDimmed, isLightBasemap) {
         when {
-            directionAccent == null -> Brush.verticalGradient(
-                colors = listOf(
-                    if (isSelected) Color(0xCCFFFFFF) else OverlayPillBorder,
-                    Color(0x28FFFFFF),
-                ),
+            directionAccent == null -> liquidGlassRimBrush(
+                topAlpha = if (isSelected) 0.72f else if (isLightBasemap) 0.56f else 0.46f,
+                midAlpha = 0.16f,
+                bottomAlpha = 0.26f,
             )
             isSelected -> Brush.verticalGradient(
                 colors = listOf(
-                    Color(0xEBFFFFFF),
-                    directionAccent.copy(alpha = 0.90f),
+                    Color.White.copy(alpha = 0.85f),
+                    directionAccent.copy(alpha = 0.82f),
                 ),
             )
             else -> Brush.verticalGradient(
                 colors = listOf(
-                    directionAccent.copy(alpha = if (isDimmed) 0.45f else 0.78f),
-                    directionAccent.copy(alpha = if (isDimmed) 0.16f else 0.28f),
+                    Color.White.copy(alpha = if (isDimmed) 0.28f else if (isLightBasemap) 0.58f else 0.46f),
+                    directionAccent.copy(alpha = if (isDimmed) 0.18f else 0.44f),
                 ),
             )
         }
@@ -841,9 +1120,8 @@ private fun ActiveBusDirectionGlassPill(
     Box(
         modifier = modifier
             .glassInteractive(interaction, onClick = onClick)
-            .clip(pillShape)
-            .background(smokedBaseBrush)
-            .background(glassTintBrush)
+            .background(smokedBaseBrush, pillShape)
+            .background(glassTintBrush, pillShape)
             .border(
                 width = if (isSelected) 1.5.dp else 1.dp,
                 brush = borderBrush,
@@ -859,8 +1137,7 @@ private fun ActiveBusDirectionGlassPill(
             Box(
                 modifier = Modifier
                     .size(7.dp)
-                    .clip(CircleShape)
-                    .background(indicatorColor),
+                    .background(directionAccent ?: indicatorColor, CircleShape),
             )
             Text(
                 text = "#${bus.label}",
@@ -881,25 +1158,31 @@ private fun GttAlertsGlassButton(
     hasLineAlert: Boolean,
     hasGeneralAlerts: Boolean,
     badgeCount: Int,
+    isLightBasemap: Boolean = false,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val interaction = remember { MutableInteractionSource() }
-    val bgBrush = when {
-        hasLineAlert -> Brush.verticalGradient(
-            listOf(Color(0xEE5C1420), Color(0xEB2F0A11)),
-        )
-        hasGeneralAlerts -> Brush.verticalGradient(
-            listOf(Color(0xEE4A3712), Color(0xEB241B08)),
-        )
-        else -> Brush.verticalGradient(
-            listOf(OverlayPillFill, OverlayPillFill),
-        )
+    val bgBrush = remember(hasLineAlert, hasGeneralAlerts, isLightBasemap) {
+        val neutralFill = if (isLightBasemap) OverlayPillLightMapFill else OverlayPillFill
+        when {
+            hasLineAlert -> Brush.verticalGradient(
+                listOf(Color(0xEE5C1420), Color(0xEB2F0A11)),
+            )
+            hasGeneralAlerts -> Brush.verticalGradient(
+                listOf(Color(0xEE4A3712), Color(0xEB241B08)),
+            )
+            else -> Brush.verticalGradient(
+                listOf(neutralFill, neutralFill),
+            )
+        }
     }
-    val borderColor = when {
-        hasLineAlert -> AccentRed
-        hasGeneralAlerts -> AccentGold.copy(alpha = 0.80f)
-        else -> OverlayPillBorder
+    val borderBrush = remember(hasLineAlert, hasGeneralAlerts) {
+        when {
+            hasLineAlert -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), AccentRed))
+            hasGeneralAlerts -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), AccentGold.copy(alpha = 0.80f)))
+            else -> liquidGlassRimBrush(topAlpha = 0.46f, midAlpha = 0.15f, bottomAlpha = 0.26f)
+        }
     }
     val iconTint = when {
         hasLineAlert -> Color(0xFFFF7A7A)
@@ -917,11 +1200,10 @@ private fun GttAlertsGlassButton(
         Box(
             modifier = Modifier
                 .size(44.dp)
-                .clip(CircleShape)
-                .background(bgBrush)
+                .background(bgBrush, CircleShape)
                 .border(
                     width = if (hasLineAlert || hasGeneralAlerts) 1.4.dp else 1.dp,
-                    color = borderColor,
+                    brush = borderBrush,
                     shape = CircleShape,
                 ),
             contentAlignment = Alignment.Center,
@@ -944,8 +1226,7 @@ private fun GttAlertsGlassButton(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(top = 2.dp, end = 2.dp)
-                    .clip(CircleShape)
-                    .background(dotColor)
+                    .background(dotColor, CircleShape)
                     .border(1.dp, Color(0xFF0A0A0E), CircleShape)
                     .padding(horizontal = if (badgeCount > 9) 4.dp else 5.dp, vertical = 1.dp),
                 contentAlignment = Alignment.Center,
@@ -964,6 +1245,7 @@ private fun GttAlertsGlassButton(
 private fun UserLocationGlassButton(
     isEnabled: Boolean,
     isLocating: Boolean,
+    isLightBasemap: Boolean = false,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -974,14 +1256,20 @@ private fun UserLocationGlassButton(
         label = "gps_border_color",
     )
     val iconTint by animateColorAsState(
-        targetValue = if (isEnabled) AccentCyan else TextPrimary.copy(alpha = 0.85f),
+        targetValue = if (isEnabled) AccentCyan else TextPrimary.copy(alpha = 0.88f),
         animationSpec = tween(durationMillis = 240),
         label = "gps_icon_tint",
     )
-    val fillBrush = if (isEnabled) {
-        Brush.verticalGradient(listOf(Color(0xEE103044), Color(0xEB091C2A)))
-    } else {
-        Brush.verticalGradient(listOf(OverlayPillFill, OverlayPillFill))
+    val fillBrush = remember(isEnabled, isLightBasemap) {
+        val neutralFill = if (isLightBasemap) OverlayPillLightMapFill else OverlayPillFill
+        if (isEnabled) {
+            Brush.verticalGradient(listOf(Color(0xEE103044), Color(0xEB091C2A)))
+        } else {
+            Brush.verticalGradient(listOf(neutralFill, neutralFill))
+        }
+    }
+    val inactiveRimBrush = remember {
+        liquidGlassRimBrush(topAlpha = 0.46f, midAlpha = 0.15f, bottomAlpha = 0.26f)
     }
 
     val locatingAlpha = if (isLocating) {
@@ -1010,11 +1298,14 @@ private fun UserLocationGlassButton(
         Box(
             modifier = Modifier
                 .size(44.dp)
-                .clip(CircleShape)
-                .background(fillBrush)
+                .background(fillBrush, CircleShape)
                 .border(
                     width = if (isEnabled) 1.4.dp else 1.dp,
-                    color = borderColor,
+                    brush = if (isEnabled) {
+                        Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), borderColor))
+                    } else {
+                        inactiveRimBrush
+                    },
                     shape = CircleShape,
                 ),
             contentAlignment = Alignment.Center,
@@ -1026,6 +1317,142 @@ private fun UserLocationGlassButton(
                 modifier = Modifier
                     .size(19.dp)
                     .graphicsLayer { alpha = locatingAlpha },
+            )
+        }
+    }
+}
+
+@Composable
+private fun RefreshProgressGlassButton(
+    pollProgressFlow: StateFlow<Float>,
+    isRefreshing: Boolean,
+    isLightBasemap: Boolean = false,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val progress by pollProgressFlow.collectAsStateWithLifecycle()
+    val interaction = remember { MutableInteractionSource() }
+    val clampedProgress = progress.coerceIn(0f, 1f)
+    val fillColor = if (isLightBasemap) OverlayPillLightMapFill else OverlayPillFill
+    val smoothProgress = remember { Animatable(clampedProgress) }
+
+    LaunchedEffect(clampedProgress) {
+        if (clampedProgress < smoothProgress.value - 0.12f) {
+            smoothProgress.snapTo(clampedProgress)
+        } else {
+            smoothProgress.animateTo(
+                targetValue = clampedProgress,
+                animationSpec = tween(durationMillis = 960, easing = LinearEasing),
+            )
+        }
+    }
+
+    val rotation = if (isRefreshing) {
+        val transition = rememberInfiniteTransition(label = "refresh_icon_spin")
+        val angle by transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 900, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart,
+            ),
+            label = "refresh_spin_angle",
+        )
+        angle
+    } else {
+        0f
+    }
+
+    Box(
+        modifier = modifier
+            .size(48.dp)
+            .glassInteractive(interaction, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        val topSpecularBrush = remember {
+            Brush.verticalGradient(
+                listOf(
+                    Color(0x16FFFFFF),
+                    Color.Transparent,
+                ),
+            )
+        }
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .background(fillColor, CircleShape)
+                .background(topSpecularBrush, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val strokePx = 2.dp.toPx()
+                val inset = strokePx / 2f
+                val arcSize = androidx.compose.ui.geometry.Size(
+                    width = size.width - strokePx,
+                    height = size.height - strokePx,
+                )
+                // Subtle glass outer rim track
+                drawArc(
+                    color = Color.White.copy(alpha = 0.16f),
+                    startAngle = 0f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    topLeft = androidx.compose.ui.geometry.Offset(inset, inset),
+                    size = arcSize,
+                    style = Stroke(width = 1.dp.toPx()),
+                )
+                if (isRefreshing) {
+                    // Fluid rotating cyan/specular arc while live feeds are fetching
+                    drawArc(
+                        color = AccentCyan.copy(alpha = 0.28f),
+                        startAngle = 0f,
+                        sweepAngle = 360f,
+                        useCenter = false,
+                        topLeft = androidx.compose.ui.geometry.Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokePx),
+                    )
+                    drawArc(
+                        color = AccentCyan,
+                        startAngle = -90f + rotation,
+                        sweepAngle = 135f,
+                        useCenter = false,
+                        topLeft = androidx.compose.ui.geometry.Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokePx, cap = StrokeCap.Round),
+                    )
+                    drawArc(
+                        color = Color.White.copy(alpha = 0.90f),
+                        startAngle = -90f + rotation + 92f,
+                        sweepAngle = 42f,
+                        useCenter = false,
+                        topLeft = androidx.compose.ui.geometry.Offset(inset, inset),
+                        size = arcSize,
+                        style = Stroke(width = strokePx, cap = StrokeCap.Round),
+                    )
+                } else {
+                    // Silky 60fps interpolated countdown sweep along the circular button rim
+                    val sweep = smoothProgress.value * 360f
+                    if (sweep > 0.5f) {
+                        drawArc(
+                            color = Color.White.copy(alpha = 0.86f),
+                            startAngle = -90f,
+                            sweepAngle = sweep,
+                            useCenter = false,
+                            topLeft = androidx.compose.ui.geometry.Offset(inset, inset),
+                            size = arcSize,
+                            style = Stroke(width = strokePx, cap = StrokeCap.Round),
+                        )
+                    }
+                }
+            }
+            Icon(
+                imageVector = Icons.Rounded.Refresh,
+                contentDescription = stringResource(R.string.cd_refresh_map),
+                tint = if (isRefreshing) AccentCyan else TextPrimary,
+                modifier = Modifier
+                    .size(20.dp)
+                    .graphicsLayer { rotationZ = rotation },
             )
         }
     }
@@ -1099,8 +1526,7 @@ private fun GttAlertsDialog(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(GlassRowFill)
+                    .background(GlassRowFill, RoundedCornerShape(16.dp))
                     .border(1.dp, GlassRowBorder, RoundedCornerShape(16.dp))
                     .padding(14.dp),
             ) {
@@ -1170,8 +1596,7 @@ private fun AlertItemCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(bgColor)
+            .background(bgColor, RoundedCornerShape(16.dp))
             .border(1.dp, borderColor, RoundedCornerShape(16.dp))
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -1186,8 +1611,7 @@ private fun AlertItemCard(
                     val vColor = if (activeNow) AccentEmerald else AccentCyan
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(vColor.copy(alpha = 0.16f))
+                            .background(vColor.copy(alpha = 0.16f), RoundedCornerShape(999.dp))
                             .border(1.dp, vColor.copy(alpha = 0.45f), RoundedCornerShape(999.dp))
                             .padding(horizontal = 8.dp, vertical = 2.dp),
                     ) {
@@ -1206,8 +1630,7 @@ private fun AlertItemCard(
                         items(alert.affectedLines.toList().sorted()) { line ->
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .background(chipAccent.copy(alpha = 0.20f))
+                                    .background(chipAccent.copy(alpha = 0.20f), RoundedCornerShape(999.dp))
                                     .border(1.dp, chipAccent.copy(alpha = 0.48f), RoundedCornerShape(999.dp))
                                     .padding(horizontal = 8.dp, vertical = 2.dp),
                             ) {
@@ -1243,6 +1666,7 @@ private fun AlertItemCard(
 private fun SelectedBusInspectorCard(
     bus: BusVehicle,
     isExternal: Boolean,
+    isLightBasemap: Boolean,
     resolvedDirectionId: Int?,
     health: VehicleHealthAssessment,
     terminusName: String?,
@@ -1255,21 +1679,15 @@ private fun SelectedBusInspectorCard(
 ) {
     val freshness = bus.freshness(nowMillis)
     val freshnessColor = when {
-        health.isInDepot -> AccentGold
+        health.isInDepot || health.isOffRoute -> AccentGold
+        health.isStaleGps -> AccentRed
         freshness == VehicleFreshness.LIVE -> AccentEmerald
         freshness == VehicleFreshness.SLOW -> AccentGold
         else -> AccentRed
     }
     val warningText = remember(health) { health.warningMessage() }
+    val terminusText = remember(health) { health.terminusMessage() }
     val ageSeconds = bus.gpsAgeSeconds(nowMillis)
-    val clockFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.ITALY) }
-    val exactClock = remember(bus.timestampSeconds) {
-        if (bus.timestampSeconds > 0L) {
-            clockFormat.format(Date(bus.timestampSeconds * 1000L))
-        } else {
-            "Orario non inviato"
-        }
-    }
     val isAltDir = colorByDirection && resolvedDirectionId == 1
     val badgeAccent = when {
         isExternal -> AccentEmerald
@@ -1286,10 +1704,11 @@ private fun SelectedBusInspectorCard(
         ((nowMillis - since) / 1000L).coerceAtLeast(0L)
     }
     val isActuallyStationary = stationarySeconds >= 25L
-    val movementText = if (isActuallyStationary) {
-        "Fermo da ${formatCompactAge(stationarySeconds)}"
-    } else {
-        "In movimento"
+    val movementText = when {
+        health.isInDepot -> "In deposito"
+        health.isAtTerminus -> "Al capolinea"
+        isActuallyStationary -> "Fermo da ${formatCompactAge(stationarySeconds)}"
+        else -> "In movimento"
     }
 
     val delayText = remember(bus.delaySeconds) {
@@ -1311,12 +1730,11 @@ private fun SelectedBusInspectorCard(
         }
     }
 
-    val shape = RoundedCornerShape(24.dp)
-    Surface(
+    LiquidGlassOverlaySurface(
+        isLightBasemap = isLightBasemap,
+        accentTint = badgeAccent,
+        shape = RoundedCornerShape(24.dp),
         modifier = modifier.testTag("selected_bus_card"),
-        shape = shape,
-        color = SmokedGlassFill,
-        border = BorderStroke(1.2.dp, SmokedGlassBorder),
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -1351,9 +1769,8 @@ private fun SelectedBusInspectorCard(
                             val switchInteraction = remember { MutableInteractionSource() }
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
                                     .glassInteractive(switchInteraction, onClick = onSwitchToLine)
-                                    .background(badgeAccent.copy(alpha = 0.22f))
+                                    .background(badgeAccent.copy(alpha = 0.22f), RoundedCornerShape(999.dp))
                                     .border(1.dp, badgeAccent.copy(alpha = 0.65f), RoundedCornerShape(999.dp))
                                     .padding(horizontal = 9.dp, vertical = 3.dp)
                                     .testTag("switch_to_external_line_button"),
@@ -1367,8 +1784,7 @@ private fun SelectedBusInspectorCard(
                         } else {
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .background(badgeAccent.copy(alpha = 0.2f))
+                                    .background(badgeAccent.copy(alpha = 0.2f), RoundedCornerShape(999.dp))
                                     .border(1.dp, badgeAccent.copy(alpha = 0.5f), RoundedCornerShape(999.dp))
                                     .padding(horizontal = 8.dp, vertical = 2.dp),
                             ) {
@@ -1390,8 +1806,7 @@ private fun SelectedBusInspectorCard(
                     if (shortCurrentStop != null) {
                         Row(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(GlassRowFill)
+                                .background(GlassRowFill, RoundedCornerShape(999.dp))
                                 .border(1.dp, GlassRowBorder, RoundedCornerShape(999.dp))
                                 .padding(horizontal = 8.dp, vertical = 3.dp)
                                 .testTag("bus_current_stop_pill"),
@@ -1421,14 +1836,13 @@ private fun SelectedBusInspectorCard(
                 )
             }
 
-            // Smart Depot / Stale / Stuck / Off-Route Alert Strip
+            // Smart Depot / Stale / Stuck / Off-Route Alert Strip OR calm Capolinea info strip
             if (warningText != null) {
-                val warnColor = if (health.isStaleGps) AccentRed else AccentGold
+                val warnColor = if (health.isStaleGps || health.isStuck) AccentRed else AccentGold
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(warnColor.copy(alpha = 0.16f))
+                        .background(warnColor.copy(alpha = 0.16f), RoundedCornerShape(14.dp))
                         .border(1.dp, warnColor.copy(alpha = 0.50f), RoundedCornerShape(14.dp))
                         .padding(horizontal = 12.dp, vertical = 9.dp)
                         .testTag("bus_health_warning"),
@@ -1448,48 +1862,116 @@ private fun SelectedBusInspectorCard(
                         modifier = Modifier.weight(1f),
                     )
                 }
-            }
-
-            // Highlighted Live GPS Freshness Banner (exact age + exact clock + health badge)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(freshnessColor.copy(alpha = 0.14f))
-                    .border(1.dp, freshnessColor.copy(alpha = 0.42f), RoundedCornerShape(16.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(freshnessColor),
-                        )
-                        Text(
-                            text = freshness.labelIt,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = freshnessColor,
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(2.dp))
+            } else if (terminusText != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(badgeAccent.copy(alpha = 0.14f), RoundedCornerShape(14.dp))
+                        .border(1.dp, badgeAccent.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                        .testTag("bus_terminus_info"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Place,
+                        contentDescription = null,
+                        tint = badgeAccent,
+                        modifier = Modifier.size(17.dp),
+                    )
                     Text(
-                        text = "Ultimo pacchetto GPS alle $exactClock",
+                        text = terminusText,
                         style = MaterialTheme.typography.bodySmall,
-                        color = TextBody,
+                        color = TextPrimary,
+                        modifier = Modifier.weight(1f),
                     )
                 }
-                Spacer(modifier = Modifier.width(10.dp))
+            }
+
+            // Compact inline Live GPS indicator: pulsing dot + status + elapsed age
+            val statusShortLabel = when {
+                health.isInDepot -> "Deposito"
+                health.isOffRoute -> "Fuori linea"
+                health.isAtTerminus -> "Capolinea"
+                freshness == VehicleFreshness.LIVE -> "Live"
+                freshness == VehicleFreshness.SLOW -> "Segnale lento"
+                else -> "Segnale fermo"
+            }
+            val shouldPulse = !health.isInDepot && !health.isOffRoute && freshness == VehicleFreshness.LIVE
+            val pulseAlpha: Float
+            val pulseScale: Float
+            if (shouldPulse) {
+                val pulseTransition = rememberInfiniteTransition(label = "bus_live_dot_pulse")
+                val animAlpha by pulseTransition.animateFloat(
+                    initialValue = 0.22f,
+                    targetValue = 0.72f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 1050, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse,
+                    ),
+                    label = "bus_live_halo_alpha",
+                )
+                val animScale by pulseTransition.animateFloat(
+                    initialValue = 1.0f,
+                    targetValue = 1.95f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 1050, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse,
+                    ),
+                    label = "bus_live_halo_scale",
+                )
+                pulseAlpha = animAlpha
+                pulseScale = animScale
+            } else {
+                pulseAlpha = 0f
+                pulseScale = 1f
+            }
+            val ageDisplay = ageSeconds?.let { "agg. ${formatDetailedAge(it)}" } ?: "agg. N/D"
+
+            Row(
+                modifier = Modifier
+                    .background(freshnessColor.copy(alpha = 0.12f), RoundedCornerShape(999.dp))
+                    .border(1.dp, freshnessColor.copy(alpha = 0.34f), RoundedCornerShape(999.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Box(
+                    modifier = Modifier.size(12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (shouldPulse) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .graphicsLayer {
+                                    scaleX = pulseScale
+                                    scaleY = pulseScale
+                                    alpha = pulseAlpha
+                                }
+                                .background(freshnessColor, CircleShape),
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .background(freshnessColor, CircleShape),
+                    )
+                }
                 Text(
-                    text = ageSeconds?.let { formatDetailedAge(it) } ?: "N/D",
-                    style = MaterialTheme.typography.headlineSmall,
-                    color = TextPrimary,
+                    text = statusShortLabel,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = freshnessColor,
+                )
+                Text(
+                    text = "·",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextSubtitle,
+                )
+                Text(
+                    text = ageDisplay,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextBody,
                     modifier = Modifier.testTag("selected_bus_age_text"),
                 )
             }
@@ -1525,8 +2007,7 @@ private fun SelectedBusInspectorCard(
                 Box(
                     modifier = Modifier
                         .size(5.dp)
-                        .clip(CircleShape)
-                        .background(AccentCyan.copy(alpha = 0.72f)),
+                        .background(AccentCyan.copy(alpha = 0.72f), CircleShape),
                 )
                 Text(
                     text = "Fonti: ${bus.contributingSources.joinToString(" · ")}",
@@ -1569,6 +2050,7 @@ private fun SelectedStopArrivalsCard(
     arrivals: List<StopArrival>,
     isLoading: Boolean,
     isFavorite: Boolean,
+    isLightBasemap: Boolean,
     nowMillis: Long,
     colorByDirection: Boolean,
     maxScrollHeight: Dp = 246.dp,
@@ -1597,11 +2079,11 @@ private fun SelectedStopArrivalsCard(
             )
     }
 
-    Surface(
-        modifier = modifier.testTag("selected_stop_card"),
+    LiquidGlassOverlaySurface(
+        isLightBasemap = isLightBasemap,
+        accentTint = badgeAccent,
         shape = RoundedCornerShape(24.dp),
-        color = SmokedGlassFill,
-        border = BorderStroke(1.2.dp, SmokedGlassBorder),
+        modifier = modifier.testTag("selected_stop_card"),
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -1679,8 +2161,7 @@ private fun SelectedStopArrivalsCard(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(GlassRowFill)
+                            .background(GlassRowFill, RoundedCornerShape(14.dp))
                             .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
                             .padding(horizontal = 14.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -1703,8 +2184,7 @@ private fun SelectedStopArrivalsCard(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(GlassRowFill)
+                            .background(GlassRowFill, RoundedCornerShape(14.dp))
                             .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
                             .padding(horizontal = 14.dp, vertical = 14.dp),
                     ) {
@@ -1725,7 +2205,7 @@ private fun SelectedStopArrivalsCard(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
-                            text = "Tocca un arrivo Live per mostrare quel pullman sulla mappa",
+                            text = "Tocca un arrivo Live · mirino = posizione GPS attiva",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSubtitle,
                         )
@@ -1744,8 +2224,7 @@ private fun SelectedStopArrivalsCard(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(if (isTrackedLine) Color(0x1EFFFFFF) else GlassRowFill)
+                                    .background(if (isTrackedLine) Color(0x1EFFFFFF) else GlassRowFill, RoundedCornerShape(16.dp))
                                     .border(
                                         width = 1.dp,
                                         color = if (isTrackedLine) badgeAccent.copy(alpha = 0.45f) else GlassRowBorder,
@@ -1762,8 +2241,10 @@ private fun SelectedStopArrivalsCard(
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .clip(RoundedCornerShape(999.dp))
-                                            .background(if (isTrackedLine) badgeAccent else Color(0x28FFFFFF))
+                                            .background(
+                                                color = if (isTrackedLine) badgeAccent else Color(0x28FFFFFF),
+                                                shape = RoundedCornerShape(999.dp),
+                                            )
                                             .padding(horizontal = 10.dp, vertical = 3.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
@@ -1786,18 +2267,22 @@ private fun SelectedStopArrivalsCard(
                                 }
 
                                 // Horizontal clickable chips: Minutes + Exact Clock + Live / Stimato -> tap to locate bus!
-                                LazyRow(
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
                                     horizontalArrangement = Arrangement.spacedBy(7.dp),
                                 ) {
-                                    items(lineArrivals.size) { indexInLine ->
-                                        val arrival = lineArrivals[indexInLine]
+                                    lineArrivals.forEachIndexed { indexInLine, arrival ->
                                         val mins = arrival.minutesUntil(nowMillis).coerceAtLeast(0)
                                         val countdownText = when {
                                             mins <= 0 -> "Ora"
                                             mins == 1 -> "1 min"
                                             else -> "$mins min"
                                         }
-                                        val clockText = clockFormat.format(Date(arrival.arrivalEpochSeconds * 1000L))
+                                        val clockText = remember(arrival.arrivalEpochSeconds, clockFormat) {
+                                            clockFormat.format(Date(arrival.arrivalEpochSeconds * 1000L))
+                                        }
                                         val chipBg = if (arrival.isRealtime) {
                                             AccentEmerald.copy(alpha = 0.14f)
                                         } else {
@@ -1816,8 +2301,7 @@ private fun SelectedStopArrivalsCard(
                                                 .glassInteractive(chipInteraction) {
                                                     onArrivalTap(arrival, indexInLine)
                                                 }
-                                                .clip(RoundedCornerShape(12.dp))
-                                                .background(chipBg)
+                                                .background(chipBg, RoundedCornerShape(12.dp))
                                                 .border(1.dp, chipBorder, RoundedCornerShape(12.dp))
                                                 .padding(horizontal = 10.dp, vertical = 7.dp)
                                                 .testTag("arrival_chip_${lineCode}_$indexInLine"),
@@ -1839,8 +2323,7 @@ private fun SelectedStopArrivalsCard(
                                                 )
                                             }
                                             val linkedVid = arrival.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
-                                            val canLocateLive = arrival.isRealtime &&
-                                                (linkedVid != null || !arrival.tripId.isNullOrBlank())
+                                            val canLocateLive = arrival.isRealtime && linkedVid != null
                                             val statusLabel = when {
                                                 arrival.isRealtime && linkedVid != null -> "Live · #$linkedVid"
                                                 arrival.isRealtime -> "Live"
@@ -1853,8 +2336,10 @@ private fun SelectedStopArrivalsCard(
                                                 Box(
                                                     modifier = Modifier
                                                         .size(5.dp)
-                                                        .clip(CircleShape)
-                                                        .background(if (arrival.isRealtime) AccentEmerald else TextSubtitle),
+                                                        .background(
+                                                            color = if (arrival.isRealtime) AccentEmerald else TextSubtitle,
+                                                            shape = CircleShape,
+                                                        ),
                                                 )
                                                 Text(
                                                     text = statusLabel,

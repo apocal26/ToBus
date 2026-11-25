@@ -6,13 +6,17 @@ import android.appwidget.AppWidgetProvider
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.widget.RemoteViews
 import com.example.MainActivity
 import com.example.R
+import com.example.data.model.FavoriteStop
 import com.example.data.model.StopArrival
+import com.example.data.model.isGenericDirectionLabel
 import com.example.data.model.shortTurinPlaceName
 import com.example.data.network.GttRealtimeRepository
 import com.example.data.preferences.ToBusPreferences
@@ -29,11 +33,12 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Multi-stop Home Screen Widget ("ToBus · Fermate Live"):
- * - When 2+ favorite stops are saved: displays up to 3 favorite stops simultaneously in clean
- *   Dark Translucent Glass cards, each with colored line pill + grouped upcoming times (min + HH:mm + live/stimato).
- * - When 1 favorite stop is saved: displays up to 3 lines grouped at that stop.
- * - When >3 favorite stops are saved: includes a compact page switcher ("1–3 / N ›") in the header.
+ * Full-board Favorite Stop Home Screen Widget ("ToBus · Fermate Live"):
+ * - Focuses on ONE favorite stop per widget instance (mirroring the in-app Stop popup) so ALL
+ *   incoming lines at that stop are clearly separated in a scrollable Dark Glass list.
+ * - Each placed widget tracks its own active favorite stop index independently; when 2+ favorite
+ *   stops exist, a compact header switcher ("1/3 ›") lets the user cycle between stops in one tap.
+ * - Tapping the header or any line row opens ToBus directly centered on that stop.
  */
 class StopArrivalsWidgetProvider : AppWidgetProvider() {
 
@@ -57,6 +62,33 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
         }
     }
 
+    override fun onAppWidgetOptionsChanged(
+        context: Context,
+        appWidgetManager: AppWidgetManager,
+        appWidgetId: Int,
+        newOptions: Bundle,
+    ) {
+        super.onAppWidgetOptionsChanged(context, appWidgetManager, appWidgetId, newOptions)
+        val appContext = context.applicationContext
+        val pendingResult = goAsync()
+        widgetScope.launch {
+            try {
+                refreshAllStopWidgets(appContext, showLoading = false, onlyWidgetId = appWidgetId)
+            } finally {
+                pendingResult.finish()
+            }
+        }
+    }
+
+    override fun onDeleted(context: Context, appWidgetIds: IntArray) {
+        super.onDeleted(context, appWidgetIds)
+        val prefs = ToBusPreferences.getInstance(context.applicationContext)
+        for (id in appWidgetIds) {
+            prefs.clearStopWidgetIndex(id)
+            StopWidgetRowCache.clearWidget(context.applicationContext, id)
+        }
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
         super.onReceive(context, intent)
         val appContext = context.applicationContext
@@ -64,22 +96,40 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
             ACTION_STOP_WIDGET_REFRESH -> {
                 val interval = ToBusPreferences.getInstance(appContext).currentSettings().refreshInterval
                 BusMapWidgetProvider.schedulePeriodicUpdates(appContext, interval)
+                val targetId = intent.getIntExtra(
+                    AppWidgetManager.EXTRA_APPWIDGET_ID,
+                    AppWidgetManager.INVALID_APPWIDGET_ID,
+                ).takeIf { it != AppWidgetManager.INVALID_APPWIDGET_ID }
 
                 val pendingResult = goAsync()
                 widgetScope.launch {
                     try {
-                        refreshAllStopWidgets(appContext, showLoading = true)
+                        refreshAllStopWidgets(appContext, showLoading = true, onlyWidgetId = targetId)
                     } finally {
                         pendingResult.finish()
                     }
                 }
             }
+
             ACTION_STOP_WIDGET_NEXT_FAV -> {
+                val targetId = intent.getIntExtra(
+                    AppWidgetManager.EXTRA_APPWIDGET_ID,
+                    AppWidgetManager.INVALID_APPWIDGET_ID,
+                )
                 val pendingResult = goAsync()
                 widgetScope.launch {
                     try {
-                        ToBusPreferences.getInstance(appContext).cycleStopWidgetIndex(+PAGE_SIZE)
-                        refreshAllStopWidgets(appContext, showLoading = true)
+                        val prefs = ToBusPreferences.getInstance(appContext)
+                        if (targetId != AppWidgetManager.INVALID_APPWIDGET_ID) {
+                            prefs.cycleStopWidgetIndex(targetId, +1)
+                        } else {
+                            prefs.cycleStopWidgetIndex(+1)
+                        }
+                        refreshAllStopWidgets(
+                            appContext,
+                            showLoading = true,
+                            onlyWidgetId = targetId.takeIf { it != AppWidgetManager.INVALID_APPWIDGET_ID },
+                        )
                     } finally {
                         pendingResult.finish()
                     }
@@ -105,61 +155,13 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
         }
     }
 
-    private data class CardSlotIds(
-        val containerId: Int,
-        val lineId: Int,
-        val titleId: Int,
-        val dirId: Int,
-        val eta1Id: Int,
-        val eta2Id: Int,
-        val eta3Id: Int,
-    )
-
-    private data class RenderedCard(
-        val lineCode: String,
-        val useCyanBadge: Boolean,
-        val title: String,
-        val dirLabel: String,
-        val arrivals: List<StopArrival>,
-    )
-
     companion object {
         private const val TAG = "StopArrivalsWidget"
-        private const val PAGE_SIZE = 3
         const val ACTION_STOP_WIDGET_REFRESH = "com.example.tobus.ACTION_STOP_WIDGET_REFRESH"
         const val ACTION_STOP_WIDGET_NEXT_FAV = "com.example.tobus.ACTION_STOP_WIDGET_NEXT_FAV"
+        const val EXTRA_OPEN_STOP_ID = "extra_open_stop_id"
 
         private val widgetScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-        private val CARD_SLOTS = listOf(
-            CardSlotIds(
-                containerId = R.id.stop_card_1,
-                lineId = R.id.stop_card_1_line,
-                titleId = R.id.stop_card_1_title,
-                dirId = R.id.stop_card_1_dir,
-                eta1Id = R.id.stop_card_1_eta1,
-                eta2Id = R.id.stop_card_1_eta2,
-                eta3Id = R.id.stop_card_1_eta3,
-            ),
-            CardSlotIds(
-                containerId = R.id.stop_card_2,
-                lineId = R.id.stop_card_2_line,
-                titleId = R.id.stop_card_2_title,
-                dirId = R.id.stop_card_2_dir,
-                eta1Id = R.id.stop_card_2_eta1,
-                eta2Id = R.id.stop_card_2_eta2,
-                eta3Id = R.id.stop_card_2_eta3,
-            ),
-            CardSlotIds(
-                containerId = R.id.stop_card_3,
-                lineId = R.id.stop_card_3_line,
-                titleId = R.id.stop_card_3_title,
-                dirId = R.id.stop_card_3_dir,
-                eta1Id = R.id.stop_card_3_eta1,
-                eta2Id = R.id.stop_card_3_eta2,
-                eta3Id = R.id.stop_card_3_eta3,
-            ),
-        )
 
         fun requestUpdateAll(context: Context) {
             val appContext = context.applicationContext
@@ -168,49 +170,74 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
             }
         }
 
-        suspend fun refreshAllStopWidgets(context: Context, showLoading: Boolean) {
+        suspend fun refreshAllStopWidgets(
+            context: Context,
+            showLoading: Boolean,
+            onlyWidgetId: Int? = null,
+        ) {
             val manager = AppWidgetManager.getInstance(context)
-            val ids = manager.getAppWidgetIds(ComponentName(context, StopArrivalsWidgetProvider::class.java))
-            if (ids.isEmpty()) return
+            val allIds = manager.getAppWidgetIds(ComponentName(context, StopArrivalsWidgetProvider::class.java))
+            if (allIds.isEmpty()) return
+            val targetIds = if (onlyWidgetId != null && allIds.contains(onlyWidgetId)) {
+                intArrayOf(onlyWidgetId)
+            } else {
+                allIds
+            }
 
             val prefs = ToBusPreferences.getInstance(context)
             val favorites = prefs.currentFavoriteStops()
             val settings = prefs.currentSettings()
 
             if (favorites.isEmpty()) {
-                for (id in ids) {
-                    manager.updateAppWidget(id, buildEmptyViews(context, id))
+                for (id in targetIds) {
+                    StopWidgetRowCache.clearWidget(context, id)
+                    manager.updateAppWidget(id, buildEmptyFavoritesViews(context, id))
                 }
                 return
             }
 
+            // Map each placed widget to its currently selected favorite stop
+            val stopByWidgetId = HashMap<Int, Pair<Int, FavoriteStop>>(targetIds.size)
+            for (id in targetIds) {
+                val idx = prefs.getStopWidgetIndex(id) % favorites.size
+                stopByWidgetId[id] = idx to favorites[idx]
+            }
+
             if (showLoading) {
-                for (id in ids) {
+                for (id in targetIds) {
+                    val (idx, fav) = stopByWidgetId[id] ?: continue
                     val loading = RemoteViews(context.packageName, R.layout.widget_stop_arrivals)
-                    loading.setTextViewText(R.id.stop_widget_subtitle, "…")
+                    loading.setTextViewText(R.id.stop_widget_title, shortTurinPlaceName(fav.name))
+                    loading.setTextViewText(R.id.stop_widget_subtitle, "#${fav.stopCode} · aggiorno…")
+                    if (favorites.size > 1) {
+                        loading.setViewVisibility(R.id.stop_widget_switch_btn, View.VISIBLE)
+                        loading.setTextViewText(R.id.stop_widget_switch_btn, "${idx + 1}/${favorites.size} ›")
+                    }
                     manager.partiallyUpdateAppWidget(id, loading)
                 }
             }
 
-            val totalPages = ((favorites.size - 1) / PAGE_SIZE) + 1
-            val currentPage = (prefs.getActiveStopWidgetIndex() / PAGE_SIZE) % totalPages
-            val pageStart = currentPage * PAGE_SIZE
-            val visibleFavorites = favorites.drop(pageStart).take(PAGE_SIZE)
-
+            val distinctStops = stopByWidgetId.values.map { it.second }.distinctBy { it.stopId }
             val repo = GttRealtimeRepository.getInstance(context)
             val fetchNow = System.currentTimeMillis()
             val cached = repo.getLastCachedSnapshot()
+            val primaryFocusLine = distinctStops.firstOrNull()?.lineCode?.ifBlank { settings.selectedLine }
+                ?: settings.selectedLine
             val snap = if (cached == null || fetchNow - cached.fetchedAtMillis > 50_000L) {
-                withTimeoutOrNull(4_000L) {
-                    repo.fetchLiveVehicles(includeSecondaryFeeds = false, widgetFastMode = true).getOrNull()
+                withTimeoutOrNull(4_800L) {
+                    repo.fetchLiveVehicles(
+                        includeSecondaryFeeds = false,
+                        widgetFastMode = true,
+                        focusLine = primaryFocusLine,
+                    ).getOrNull()
                 } ?: cached
             } else {
                 cached
             }
 
-            // Parallel fetch for all visible stops at once, bounded to never exceed Android's 10s goAsync() window
+            // Fetch ALL lines arriving at each active widget's stop in parallel
             val arrivalsByStopId: Map<String, List<StopArrival>> = coroutineScope {
-                visibleFavorites.map { fav ->
+                distinctStops.map { fav ->
                     async {
                         val lineVehicles = snap?.allVehicles?.filter {
                             it.lineCode.equals(fav.lineCode, ignoreCase = true)
@@ -229,87 +256,43 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
                 }.awaitAll().toMap()
             }
 
-            val nowMillis = System.currentTimeMillis()
-            val timeFormat = SimpleDateFormat("HH:mm", Locale.ITALY)
-            val timeStr = timeFormat.format(Date(nowMillis))
-
-            val headerTitle: String
-            val cards: List<RenderedCard>
-
-            if (visibleFavorites.size == 1) {
-                // Single saved favorite -> group up to 3 lines cleanly at this stop!
-                val only = visibleFavorites.first()
-                headerTitle = shortTurinPlaceName(only.name)
-                val rawArrivals = arrivalsByStopId[only.stopId].orEmpty()
-                val grouped = rawArrivals
-                    .groupBy { it.lineCode.uppercase() }
-                    .entries
-                    .sortedWith(
-                        compareByDescending<Map.Entry<String, List<StopArrival>>> {
-                            it.key.equals(only.lineCode, ignoreCase = true)
-                        }.thenBy { it.value.minOfOrNull { a -> a.arrivalEpochSeconds } ?: Long.MAX_VALUE },
-                    )
-                    .take(PAGE_SIZE)
-
-                cards = if (grouped.isEmpty()) {
-                    listOf(
-                        RenderedCard(
-                            lineCode = only.lineCode,
-                            useCyanBadge = settings.colorByDirection && only.directionId == 1,
-                            title = shortTurinPlaceName(only.name),
-                            dirLabel = only.terminusName?.let { "→ ${shortTurinPlaceName(it)}" }.orEmpty(),
-                            arrivals = emptyList(),
-                        ),
-                    )
-                } else {
-                    grouped.map { (line, list) ->
-                        val headsign = list.firstOrNull()?.headsign?.takeIf { it.isNotBlank() }
-                            ?: only.terminusName.orEmpty()
-                        val isSavedLine = line.equals(only.lineCode, ignoreCase = true)
-                        RenderedCard(
-                            lineCode = line,
-                            useCyanBadge = isSavedLine && settings.colorByDirection && only.directionId == 1,
-                            title = if (headsign.isNotBlank()) shortTurinPlaceName(headsign) else "Linea $line",
-                            dirLabel = "",
-                            arrivals = list.sortedBy { it.arrivalEpochSeconds }.take(3),
-                        )
-                    }
-                }
-            } else {
-                // Multi-stop mode: display 2 or 3 favorite stops simultaneously!
-                headerTitle = "Fermate Live"
-                cards = visibleFavorites.map { fav ->
-                    val allForStop = arrivalsByStopId[fav.stopId].orEmpty()
-                    val preferred = allForStop.filter { it.lineCode.equals(fav.lineCode, ignoreCase = true) }
-                    val chosenArrivals = (preferred.ifEmpty { allForStop })
-                        .sortedBy { it.arrivalEpochSeconds }
-                        .take(3)
-                    val displayLine = chosenArrivals.firstOrNull()?.lineCode ?: fav.lineCode
-                    val dirShort = fav.terminusName?.takeIf { it.isNotBlank() }?.let { "→ ${shortTurinPlaceName(it)}" }
-                        ?: chosenArrivals.firstOrNull()?.headsign?.takeIf { it.isNotBlank() }?.let { "→ ${shortTurinPlaceName(it)}" }
-                        ?: ""
-                    RenderedCard(
-                        lineCode = displayLine,
-                        useCyanBadge = settings.colorByDirection && fav.directionId == 1,
-                        title = shortTurinPlaceName(fav.name),
-                        dirLabel = dirShort,
-                        arrivals = chosenArrivals,
-                    )
-                }
+            // On silent background ticks, if the network completely timed out, keep previous cached rows intact
+            val allEmpty = arrivalsByStopId.values.all { it.isEmpty() }
+            if (!showLoading && snap == null && allEmpty) {
+                return
             }
 
-            for (id in ids) {
-                val views = RemoteViews(context.packageName, R.layout.widget_stop_arrivals)
-                views.setTextViewText(R.id.stop_widget_title, headerTitle)
-                views.setTextViewText(R.id.stop_widget_subtitle, timeStr)
-                views.setViewVisibility(R.id.stop_widget_empty_text, View.GONE)
-                views.setViewVisibility(R.id.stop_widget_rows_container, View.VISIBLE)
+            val nowMillis = System.currentTimeMillis()
+            val timeStr = SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(nowMillis))
 
-                if (totalPages > 1) {
+            for (id in targetIds) {
+                val (favIdx, fav) = stopByWidgetId[id] ?: continue
+                val rawArrivals = arrivalsByStopId[fav.stopId].orEmpty()
+                val groupedRows = buildGroupedLineRows(
+                    fav = fav,
+                    arrivals = rawArrivals,
+                    colorByDirection = settings.colorByDirection,
+                )
+
+                StopWidgetRowCache.saveRows(context, id, fav.stopId, groupedRows)
+
+                val views = RemoteViews(context.packageName, R.layout.widget_stop_arrivals)
+                views.setTextViewText(R.id.stop_widget_title, shortTurinPlaceName(fav.name))
+
+                val lineCountPart = when (groupedRows.size) {
+                    0 -> "nessun bus"
+                    1 -> "1 linea"
+                    else -> "${groupedRows.size} linee"
+                }
+                views.setTextViewText(R.id.stop_widget_subtitle, "#${fav.stopCode} · $lineCountPart · $timeStr")
+
+                // Switcher button between saved favorite stops (1/N ›)
+                if (favorites.size > 1) {
                     views.setViewVisibility(R.id.stop_widget_switch_btn, View.VISIBLE)
-                    views.setTextViewText(R.id.stop_widget_switch_btn, "${currentPage + 1}/$totalPages ›")
+                    views.setTextViewText(R.id.stop_widget_switch_btn, "${favIdx + 1}/${favorites.size} ›")
                     val nextIntent = Intent(context, StopArrivalsWidgetProvider::class.java).apply {
                         action = ACTION_STOP_WIDGET_NEXT_FAV
+                        putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
                     }
                     val nextPending = PendingIntent.getBroadcast(
                         context,
@@ -322,43 +305,54 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
                     views.setViewVisibility(R.id.stop_widget_switch_btn, View.GONE)
                 }
 
-                CARD_SLOTS.forEachIndexed { idx, slot ->
-                    val card = cards.getOrNull(idx)
-                    if (card == null) {
-                        views.setViewVisibility(slot.containerId, View.GONE)
-                    } else {
-                        views.setViewVisibility(slot.containerId, View.VISIBLE)
-                        views.setTextViewText(slot.lineId, card.lineCode)
-                        views.setInt(
-                            slot.lineId,
-                            "setBackgroundResource",
-                            if (card.useCyanBadge) R.drawable.widget_badge_cyan else R.drawable.widget_badge_amber,
-                        )
-                        views.setTextViewText(slot.titleId, card.title)
-                        if (card.dirLabel.isNotBlank()) {
-                            views.setViewVisibility(slot.dirId, View.VISIBLE)
-                            views.setTextViewText(slot.dirId, card.dirLabel)
-                        } else {
-                            views.setViewVisibility(slot.dirId, View.GONE)
-                        }
-
-                        bindEtaChips(views, slot, card.arrivals, nowMillis, timeFormat)
-                    }
+                // Bind scrollable ListView adapter (unique data URI per widgetId so multiple widgets never collide)
+                val serviceIntent = Intent(context, StopArrivalsWidgetService::class.java).apply {
+                    putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+                    data = Uri.parse("tobus://stop-widget/$id")
                 }
+                @Suppress("DEPRECATION")
+                views.setRemoteAdapter(R.id.stop_widget_list, serviceIntent)
+                views.setEmptyView(R.id.stop_widget_list, R.id.stop_widget_empty_text)
+                views.setTextViewText(
+                    R.id.stop_widget_empty_text,
+                    "Nessun passaggio imminente rilevato per ${shortTurinPlaceName(fav.name)}.",
+                )
 
-                val openIntent = Intent(context, MainActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                // PendingIntent template for tapping any line row inside the ListView -> opens stop in ToBus
+                val rowClickTemplateIntent = Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 }
-                val openPending = PendingIntent.getActivity(
+                val templateFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                } else {
+                    PendingIntent.FLAG_UPDATE_CURRENT
+                }
+                val rowClickTemplate = PendingIntent.getActivity(
+                    context,
+                    id + 5000,
+                    rowClickTemplateIntent,
+                    templateFlags,
+                )
+                views.setPendingIntentTemplate(R.id.stop_widget_list, rowClickTemplate)
+
+                // Tapping the widget header also opens ToBus directly on this favorite stop
+                val openHeaderIntent = Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    putExtra(EXTRA_OPEN_STOP_ID, fav.stopId)
+                }
+                val openHeaderPending = PendingIntent.getActivity(
                     context,
                     id + 2000,
-                    openIntent,
+                    openHeaderIntent,
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
                 )
-                views.setOnClickPendingIntent(R.id.stop_widget_root, openPending)
+                views.setOnClickPendingIntent(R.id.stop_widget_header, openHeaderPending)
+                views.setOnClickPendingIntent(R.id.stop_widget_empty_text, openHeaderPending)
 
+                // Refresh circle button
                 val refreshIntent = Intent(context, StopArrivalsWidgetProvider::class.java).apply {
                     action = ACTION_STOP_WIDGET_REFRESH
+                    putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
                 }
                 val refreshPending = PendingIntent.getBroadcast(
                     context,
@@ -370,77 +364,72 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
 
                 try {
                     manager.updateAppWidget(id, views)
+                    manager.notifyAppWidgetViewDataChanged(id, R.id.stop_widget_list)
                 } catch (e: Exception) {
                     Log.e(TAG, "Errore update widget fermata $id: ${e.message}")
                 }
             }
         }
 
-        private fun bindEtaChips(
-            views: RemoteViews,
-            slot: CardSlotIds,
+        private fun buildGroupedLineRows(
+            fav: FavoriteStop,
             arrivals: List<StopArrival>,
-            nowMillis: Long,
-            timeFormat: SimpleDateFormat,
-        ) {
-            val etaIds = listOf(slot.eta1Id, slot.eta2Id, slot.eta3Id)
-            if (arrivals.isEmpty()) {
-                views.setViewVisibility(slot.eta1Id, View.VISIBLE)
-                views.setInt(slot.eta1Id, "setBackgroundResource", R.drawable.widget_eta_chip_sched)
-                views.setTextViewText(slot.eta1Id, "Nessun passaggio ora")
-                views.setTextColor(slot.eta1Id, 0x99FFFFFF.toInt())
-                views.setViewVisibility(slot.eta2Id, View.GONE)
-                views.setViewVisibility(slot.eta3Id, View.GONE)
-                return
-            }
+            colorByDirection: Boolean,
+        ): List<WidgetStopLineRow> {
+            if (arrivals.isEmpty()) return emptyList()
+            val savedLine = fav.lineCode.trim().uppercase()
+            val savedTerminus = fav.terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
 
-            etaIds.forEachIndexed { idx, viewId ->
-                val item = arrivals.getOrNull(idx)
-                if (item == null) {
-                    views.setViewVisibility(viewId, View.GONE)
-                } else {
-                    views.setViewVisibility(viewId, View.VISIBLE)
-                    val mins = item.minutesUntil(nowMillis).coerceAtLeast(0)
-                    val clock = timeFormat.format(Date(item.arrivalEpochSeconds * 1000L))
-                    val prefix = if (item.isRealtime) "● " else "○ "
-                    val label = when (idx) {
-                        0 -> {
-                            val minText = if (mins <= 0) "Ora" else "$mins min"
-                            "$prefix$minText · $clock"
-                        }
-                        1 -> {
-                            val minText = if (mins <= 0) "Ora" else "${mins}'"
-                            "$prefix$minText · $clock"
-                        }
-                        else -> {
-                            val minText = if (mins <= 0) "Ora" else "${mins}'"
-                            "$prefix$minText"
-                        }
-                    }
-                    views.setTextViewText(viewId, label)
-                    val useLiveChip = item.isRealtime && idx == 0
-                    views.setInt(
-                        viewId,
-                        "setBackgroundResource",
-                        if (useLiveChip) R.drawable.widget_eta_chip_live else R.drawable.widget_eta_chip_sched,
+            return arrivals
+                .groupBy { it.lineCode.trim().uppercase() }
+                .entries
+                .sortedWith(
+                    compareByDescending<Map.Entry<String, List<StopArrival>>> {
+                        savedLine.isNotEmpty() && it.key.equals(savedLine, ignoreCase = true)
+                    }.thenBy { entry ->
+                        entry.value.minOfOrNull { it.arrivalEpochSeconds } ?: Long.MAX_VALUE
+                    },
+                )
+                .map { (lineCode, lineList) ->
+                    val sorted = lineList.sortedBy { it.arrivalEpochSeconds }.take(3)
+                    val isPrimary = savedLine.isNotEmpty() && lineCode.equals(savedLine, ignoreCase = true)
+                    val headsign = sorted
+                        .firstOrNull { !isGenericDirectionLabel(it.headsign) }
+                        ?.headsign
+                        ?.let(::shortTurinPlaceName)
+                        ?: (if (isPrimary) savedTerminus else null)
+                        ?: sorted
+                            .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", ignoreCase = true) }
+                            ?.headsign
+                            ?.let(::shortTurinPlaceName)
+                        ?: ""
+                    WidgetStopLineRow(
+                        stopId = fav.stopId,
+                        lineCode = lineCode,
+                        headsign = headsign,
+                        isPrimaryLine = isPrimary,
+                        useCyanBadge = isPrimary && colorByDirection && fav.directionId == 1,
+                        arrivals = sorted.map {
+                            WidgetEtaChip(
+                                arrivalEpochSeconds = it.arrivalEpochSeconds,
+                                isRealtime = it.isRealtime,
+                            )
+                        },
                     )
-                    val textColor = when {
-                        item.isRealtime && idx == 0 -> 0xFF34D399.toInt()
-                        item.isRealtime -> 0xFFFFFFFF.toInt()
-                        else -> 0xB8FFFFFF.toInt()
-                    }
-                    views.setTextColor(viewId, textColor)
                 }
-            }
         }
 
-        private fun buildEmptyViews(context: Context, appWidgetId: Int): RemoteViews {
+        private fun buildEmptyFavoritesViews(context: Context, appWidgetId: Int): RemoteViews {
             val views = RemoteViews(context.packageName, R.layout.widget_stop_arrivals)
             views.setTextViewText(R.id.stop_widget_title, "Fermate Live")
-            views.setTextViewText(R.id.stop_widget_subtitle, "")
+            views.setTextViewText(R.id.stop_widget_subtitle, "Nessuna fermata preferita")
             views.setViewVisibility(R.id.stop_widget_switch_btn, View.GONE)
-            views.setViewVisibility(R.id.stop_widget_rows_container, View.GONE)
+            views.setViewVisibility(R.id.stop_widget_list, View.GONE)
             views.setViewVisibility(R.id.stop_widget_empty_text, View.VISIBLE)
+            views.setTextViewText(
+                R.id.stop_widget_empty_text,
+                "Tocca una fermata nella Mappa di ToBus e premi ★ per vedere qui tutti i pullman in arrivo.",
+            )
 
             val openIntent = Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP

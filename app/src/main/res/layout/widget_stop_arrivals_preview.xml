@@ -4,7 +4,7 @@
     android:layout_height="match_parent"
     android:background="@drawable/widget_bg_rounded"
     android:orientation="vertical"
-    android:padding="11dp">
+    android:padding="12dp">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -17,33 +17,53 @@
             android:layout_height="wrap_content"
             android:text="★"
             android:textColor="#FFFBBF24"
-            android:textSize="14sp" />
+            android:textSize="16sp" />
 
-        <TextView
+        <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginStart="6dp"
+            android:layout_marginStart="7dp"
             android:layout_weight="1"
-            android:fontFamily="sans-serif-medium"
-            android:maxLines="1"
-            android:text="Fermate Live"
-            android:textColor="#FFFFFFFF"
-            android:textSize="13sp"
-            android:textStyle="bold" />
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="sans-serif-medium"
+                android:maxLines="1"
+                android:text="Politecnico"
+                android:textColor="#FFFFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:maxLines="1"
+                android:text="#245 · 3 linee · 19:42"
+                android:textColor="#99FFFFFF"
+                android:textSize="10.5sp" />
+        </LinearLayout>
 
         <TextView
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="19:42"
-            android:textColor="#8AFFFFFF"
-            android:textSize="11sp" />
+            android:layout_height="26dp"
+            android:background="@drawable/widget_pill_dark"
+            android:gravity="center"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:text="1/2 ›"
+            android:textColor="#F0FFFFFF"
+            android:textSize="10sp"
+            android:textStyle="bold" />
     </LinearLayout>
 
+    <!-- Line 12 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="7dp"
-        android:background="@drawable/widget_stop_row_bg"
+        android:layout_marginTop="8dp"
+        android:background="@drawable/widget_stop_row_highlight_bg"
         android:orientation="vertical"
         android:padding="8dp">
 
@@ -57,31 +77,31 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:background="@drawable/widget_badge_amber"
-                android:paddingStart="6dp"
+                android:paddingStart="7dp"
                 android:paddingTop="1dp"
-                android:paddingEnd="6dp"
+                android:paddingEnd="7dp"
                 android:paddingBottom="1dp"
                 android:text="12"
                 android:textColor="#FF0D0D12"
-                android:textSize="10sp"
+                android:textSize="11sp"
                 android:textStyle="bold" />
 
             <TextView
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="6dp"
+                android:layout_marginStart="7dp"
                 android:layout_weight="1"
-                android:text="Santa Rita"
-                android:textColor="#FFFFFFFF"
-                android:textSize="12sp"
-                android:textStyle="bold" />
+                android:text="→ Allamano"
+                android:textColor="#E6FFFFFF"
+                android:textSize="12sp" />
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="→ Porta Nuova"
-                android:textColor="#99FFFFFF"
-                android:textSize="10sp" />
+                android:text="● Live"
+                android:textColor="#FF34D399"
+                android:textSize="10sp"
+                android:textStyle="bold" />
         </LinearLayout>
 
         <LinearLayout
@@ -112,16 +132,17 @@
                 android:paddingTop="2dp"
                 android:paddingEnd="6dp"
                 android:paddingBottom="2dp"
-                android:text="12' · 19:54"
+                android:text="● 14' · 19:56"
                 android:textColor="#E6FFFFFF"
                 android:textSize="10sp" />
         </LinearLayout>
     </LinearLayout>
 
+    <!-- Line 33 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="5dp"
+        android:layout_marginTop="6dp"
         android:background="@drawable/widget_stop_row_bg"
         android:orientation="vertical"
         android:padding="8dp">
@@ -135,32 +156,32 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:background="@drawable/widget_badge_cyan"
-                android:paddingStart="6dp"
+                android:background="@drawable/widget_badge_neutral"
+                android:paddingStart="7dp"
                 android:paddingTop="1dp"
-                android:paddingEnd="6dp"
+                android:paddingEnd="7dp"
                 android:paddingBottom="1dp"
-                android:text="12"
-                android:textColor="#FF0D0D12"
-                android:textSize="10sp"
+                android:text="33"
+                android:textColor="#FFFFFFFF"
+                android:textSize="11sp"
                 android:textStyle="bold" />
 
             <TextView
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="6dp"
+                android:layout_marginStart="7dp"
                 android:layout_weight="1"
-                android:text="Porta Nuova"
-                android:textColor="#FFFFFFFF"
-                android:textSize="12sp"
-                android:textStyle="bold" />
+                android:text="→ Collegno"
+                android:textColor="#E6FFFFFF"
+                android:textSize="12sp" />
 
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="→ Mirafiori Nord"
-                android:textColor="#99FFFFFF"
-                android:textSize="10sp" />
+                android:text="● Live"
+                android:textColor="#FF34D399"
+                android:textSize="10sp"
+                android:textStyle="bold" />
         </LinearLayout>
 
         <LinearLayout
@@ -191,8 +212,8 @@
                 android:paddingTop="2dp"
                 android:paddingEnd="6dp"
                 android:paddingBottom="2dp"
-                android:text="16' · 19:58"
-                android:textColor="#E6FFFFFF"
+                android:text="○ 19' · 20:01"
+                android:textColor="#B8FFFFFF"
                 android:textSize="10sp" />
         </LinearLayout>
     </LinearLayout>

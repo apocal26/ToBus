@@ -41,13 +41,15 @@ import java.util.concurrent.atomic.AtomicLong
  *   GeoJSON `FeatureCollection`, keyed vehicle maps, and binary GTFS-RT protobuf.
  */
 class MatoMqttLiveClient(
-    baseClient: OkHttpClient,
+    private val baseClientProvider: () -> OkHttpClient,
 ) {
-    private val wsClient: OkHttpClient = baseClient.newBuilder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // Long-lived streaming WebSocket
-        .pingInterval(25, TimeUnit.SECONDS)
-        .build()
+    private val wsClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        baseClientProvider().newBuilder()
+            .connectTimeout(7, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS) // Long-lived streaming WebSocket
+            .pingInterval(25, TimeUnit.SECONDS)
+            .build()
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val vehiclesById = ConcurrentHashMap<String, BusVehicle>()
@@ -91,11 +93,13 @@ class MatoMqttLiveClient(
         focusedLine = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
         onFocusedLineUpdate = onFocusedUpdate
         val wasActive = isActiveDesired.getAndSet(true)
-        if (!wasActive || activeWebSocket == null) {
-            reconnectAttempt = 0
-            openSocket()
-        } else if (isMqttConnected.get()) {
-            subscribeForLine(activeWebSocket, focusedLine)
+        scope.launch {
+            if (!wasActive || activeWebSocket == null) {
+                reconnectAttempt = 0
+                openSocket()
+            } else if (isMqttConnected.get()) {
+                subscribeForLine(activeWebSocket, focusedLine)
+            }
         }
     }
 
@@ -104,7 +108,32 @@ class MatoMqttLiveClient(
         if (norm.isEmpty() || norm == "?" || norm == focusedLine) return
         focusedLine = norm
         if (isMqttConnected.get()) {
-            subscribeForLine(activeWebSocket, norm)
+            scope.launch {
+                subscribeForLine(activeWebSocket, norm)
+            }
+        }
+    }
+
+    /**
+     * Self-healing liveness check called during periodic foreground polls:
+     * if the MQTT WebSocket silently stalled after a Wi-Fi/5G switch or screen sleep,
+     * force a clean reconnect so live MaTO telemetry resumes automatically.
+     */
+    fun ensureHealthyConnection(nowMillis: Long = System.currentTimeMillis()) {
+        if (!isActiveDesired.get()) return
+        val ws = activeWebSocket
+        val lastMsg = lastMessageReceivedAtMillis.get()
+        val connSince = connectedSinceMillis.get()
+        val stalled = isMqttConnected.get() &&
+            connSince > 0L &&
+            (nowMillis - connSince) > 55_000L &&
+            (lastMsg == 0L || (nowMillis - lastMsg) > 65_000L)
+        if (ws == null || stalled) {
+            scope.launch {
+                if (!isActiveDesired.get()) return@launch
+                reconnectAttempt = 0
+                openSocket()
+            }
         }
     }
 
@@ -121,8 +150,10 @@ class MatoMqttLiveClient(
         val ws = activeWebSocket
         activeWebSocket = null
         if (ws != null) {
-            runCatching { ws.send(encodeDisconnectPacket().toByteString()) }
-            runCatching { ws.close(1000, "App in background") }
+            scope.launch {
+                runCatching { ws.send(encodeDisconnectPacket().toByteString()) }
+                runCatching { ws.close(1000, "App in background") }
+            }
         }
     }
 

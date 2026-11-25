@@ -1,5 +1,6 @@
 package com.example
 
+import android.content.Intent
 import android.graphics.Color as AndroidColor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -7,7 +8,17 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -52,7 +63,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -86,6 +96,8 @@ import com.example.ui.theme.TextSubtitle
 import com.example.ui.theme.ToBusTheme
 import com.example.ui.viewmodel.ToBusViewModel
 
+import com.example.widget.StopArrivalsWidgetProvider
+
 private enum class AppDestination(
     val route: String,
     val labelRes: Int,
@@ -97,16 +109,36 @@ private enum class AppDestination(
 }
 
 class MainActivity : ComponentActivity() {
+    private val pendingOpenStopId = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        consumeWidgetStopIntent(intent)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
         )
         setContent {
             ToBusTheme {
-                ToBusApp()
+                ToBusApp(
+                    pendingOpenStopId = pendingOpenStopId.value,
+                    onConsumedOpenStopId = { pendingOpenStopId.value = null },
+                )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeWidgetStopIntent(intent)
+    }
+
+    private fun consumeWidgetStopIntent(intent: Intent?) {
+        val stopId = intent?.getStringExtra(StopArrivalsWidgetProvider.EXTRA_OPEN_STOP_ID)?.trim()
+        if (!stopId.isNullOrEmpty()) {
+            pendingOpenStopId.value = stopId
+            intent.removeExtra(StopArrivalsWidgetProvider.EXTRA_OPEN_STOP_ID)
         }
     }
 }
@@ -114,6 +146,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ToBusApp(
     viewModel: ToBusViewModel = viewModel(),
+    pendingOpenStopId: String? = null,
+    onConsumedOpenStopId: () -> Unit = {},
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -121,6 +155,14 @@ fun ToBusApp(
     var currentTab by rememberSaveable { mutableStateOf(AppDestination.MAP) }
     var showLinePicker by rememberSaveable { mutableStateOf(false) }
     val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(pendingOpenStopId) {
+        val targetStopId = pendingOpenStopId ?: return@LaunchedEffect
+        currentTab = AppDestination.MAP
+        showLinePicker = false
+        viewModel.openFavoriteStopById(targetStopId)
+        onConsumedOpenStopId()
+    }
 
     // Energy efficiency: stop polling, clocks & animations automatically when app goes to background
     DisposableEffect(lifecycleOwner) {
@@ -150,6 +192,10 @@ fun ToBusApp(
 
     LaunchedEffect(currentTab) {
         viewModel.setStudioTabActive(currentTab == AppDestination.WIDGET)
+    }
+
+    LaunchedEffect(showLinePicker) {
+        viewModel.setLinePickerOpen(showLinePicker)
     }
 
     LaunchedEffect(uiState.statusToast) {
@@ -183,65 +229,132 @@ fun ToBusApp(
         }
     }
 
+    val isLightMapVisible = currentTab == AppDestination.MAP && !uiState.settings.mapStyle.isDark && !showLinePicker
+    val activity = LocalContext.current as? ComponentActivity
+    LaunchedEffect(activity, isLightMapVisible) {
+        activity?.enableEdgeToEdge(
+            statusBarStyle = if (isLightMapVisible) {
+                SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT)
+            } else {
+                SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+            },
+            navigationBarStyle = if (isLightMapVisible) {
+                SystemBarStyle.light(AndroidColor.TRANSPARENT, AndroidColor.TRANSPARENT)
+            } else {
+                SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+            },
+        )
+    }
+
+    val openLinePicker = remember { { showLinePicker = true } }
+    val closeLinePicker = remember { { showLinePicker = false } }
+    val refreshLive = remember(viewModel) { { viewModel.refreshLiveData() } }
+    val refreshStopArrivals = remember(viewModel) { { viewModel.refreshSelectedStopArrivals(silent = false) } }
+    val ensureWidgetPreviewRendered = remember(viewModel) { { viewModel.regenerateWidgetPreview(force = true) } }
+    val selectSearchedStop = remember(viewModel) {
+        { entry: com.example.data.model.StopSearchEntry ->
+            currentTab = AppDestination.MAP
+            viewModel.openSearchedStop(entry)
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black),
     ) {
-        // Pure #FF000000 root + Dynamic Elliptical Ambient Glow Shader (only drawn when visible, skipping hidden overdraw behind full-bleed map)
-        if (currentTab != AppDestination.MAP) {
+        // Pure #FF000000 root + Dynamic Elliptical Ambient Glow Shader (smooth crossfade when entering Settings)
+        AnimatedVisibility(
+            visible = currentTab != AppDestination.MAP,
+            enter = fadeIn(animationSpec = tween(durationMillis = 280)),
+            exit = fadeOut(animationSpec = tween(durationMillis = 220)),
+        ) {
             AmbientGlowBackground(accentColor = ambientAccent)
         }
 
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val useNavigationRail = maxWidth >= 680.dp
-            val bottomClearance = if (useNavigationRail) 0.dp else 86.dp
+            val isInspectingMapPopup = currentTab == AppDestination.MAP &&
+                (uiState.selectedVehicle != null || uiState.selectedStop != null)
+            val bottomClearance by animateDpAsState(
+                targetValue = if (useNavigationRail || isInspectingMapPopup) 0.dp else 86.dp,
+                animationSpec = tween(durationMillis = 220),
+                label = "bottom_bar_clearance",
+            )
+            val snackbarBottomPadding by animateDpAsState(
+                targetValue = when {
+                    useNavigationRail -> 72.dp
+                    isInspectingMapPopup -> 18.dp
+                    else -> 88.dp
+                },
+                animationSpec = tween(durationMillis = 220),
+                label = "snackbar_bottom_padding",
+            )
             val leftRailClearance = if (useNavigationRail) 112.dp else 0.dp
 
             Box(modifier = Modifier.fillMaxSize()) {
-                when (currentTab) {
-                    AppDestination.MAP -> MapScreen(
-                        uiState = uiState,
-                        isForegroundActive = isForegroundActive,
-                        isWideScreen = useNavigationRail,
-                        bottomNavClearance = bottomClearance,
-                        onCameraChange = viewModel::updateCamera,
-                        onViewportSizeChange = viewModel::updateViewportSize,
-                        onOpenLinePicker = { showLinePicker = true },
-                        onRefresh = { viewModel.refreshLiveData() },
-                        onUserLocationClick = viewModel::onUserLocationButtonClicked,
-                        onLocationPermissionResult = viewModel::onLocationPermissionResult,
-                        onSelectVehicle = viewModel::selectVehicle,
-                        onSelectStop = viewModel::selectStop,
-                        onRefreshStopArrivals = { viewModel.refreshSelectedStopArrivals(silent = false) },
-                        onToggleFavoriteStop = viewModel::toggleFavoriteStop,
-                        onOpenFavoriteStop = viewModel::openFavoriteStop,
-                        onFocusArrivalBus = viewModel::focusBusForArrival,
-                        onSelectLine = viewModel::selectLine,
-                    )
+                AnimatedContent(
+                    targetState = currentTab,
+                    transitionSpec = {
+                        if (targetState == AppDestination.WIDGET) {
+                            (fadeIn(tween(240, easing = FastOutSlowInEasing)) +
+                                slideInVertically(tween(260, easing = FastOutSlowInEasing)) { it / 20 })
+                                .togetherWith(fadeOut(tween(180)))
+                        } else {
+                            fadeIn(tween(220, easing = FastOutSlowInEasing))
+                                .togetherWith(
+                                    fadeOut(tween(170)) +
+                                        slideOutVertically(tween(200)) { it / 20 },
+                                )
+                        }
+                    },
+                    label = "app_tab_transition",
+                ) { destination ->
+                    when (destination) {
+                        AppDestination.MAP -> MapScreen(
+                            uiState = uiState,
+                            pollProgressFlow = viewModel.pollProgress,
+                            isForegroundActive = isForegroundActive && !showLinePicker,
+                            isWideScreen = useNavigationRail,
+                            bottomNavClearance = bottomClearance,
+                            onCameraChange = viewModel::updateCamera,
+                            onViewportSizeChange = viewModel::updateViewportSize,
+                            onOpenLinePicker = openLinePicker,
+                            onRefresh = refreshLive,
+                            onUserLocationClick = viewModel::onUserLocationButtonClicked,
+                            onLocationPermissionResult = viewModel::onLocationPermissionResult,
+                            onSelectVehicle = viewModel::selectVehicle,
+                            onSelectStop = viewModel::selectStop,
+                            onRefreshStopArrivals = refreshStopArrivals,
+                            onToggleFavoriteStop = viewModel::toggleFavoriteStop,
+                            onOpenFavoriteStop = viewModel::openFavoriteStop,
+                            onFocusArrivalBus = viewModel::focusBusForArrival,
+                            onSelectLine = viewModel::selectLine,
+                        )
 
-                    AppDestination.WIDGET -> WidgetStudioScreen(
-                        uiState = uiState,
-                        bottomNavClearance = bottomClearance,
-                        leftRailClearance = leftRailClearance,
-                        onOpenLinePicker = { showLinePicker = true },
-                        onSelectMapStyle = viewModel::setMapStyle,
-                        onSelectCameraMode = viewModel::setCameraMode,
-                        onCaptureCurrentMapArea = viewModel::saveCurrentMapAsWidgetArea,
-                        onToggleVehicleLabels = viewModel::setShowVehicleLabels,
-                        onToggleRouteLine = viewModel::setShowRouteLine,
-                        onToggleColorByDirection = viewModel::setColorByDirection,
-                        onToggleHideInactiveInWidget = viewModel::setHideInactiveInWidget,
-                        onSelectRefreshInterval = viewModel::setRefreshInterval,
-                        onSelectPreviewSize = viewModel::setPreviewSize,
-                        onSyncWidgetNow = viewModel::triggerHomeWidgetSync,
-                        onEnsurePreviewRendered = { viewModel.regenerateWidgetPreview(force = true) },
-                        onOpenFavoriteStop = { fav ->
-                            currentTab = AppDestination.MAP
-                            viewModel.openFavoriteStop(fav)
-                        },
-                        onRemoveFavoriteStop = viewModel::removeFavoriteStop,
-                    )
+                        AppDestination.WIDGET -> WidgetStudioScreen(
+                            uiState = uiState,
+                            bottomNavClearance = bottomClearance,
+                            leftRailClearance = leftRailClearance,
+                            onOpenLinePicker = openLinePicker,
+                            onSelectMapStyle = viewModel::setMapStyle,
+                            onSelectCameraMode = viewModel::setCameraMode,
+                            onCaptureCurrentMapArea = viewModel::saveCurrentMapAsWidgetArea,
+                            onToggleVehicleLabels = viewModel::setShowVehicleLabels,
+                            onToggleRouteLine = viewModel::setShowRouteLine,
+                            onToggleColorByDirection = viewModel::setColorByDirection,
+                            onToggleHideInactiveInWidget = viewModel::setHideInactiveInWidget,
+                            onSelectRefreshInterval = viewModel::setRefreshInterval,
+                            onSelectPreviewSize = viewModel::setPreviewSize,
+                            onSyncWidgetNow = viewModel::triggerHomeWidgetSync,
+                            onEnsurePreviewRendered = ensureWidgetPreviewRendered,
+                            onOpenFavoriteStop = { fav ->
+                                currentTab = AppDestination.MAP
+                                viewModel.openFavoriteStop(fav)
+                            },
+                            onRemoveFavoriteStop = viewModel::removeFavoriteStop,
+                        )
+                    }
                 }
 
                 // Floating Smoked Glass Navigation Rail over full-bleed content on Tablet / Foldable
@@ -249,18 +362,26 @@ fun ToBusApp(
                     GlassNavigationRail(
                         selected = currentTab,
                         onSelect = { currentTab = it },
+                        isLightMapVisible = isLightMapVisible,
                         modifier = Modifier.align(Alignment.CenterStart),
                     )
                 } else {
-                    // Detached Floating Smoked Glass Bottom Bar on Smartphone
-                    FloatingGlassBottomBar(
-                        selected = currentTab,
-                        onSelect = { currentTab = it },
+                    // Detached Floating Smoked Glass Bottom Bar on Smartphone (auto-hides while reading popups)
+                    AnimatedVisibility(
+                        visible = !isInspectingMapPopup,
+                        enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { it },
+                        exit = fadeOut(tween(150)) + slideOutVertically(tween(200)) { it },
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .navigationBarsPadding()
                             .padding(horizontal = 24.dp, vertical = 14.dp),
-                    )
+                    ) {
+                        FloatingGlassBottomBar(
+                            selected = currentTab,
+                            onSelect = { currentTab = it },
+                            isLightMapVisible = isLightMapVisible,
+                        )
+                    }
                 }
 
                 // Smoked Glass Snackbar
@@ -270,7 +391,7 @@ fun ToBusApp(
                         .align(Alignment.BottomCenter)
                         .navigationBarsPadding()
                         .padding(
-                            bottom = if (useNavigationRail) 72.dp else 88.dp,
+                            bottom = snackbarBottomPadding,
                             start = if (useNavigationRail) leftRailClearance else 16.dp,
                             end = 16.dp,
                         ),
@@ -284,30 +405,49 @@ fun ToBusApp(
                 }
             }
         }
-    }
 
-    if (showLinePicker) {
-        LinePickerSheet(
-            selectedLine = uiState.settings.selectedLine,
-            activeLines = uiState.allActiveLines,
-            stopSearchResults = uiState.stopSearchResults,
-            isLoadingStopIndex = uiState.isLoadingStopIndex,
-            userLocation = uiState.userLocation,
-            onSelectLine = viewModel::selectLine,
-            onSearchStops = viewModel::searchStops,
-            onSelectStop = { entry ->
-                currentTab = AppDestination.MAP
-                viewModel.openSearchedStop(entry)
-            },
-            onDismiss = { showLinePicker = false },
-        )
+        AnimatedVisibility(
+            visible = showLinePicker,
+            enter = fadeIn(animationSpec = tween(durationMillis = 180)) +
+                slideInVertically(animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)) { it / 4 },
+            exit = fadeOut(animationSpec = tween(durationMillis = 140)) +
+                slideOutVertically(animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing)) { it / 4 },
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            LinePickerSheet(
+                selectedLine = uiState.settings.selectedLine,
+                activeLines = uiState.allActiveLines,
+                favoriteLines = uiState.favoriteLines,
+                stopSearchResults = uiState.stopSearchResults,
+                isLoadingStopIndex = uiState.isLoadingStopIndex,
+                userLocation = uiState.userLocation,
+                onSelectLine = viewModel::selectLine,
+                onToggleFavoriteLine = viewModel::toggleFavoriteLine,
+                onSearchStops = viewModel::searchStops,
+                onSelectStop = selectSearchedStop,
+                onDismiss = closeLinePicker,
+            )
+        }
     }
 }
+
+private val NavSliderShape = RoundedCornerShape(999.dp)
+private val NavRailShape = RoundedCornerShape(28.dp)
+private val NavRailSliderShape = RoundedCornerShape(20.dp)
+private val NavSliderBrush = Brush.verticalGradient(
+    colors = listOf(GlassSliderTop, GlassSliderMid, GlassSliderBottom),
+)
+private val NavGlassRimBrush = com.example.ui.glass.liquidGlassRimBrush(
+    topAlpha = 0.45f,
+    midAlpha = 0.16f,
+    bottomAlpha = 0.25f,
+)
 
 @Composable
 private fun FloatingGlassBottomBar(
     selected: AppDestination,
     onSelect: (AppDestination) -> Unit,
+    isLightMapVisible: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val entries = AppDestination.entries
@@ -317,9 +457,9 @@ private fun FloatingGlassBottomBar(
         modifier = modifier
             .width(284.dp)
             .height(60.dp),
-        shape = RoundedCornerShape(999.dp),
-        color = SmokedGlassFill,
-        border = BorderStroke(1.2.dp, SmokedGlassBorder),
+        shape = NavSliderShape,
+        color = if (isLightMapVisible) com.example.ui.theme.OverlayPillLightMapFill else SmokedGlassFill,
+        border = BorderStroke(1.2.dp, NavGlassRimBrush),
     ) {
         BoxWithConstraints(
             modifier = Modifier
@@ -339,13 +479,8 @@ private fun FloatingGlassBottomBar(
                     .offset(x = indicatorX)
                     .width(slotW)
                     .fillMaxHeight()
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(GlassSliderTop, GlassSliderMid, GlassSliderBottom),
-                        ),
-                    )
-                    .border(1.5.dp, GlassSliderBorder, RoundedCornerShape(999.dp)),
+                    .background(NavSliderBrush, NavSliderShape)
+                    .border(1.5.dp, GlassSliderBorder, NavSliderShape),
             )
 
             Row(modifier = Modifier.fillMaxSize()) {
@@ -388,6 +523,7 @@ private fun FloatingGlassBottomBar(
 private fun GlassNavigationRail(
     selected: AppDestination,
     onSelect: (AppDestination) -> Unit,
+    isLightMapVisible: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val entries = AppDestination.entries
@@ -409,9 +545,9 @@ private fun GlassNavigationRail(
     ) {
         Surface(
             modifier = Modifier.width(88.dp),
-            shape = RoundedCornerShape(28.dp),
-            color = SmokedGlassFill,
-            border = BorderStroke(1.2.dp, SmokedGlassBorder),
+            shape = NavRailShape,
+            color = if (isLightMapVisible) com.example.ui.theme.OverlayPillLightMapFill else SmokedGlassFill,
+            border = BorderStroke(1.2.dp, NavGlassRimBrush),
         ) {
             Box(modifier = Modifier.padding(8.dp)) {
                 Box(
@@ -419,13 +555,8 @@ private fun GlassNavigationRail(
                         .offset(y = indicatorY)
                         .fillMaxWidth()
                         .height(itemHeight)
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(
-                            Brush.verticalGradient(
-                                colors = listOf(GlassSliderTop, GlassSliderMid, GlassSliderBottom),
-                            ),
-                        )
-                        .border(1.5.dp, GlassSliderBorder, RoundedCornerShape(20.dp)),
+                        .background(NavSliderBrush, NavRailSliderShape)
+                        .border(1.5.dp, GlassSliderBorder, NavRailSliderShape),
                 )
 
                 Column(verticalArrangement = Arrangement.spacedBy(itemSpacing)) {

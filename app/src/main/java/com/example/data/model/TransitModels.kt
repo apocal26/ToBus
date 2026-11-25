@@ -1,5 +1,8 @@
 package com.example.data.model
 
+import androidx.compose.runtime.Immutable
+
+@Immutable
 data class GeoPoint(
     val lat: Double,
     val lon: Double,
@@ -18,6 +21,7 @@ enum class VehicleFreshness(val labelIt: String) {
     STALE("Segnale fermo / datato"),
 }
 
+@Immutable
 data class StopTimePrediction(
     val stopId: String,
     val arrivalEpochSeconds: Long?,
@@ -25,6 +29,7 @@ data class StopTimePrediction(
     val delaySeconds: Int?,
 )
 
+@Immutable
 data class TripDelayInfo(
     val tripId: String?,
     val vehicleId: String?,
@@ -35,11 +40,13 @@ data class TripDelayInfo(
     val stopPredictions: List<StopTimePrediction> = emptyList(),
 )
 
+@Immutable
 data class AlertTimeRange(
     val startEpochSeconds: Long?,
     val endEpochSeconds: Long?,
 )
 
+@Immutable
 data class ServiceAlertInfo(
     val id: String,
     val headerText: String,
@@ -270,6 +277,7 @@ private fun extractItalianMonthDatesEpochSeconds(text: String, nowEpochSeconds: 
     return out
 }
 
+@Immutable
 data class DataSourceStatus(
     val id: String,
     val name: String,
@@ -279,6 +287,7 @@ data class DataSourceStatus(
     val detail: String,
 )
 
+@Immutable
 data class BusVehicle(
     val entityId: String,
     val vehicleId: String,
@@ -321,6 +330,7 @@ data class BusVehicle(
     }
 }
 
+@Immutable
 data class TransitStop(
     val stopId: String,
     val stopCode: String,
@@ -334,6 +344,7 @@ data class TransitStop(
         get() = stopCode.ifBlank { stopId }
 }
 
+@Immutable
 data class FavoriteStop(
     val stopId: String,
     val stopCode: String,
@@ -357,6 +368,7 @@ data class FavoriteStop(
     )
 }
 
+@Immutable
 data class StopArrival(
     val lineCode: String,
     val headsign: String,
@@ -373,6 +385,7 @@ data class StopArrival(
     }
 }
 
+@Immutable
 data class RoutePattern(
     val id: String,
     val name: String,
@@ -397,7 +410,7 @@ data class RoutePattern(
             null
         }
         if (lastStop != null) {
-            return formatTurinLabel(lastStop)
+            return shortTurinPlaceName(lastStop)
         }
 
         val rawName = name.trim()
@@ -415,7 +428,7 @@ data class RoutePattern(
         } else {
             stops.lastOrNull()?.name?.trim().orEmpty()
         }
-        return chosen.takeIf { it.isNotBlank() }?.let(::formatTurinLabel)
+        return chosen.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
     }
 }
 
@@ -539,12 +552,14 @@ fun shortTurinPlaceName(raw: String): String {
     return formatted
 }
 
+@Immutable
 data class LineSummary(
     val lineCode: String,
     val rawRouteIds: Set<String>,
     val activeVehicleCount: Int,
 )
 
+@Immutable
 data class StopSearchEntry(
     val stopId: String,
     val stopCode: String,
@@ -647,6 +662,7 @@ enum class RefreshInterval(
     }
 }
 
+@Immutable
 data class CameraState(
     val centerLat: Double = TURIN_CENTER_LAT,
     val centerLon: Double = TURIN_CENTER_LON,
@@ -660,6 +676,7 @@ data class CameraState(
     }
 }
 
+@Immutable
 data class UserWidgetSettings(
     val selectedLine: String = "12",
     val mapStyle: MapStyle = MapStyle.DARK,

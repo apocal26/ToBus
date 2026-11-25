@@ -42,13 +42,10 @@ import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Widgets
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -84,9 +81,12 @@ import com.example.ui.glass.GlassBand
 import com.example.ui.glass.GlassCard
 import com.example.ui.glass.GlassCircleIconButton
 import com.example.ui.glass.GlassModalDialog
+import com.example.ui.glass.GlassShimmerBox
 import com.example.ui.glass.HeroEntranceText
+import com.example.ui.glass.LiquidGlassSwitch
 import com.example.ui.glass.SlidingGlassSegmentedControl
 import com.example.ui.glass.glassInteractive
+import com.example.ui.glass.rememberGlassShimmerBrush
 import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
@@ -351,9 +351,11 @@ private fun LiveWidgetShowcaseBand(
     val aspectRatio = uiState.previewSize.widthDp.toFloat() / uiState.previewSize.heightDp.toFloat()
     val isSquare = uiState.previewSize.isSquare
 
-    val wallpaperBrush = Brush.linearGradient(
-        colors = listOf(Color(0xFF0E1626), Color(0xFF080A10), Color(0xFF142133)),
-    )
+    val wallpaperBrush = remember {
+        Brush.linearGradient(
+            colors = listOf(Color(0xFF0E1626), Color(0xFF080A10), Color(0xFF142133)),
+        )
+    }
 
     GlassBand(
         modifier = Modifier.testTag("widget_live_preview_card"),
@@ -363,8 +365,7 @@ private fun LiveWidgetShowcaseBand(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(20.dp))
-                .background(wallpaperBrush)
+                .background(wallpaperBrush, RoundedCornerShape(20.dp))
                 .border(1.dp, GlassBandBorder, RoundedCornerShape(20.dp))
                 .padding(horizontal = 16.dp, vertical = 20.dp),
             contentAlignment = Alignment.Center,
@@ -376,15 +377,22 @@ private fun LiveWidgetShowcaseBand(
                     onRefreshPreview = onRefreshPreview,
                 )
             } else {
+                val spatialById = remember(uiState.lineVehicles, uiState.routePatterns) {
+                    uiState.lineVehicles.associate { bus ->
+                        bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
+                    }
+                }
                 val displayedCount = remember(
                     uiState.lineVehicles,
-                    uiState.routePatterns,
+                    spatialById,
                     uiState.settings.hideInactiveInWidget,
                     uiState.nowMillis,
                 ) {
                     if (uiState.settings.hideInactiveInWidget) {
                         uiState.lineVehicles.count { bus ->
-                            val health = GttFleetAnalyzer.assess(bus, uiState.routePatterns, uiState.nowMillis)
+                            val spatial = spatialById[bus.vehicleId]
+                                ?: GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
+                            val health = GttFleetAnalyzer.assessWithSpatial(bus, spatial, uiState.nowMillis)
                             !health.isInDepot && !health.isStaleGps
                         }
                     } else {
@@ -416,13 +424,41 @@ private fun LiveWidgetShowcaseBand(
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize(),
                         )
-                    } else {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(26.dp),
-                                color = AccentCyan,
-                                strokeWidth = 2.dp,
+                        if (uiState.isRefreshing) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(rememberGlassShimmerBrush()),
                             )
+                        }
+                    } else {
+                        val shimmerBrush = rememberGlassShimmerBrush()
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(shimmerBrush)
+                                .padding(14.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.align(Alignment.Center),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                GlassShimmerBox(
+                                    modifier = Modifier
+                                        .width(96.dp)
+                                        .height(14.dp),
+                                    shape = RoundedCornerShape(999.dp),
+                                    brush = shimmerBrush,
+                                )
+                                GlassShimmerBox(
+                                    modifier = Modifier
+                                        .width(64.dp)
+                                        .height(10.dp),
+                                    shape = RoundedCornerShape(999.dp),
+                                    brush = shimmerBrush,
+                                )
+                            }
                         }
                     }
 
@@ -431,8 +467,7 @@ private fun LiveWidgetShowcaseBand(
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(if (isSquare) 8.dp else 10.dp)
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(OverlayPillFill)
+                            .background(OverlayPillFill, RoundedCornerShape(999.dp))
                             .border(1.dp, OverlayPillBorder, RoundedCornerShape(999.dp))
                             .padding(
                                 start = if (isSquare) 3.dp else 4.dp,
@@ -444,8 +479,7 @@ private fun LiveWidgetShowcaseBand(
                     ) {
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .background(AccentGold)
+                                .background(AccentGold, RoundedCornerShape(999.dp))
                                 .padding(horizontal = if (isSquare) 6.dp else 8.dp, vertical = 2.dp),
                             contentAlignment = Alignment.Center,
                         ) {
@@ -459,8 +493,7 @@ private fun LiveWidgetShowcaseBand(
                         Box(
                             modifier = Modifier
                                 .size(if (isSquare) 6.dp else 7.dp)
-                                .clip(CircleShape)
-                                .background(AccentEmerald),
+                                .background(AccentEmerald, CircleShape),
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
@@ -485,8 +518,7 @@ private fun LiveWidgetShowcaseBand(
                             .padding(if (isSquare) 8.dp else 10.dp)
                             .size(if (isSquare) 30.dp else 34.dp)
                             .glassInteractive(refreshInt, onClick = onRefreshPreview)
-                            .clip(CircleShape)
-                            .background(OverlayPillFill)
+                            .background(OverlayPillFill, CircleShape)
                             .border(1.dp, OverlayPillBorder, CircleShape),
                         contentAlignment = Alignment.Center,
                     ) {
@@ -503,8 +535,7 @@ private fun LiveWidgetShowcaseBand(
                         modifier = Modifier
                             .align(Alignment.BottomStart)
                             .padding(if (isSquare) 8.dp else 10.dp)
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(OverlayPillFill)
+                            .background(OverlayPillFill, RoundedCornerShape(999.dp))
                             .border(1.dp, OverlayPillBorder, RoundedCornerShape(999.dp))
                             .padding(horizontal = 8.dp, vertical = 2.dp),
                     ) {
@@ -538,21 +569,43 @@ private fun StopsLiveWidgetPreviewCard(
     timeLabel: String,
     onRefreshPreview: () -> Unit,
 ) {
-    val visibleFavorites = uiState.favoriteStops.take(3)
+    val favorites = uiState.favoriteStops
+    var previewStopIdx by remember(favorites.size) { mutableStateOf(0) }
+    val activeFav = favorites.getOrNull(previewStopIdx.coerceIn(0, (favorites.size - 1).coerceAtLeast(0)))
     val refreshInt = remember { MutableInteractionSource() }
+    val switchInt = remember { MutableInteractionSource() }
     val clockFormat = remember { SimpleDateFormat("HH:mm", Locale.ITALY) }
+
+    val groupedLines = remember(activeFav, uiState.stopWidgetPreviewByStopId) {
+        if (activeFav == null) {
+            emptyList()
+        } else {
+            val savedLine = activeFav.lineCode.trim().uppercase()
+            uiState.stopWidgetPreviewByStopId[activeFav.stopId]
+                .orEmpty()
+                .groupBy { it.lineCode.trim().uppercase() }
+                .entries
+                .sortedWith(
+                    compareByDescending<Map.Entry<String, List<StopArrival>>> {
+                        savedLine.isNotEmpty() && it.key.equals(savedLine, ignoreCase = true)
+                    }.thenBy { entry ->
+                        entry.value.minOfOrNull { it.arrivalEpochSeconds } ?: Long.MAX_VALUE
+                    },
+                )
+                .map { (code, list) -> code to list.sortedBy { it.arrivalEpochSeconds }.take(3) }
+        }
+    }
 
     Column(
         modifier = Modifier
             .fillMaxWidth(0.98f)
             .shadow(elevation = 16.dp, shape = RoundedCornerShape(26.dp))
-            .clip(RoundedCornerShape(26.dp))
-            .background(Color(0xF011131B))
+            .background(Color(0xF011131B), RoundedCornerShape(26.dp))
             .border(1.dp, Color(0x38FFFFFF), RoundedCornerShape(26.dp))
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(7.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        // Header matching widget_stop_arrivals.xml
+        // Header mirroring widget_stop_arrivals.xml (Single Stop + #code · N linee · clock + Switcher + Refresh)
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -561,50 +614,58 @@ private fun StopsLiveWidgetPreviewCard(
                 imageVector = Icons.Rounded.Star,
                 contentDescription = null,
                 tint = AccentGold,
-                modifier = Modifier.size(15.dp),
+                modifier = Modifier.size(17.dp),
             )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = if (visibleFavorites.size == 1) {
-                    shortTurinPlaceName(visibleFavorites.first().name)
-                } else {
-                    "Fermate Live"
-                },
-                style = MaterialTheme.typography.titleSmall,
-                color = TextPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                text = timeLabel,
-                style = MaterialTheme.typography.labelSmall,
-                color = TextSubtitle,
-            )
-            if (uiState.favoriteStops.size > 3) {
-                val totalPages = ((uiState.favoriteStops.size - 1) / 3) + 1
+            Spacer(modifier = Modifier.width(7.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = activeFav?.let { shortTurinPlaceName(it.name) } ?: "Fermate Live",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val lineCountPart = when (groupedLines.size) {
+                    0 -> "nessun bus"
+                    1 -> "1 linea"
+                    else -> "${groupedLines.size} linee"
+                }
+                Text(
+                    text = if (activeFav != null) {
+                        "#${activeFav.stopCode} · $lineCountPart · $timeLabel"
+                    } else {
+                        "Nessuna fermata preferita"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSubtitle,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (favorites.size > 1) {
                 Spacer(modifier = Modifier.width(6.dp))
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(OverlayPillFill)
+                        .glassInteractive(switchInt) {
+                            previewStopIdx = (previewStopIdx + 1) % favorites.size
+                        }
+                        .background(OverlayPillFill, RoundedCornerShape(999.dp))
                         .border(1.dp, OverlayPillBorder, RoundedCornerShape(999.dp))
-                        .padding(horizontal = 7.dp, vertical = 3.dp),
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
                 ) {
                     Text(
-                        text = "1/$totalPages ›",
+                        text = "${previewStopIdx + 1}/${favorites.size} ›",
                         style = MaterialTheme.typography.labelSmall,
-                        color = TextBody,
+                        color = TextPrimary,
                     )
                 }
             }
             Spacer(modifier = Modifier.width(6.dp))
             Box(
                 modifier = Modifier
-                    .size(28.dp)
+                    .size(30.dp)
                     .glassInteractive(refreshInt, onClick = onRefreshPreview)
-                    .clip(CircleShape)
-                    .background(OverlayPillFill)
+                    .background(OverlayPillFill, CircleShape)
                     .border(1.dp, OverlayPillBorder, CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
@@ -612,107 +673,123 @@ private fun StopsLiveWidgetPreviewCard(
                     imageVector = Icons.Rounded.Refresh,
                     contentDescription = stringResource(R.string.widget_tap_to_refresh),
                     tint = TextPrimary,
-                    modifier = Modifier.size(14.dp),
+                    modifier = Modifier.size(15.dp),
                 )
             }
         }
 
-        if (visibleFavorites.isEmpty()) {
+        if (activeFav == null) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(GlassRowFill)
+                    .background(GlassRowFill, RoundedCornerShape(14.dp))
                     .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
                     .padding(12.dp),
             ) {
                 Text(
-                    text = "Tocca una o più fermate nella Mappa e premi ★ per vederle tutte qui insieme in tempo reale.",
+                    text = "Tocca una fermata nella Mappa e premi ★ per vedere qui tutte le linee in arrivo in tempo reale.",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSubtitle,
                 )
             }
-        } else if (uiState.isLoadingStopWidgetPreview && uiState.stopWidgetPreviewByStopId.isEmpty()) {
-            Row(
+        } else if (uiState.isLoadingStopWidgetPreview && groupedLines.isEmpty()) {
+            val shimmerBrush = rememberGlassShimmerBrush()
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                repeat(2) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(GlassRowFill, RoundedCornerShape(14.dp))
+                            .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            GlassShimmerBox(
+                                modifier = Modifier
+                                    .width(28.dp)
+                                    .height(16.dp),
+                                shape = RoundedCornerShape(999.dp),
+                                brush = shimmerBrush,
+                            )
+                            GlassShimmerBox(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(14.dp),
+                                shape = RoundedCornerShape(6.dp),
+                                brush = shimmerBrush,
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            repeat(3) {
+                                GlassShimmerBox(
+                                    modifier = Modifier
+                                        .width(66.dp)
+                                        .height(18.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                    brush = shimmerBrush,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (groupedLines.isEmpty()) {
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(GlassRowFill)
+                    .background(GlassRowFill, RoundedCornerShape(14.dp))
+                    .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
                     .padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    color = AccentGold,
-                    strokeWidth = 2.dp,
-                )
                 Text(
-                    text = "Carico i passaggi delle tue fermate…",
+                    text = "Nessun passaggio imminente rilevato per ${shortTurinPlaceName(activeFav.name)}.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = TextBody,
+                    color = TextSubtitle,
                 )
             }
-        } else if (visibleFavorites.size == 1) {
-            // Single favorite -> grouped by line (up to 3 lines)
-            val only = visibleFavorites.first()
-            val allArrivals = uiState.stopWidgetPreviewByStopId[only.stopId].orEmpty()
-            val grouped = allArrivals
-                .groupBy { it.lineCode.uppercase() }
-                .entries
-                .sortedWith(
-                    compareByDescending<Map.Entry<String, List<StopArrival>>> {
-                        it.key.equals(only.lineCode, ignoreCase = true)
-                    }.thenBy { it.value.minOfOrNull { a -> a.arrivalEpochSeconds } ?: Long.MAX_VALUE },
-                )
-                .take(3)
-
-            if (grouped.isEmpty()) {
-                PreviewStopCardRow(
-                    lineCode = only.lineCode,
-                    badgeColor = if (uiState.settings.colorByDirection && only.directionId == 1) AccentCyan else AccentGold,
-                    title = shortTurinPlaceName(only.name),
-                    dirText = only.terminusName?.let { "→ ${shortTurinPlaceName(it)}" }.orEmpty(),
-                    arrivals = emptyList(),
-                    nowMillis = uiState.nowMillis,
-                    clockFormat = clockFormat,
-                )
-            } else {
-                grouped.forEach { (line, list) ->
-                    val isSavedLine = line.equals(only.lineCode, ignoreCase = true)
-                    val headsign = list.firstOrNull()?.headsign?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
-                        ?: only.terminusName?.let(::shortTurinPlaceName)
-                        ?: "Linea $line"
+        } else {
+            val savedLine = activeFav.lineCode.trim().uppercase()
+            val savedTerminus = activeFav.terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                groupedLines.take(4).forEach { (lineCode, arrivals) ->
+                    val isPrimary = savedLine.isNotEmpty() && lineCode.equals(savedLine, ignoreCase = true)
+                    val headsign = arrivals
+                        .firstOrNull { !com.example.data.model.isGenericDirectionLabel(it.headsign) }
+                        ?.headsign
+                        ?.let(::shortTurinPlaceName)
+                        ?: (if (isPrimary) savedTerminus else null)
+                        ?: arrivals
+                            .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
+                            ?.headsign
+                            ?.let(::shortTurinPlaceName)
+                        ?: ""
+                    val badgeColor = when {
+                        isPrimary && uiState.settings.colorByDirection && activeFav.directionId == 1 -> AccentCyan
+                        isPrimary -> AccentGold
+                        else -> Color(0x2EFFFFFF)
+                    }
                     PreviewStopCardRow(
-                        lineCode = line,
-                        badgeColor = if (isSavedLine && uiState.settings.colorByDirection && only.directionId == 1) AccentCyan else AccentGold,
-                        title = headsign,
-                        dirText = "",
-                        arrivals = list.sortedBy { it.arrivalEpochSeconds }.take(3),
+                        lineCode = lineCode,
+                        isPrimaryLine = isPrimary,
+                        badgeColor = badgeColor,
+                        headsign = headsign,
+                        arrivals = arrivals,
                         nowMillis = uiState.nowMillis,
                         clockFormat = clockFormat,
                     )
                 }
-            }
-        } else {
-            // Multiple favorites -> display 2 or 3 favorite stops simultaneously!
-            visibleFavorites.forEach { fav ->
-                val allForStop = uiState.stopWidgetPreviewByStopId[fav.stopId].orEmpty()
-                val preferred = allForStop.filter { it.lineCode.equals(fav.lineCode, ignoreCase = true) }
-                val chosen = (preferred.ifEmpty { allForStop })
-                    .sortedBy { it.arrivalEpochSeconds }
-                    .take(3)
-                val badgeColor = if (uiState.settings.colorByDirection && fav.directionId == 1) AccentCyan else AccentGold
-                val dirText = fav.terminusName?.takeIf { it.isNotBlank() }?.let { "→ ${shortTurinPlaceName(it)}" }.orEmpty()
-                PreviewStopCardRow(
-                    lineCode = chosen.firstOrNull()?.lineCode ?: fav.lineCode,
-                    badgeColor = badgeColor,
-                    title = shortTurinPlaceName(fav.name),
-                    dirText = dirText,
-                    arrivals = chosen,
-                    nowMillis = uiState.nowMillis,
-                    clockFormat = clockFormat,
-                )
+                if (groupedLines.size > 4) {
+                    Text(
+                        text = "+ altre ${groupedLines.size - 4} linee scorrevoli nel widget",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSubtitle,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                }
             }
         }
     }
@@ -721,96 +798,90 @@ private fun StopsLiveWidgetPreviewCard(
 @Composable
 private fun PreviewStopCardRow(
     lineCode: String,
+    isPrimaryLine: Boolean,
     badgeColor: Color,
-    title: String,
-    dirText: String,
+    headsign: String,
     arrivals: List<StopArrival>,
     nowMillis: Long,
     clockFormat: SimpleDateFormat,
 ) {
+    val hasAnyLive = arrivals.any { it.isRealtime }
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(13.dp))
-            .background(GlassRowFill)
-            .border(1.dp, GlassRowBorder, RoundedCornerShape(13.dp))
-            .padding(horizontal = 9.dp, vertical = 7.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp),
+            .background(if (isPrimaryLine) Color(0x22FFFFFF) else GlassRowFill, RoundedCornerShape(14.dp))
+            .border(
+                width = 1.dp,
+                color = if (isPrimaryLine) AccentGold.copy(alpha = 0.45f) else GlassRowBorder,
+                shape = RoundedCornerShape(14.dp),
+            )
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
         ) {
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(badgeColor)
-                    .padding(horizontal = 7.dp, vertical = 1.dp),
+                    .background(badgeColor, RoundedCornerShape(999.dp))
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
             ) {
                 Text(
                     text = lineCode,
                     style = MaterialTheme.typography.labelSmall,
-                    color = DarkInkOnAccent,
+                    color = if (isPrimaryLine) DarkInkOnAccent else TextPrimary,
                 )
             }
             Text(
-                text = title,
-                style = MaterialTheme.typography.labelLarge,
-                color = TextPrimary,
+                text = if (headsign.isNotBlank()) "→ $headsign" else "Linea $lineCode",
+                style = MaterialTheme.typography.labelMedium,
+                color = TextBody,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            if (dirText.isNotBlank()) {
-                Text(
-                    text = dirText,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSubtitle,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        if (arrivals.isEmpty()) {
             Text(
-                text = "Nessun passaggio ora",
+                text = if (hasAnyLive) "● Live" else "○ Orario",
                 style = MaterialTheme.typography.labelSmall,
-                color = TextSubtitle,
+                color = if (hasAnyLive) AccentEmerald else TextSubtitle,
+                maxLines = 1,
             )
-        } else {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                arrivals.forEachIndexed { idx, arr ->
-                    val mins = arr.minutesUntil(nowMillis).coerceAtLeast(0)
-                    val clock = clockFormat.format(Date(arr.arrivalEpochSeconds * 1000L))
-                    val prefix = if (arr.isRealtime) "● " else "○ "
-                    val text = when (idx) {
-                        0 -> "$prefix${if (mins <= 0) "Ora" else "$mins min"} · $clock"
-                        1 -> "$prefix${if (mins <= 0) "Ora" else "${mins}'"} · $clock"
-                        else -> "$prefix${if (mins <= 0) "Ora" else "${mins}'"}"
-                    }
-                    val highlight = arr.isRealtime && idx == 0
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (highlight) AccentEmerald.copy(alpha = 0.16f) else Color(0x18FFFFFF))
-                            .border(
-                                1.dp,
-                                if (highlight) AccentEmerald.copy(alpha = 0.45f) else GlassRowBorder,
-                                RoundedCornerShape(8.dp),
-                            )
-                            .padding(horizontal = 7.dp, vertical = 2.dp),
-                    ) {
-                        Text(
-                            text = text,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (highlight) AccentEmerald else if (arr.isRealtime) TextPrimary else TextSubtitle,
-                            maxLines = 1,
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            arrivals.forEachIndexed { idx, arr ->
+                val mins = arr.minutesUntil(nowMillis).coerceAtLeast(0)
+                val clock = clockFormat.format(Date(arr.arrivalEpochSeconds * 1000L))
+                val prefix = if (arr.isRealtime) "● " else "○ "
+                val text = when (idx) {
+                    0 -> "$prefix${if (mins <= 0) "Ora" else "$mins min"} · $clock"
+                    1 -> "$prefix${if (mins <= 0) "Ora" else "${mins}'"} · $clock"
+                    else -> "$prefix${if (mins <= 0) "Ora" else "${mins}'"}"
+                }
+                val highlight = arr.isRealtime && idx == 0
+                Box(
+                    modifier = Modifier
+                        .background(
+                            color = if (highlight) AccentEmerald.copy(alpha = 0.16f) else Color(0x18FFFFFF),
+                            shape = RoundedCornerShape(9.dp),
                         )
-                    }
+                        .border(
+                            1.dp,
+                            if (highlight) AccentEmerald.copy(alpha = 0.45f) else GlassRowBorder,
+                            RoundedCornerShape(9.dp),
+                        )
+                        .padding(horizontal = 7.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = text,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (highlight) AccentEmerald else if (arr.isRealtime) TextPrimary else TextSubtitle,
+                        maxLines = 1,
+                    )
                 }
             }
         }
@@ -917,9 +988,16 @@ private fun WidgetControlsColumn(
                         style = MaterialTheme.typography.titleLarge,
                         color = TextPrimary,
                     )
-                    val activeReliableCount = remember(uiState.lineVehicles, uiState.routePatterns, uiState.nowMillis) {
+                    val spatialById = remember(uiState.lineVehicles, uiState.routePatterns) {
+                        uiState.lineVehicles.associate { bus ->
+                            bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
+                        }
+                    }
+                    val activeReliableCount = remember(uiState.lineVehicles, spatialById, uiState.nowMillis) {
                         uiState.lineVehicles.count { bus ->
-                            GttFleetAnalyzer.assess(bus, uiState.routePatterns, uiState.nowMillis).isReliableLive
+                            val spatial = spatialById[bus.vehicleId]
+                                ?: GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
+                            GttFleetAnalyzer.assessWithSpatial(bus, spatial, uiState.nowMillis).isReliableLive
                         }
                     }
                     Text(
@@ -935,8 +1013,7 @@ private fun WidgetControlsColumn(
                 }
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(GlassPillFill)
+                        .background(GlassPillFill, RoundedCornerShape(999.dp))
                         .border(1.dp, GlassPillBorder, RoundedCornerShape(999.dp))
                         .padding(horizontal = 14.dp, vertical = 8.dp),
                 ) {
@@ -980,14 +1057,13 @@ private fun WidgetControlsColumn(
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 uiState.favoriteStops.forEach { fav ->
-                    val openInt = remember { MutableInteractionSource() }
+                    val openInt = remember(fav.stopId) { MutableInteractionSource() }
                     val shape = RoundedCornerShape(14.dp)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .glassInteractive(openInt, enableHoverScale = false) { onOpenFavoriteStop(fav) }
-                            .clip(shape)
-                            .background(GlassRowFill)
+                            .background(GlassRowFill, shape)
                             .border(1.dp, GlassRowBorder, shape)
                             .padding(start = 10.dp, top = 8.dp, end = 6.dp, bottom = 8.dp)
                             .testTag("studio_fav_stop_${fav.stopId}"),
@@ -1084,8 +1160,7 @@ private fun WidgetControlsColumn(
                     modifier = Modifier
                         .fillMaxWidth()
                         .glassInteractive(interaction) { onSelectCameraMode(mode) }
-                        .clip(shape)
-                        .background(if (isSelected) GlassRowActiveFill else GlassRowFill)
+                        .background(if (isSelected) GlassRowActiveFill else GlassRowFill, shape)
                         .border(1.dp, if (isSelected) GlassRowActiveBorder else GlassRowBorder, shape)
                         .padding(12.dp)
                         .testTag("camera_mode_${mode.id}"),
@@ -1259,17 +1334,10 @@ private fun GlassToggleRow(
             )
         }
         Spacer(modifier = Modifier.width(12.dp))
-        Switch(
+        LiquidGlassSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
             modifier = Modifier.testTag(testTag),
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = DarkInkOnAccent,
-                checkedTrackColor = AccentCyan,
-                uncheckedThumbColor = TextSubtitle,
-                uncheckedTrackColor = GlassRowFill,
-                uncheckedBorderColor = GlassRowBorder,
-            ),
         )
     }
 }
@@ -1322,17 +1390,10 @@ private fun DirectionColorsToggleRow(
             }
         }
         Spacer(modifier = Modifier.width(12.dp))
-        Switch(
+        LiquidGlassSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
             modifier = Modifier.testTag("toggle_color_direction"),
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = DarkInkOnAccent,
-                checkedTrackColor = AccentCyan,
-                uncheckedThumbColor = TextSubtitle,
-                uncheckedTrackColor = GlassRowFill,
-                uncheckedBorderColor = GlassRowBorder,
-            ),
         )
     }
 }

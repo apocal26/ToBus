@@ -25,9 +25,35 @@ class ToBusPreferences private constructor(context: Context) {
     private val _favoriteStops = MutableStateFlow(readFavoriteStops())
     val favoriteStops: StateFlow<List<FavoriteStop>> = _favoriteStops.asStateFlow()
 
+    private val _favoriteLines = MutableStateFlow(readFavoriteLines())
+    val favoriteLines: StateFlow<List<String>> = _favoriteLines.asStateFlow()
+
     fun currentSettings(): UserWidgetSettings = readSettings().also { _settings.value = it }
 
     fun currentFavoriteStops(): List<FavoriteStop> = readFavoriteStops().also { _favoriteStops.value = it }
+
+    fun currentFavoriteLines(): List<String> = readFavoriteLines().also { _favoriteLines.value = it }
+
+    fun toggleFavoriteLine(lineCode: String): Pair<List<String>, Boolean> {
+        val cleaned = lineCode.trim().uppercase()
+        if (cleaned.isEmpty()) return _favoriteLines.value to false
+        val current = readFavoriteLines().toMutableList()
+        val idx = current.indexOfFirst { it.equals(cleaned, ignoreCase = true) }
+        val added: Boolean
+        if (idx >= 0) {
+            current.removeAt(idx)
+            added = false
+        } else {
+            current.add(0, cleaned)
+            if (current.size > MAX_FAVORITE_LINES) {
+                current.subList(MAX_FAVORITE_LINES, current.size).clear()
+            }
+            added = true
+        }
+        saveFavoriteLines(current)
+        _favoriteLines.value = current
+        return current to added
+    }
 
     fun updateSettings(transform: (UserWidgetSettings) -> UserWidgetSettings): UserWidgetSettings {
         val updated = transform(readSettings())
@@ -67,6 +93,15 @@ class ToBusPreferences private constructor(context: Context) {
 
     fun getActiveStopWidgetIndex(): Int = prefs.getInt(KEY_STOP_WIDGET_IDX, 0).coerceAtLeast(0)
 
+    fun getStopWidgetIndex(appWidgetId: Int): Int {
+        val perWidgetKey = "${KEY_STOP_WIDGET_IDX}_$appWidgetId"
+        return if (prefs.contains(perWidgetKey)) {
+            prefs.getInt(perWidgetKey, 0).coerceAtLeast(0)
+        } else {
+            getActiveStopWidgetIndex()
+        }
+    }
+
     fun cycleStopWidgetIndex(delta: Int): Int {
         val count = readFavoriteStops().size
         if (count <= 1) {
@@ -77,6 +112,23 @@ class ToBusPreferences private constructor(context: Context) {
         val next = ((cur + delta) % count + count) % count
         prefs.edit().putInt(KEY_STOP_WIDGET_IDX, next).apply()
         return next
+    }
+
+    fun cycleStopWidgetIndex(appWidgetId: Int, delta: Int): Int {
+        val count = readFavoriteStops().size
+        val perWidgetKey = "${KEY_STOP_WIDGET_IDX}_$appWidgetId"
+        if (count <= 1) {
+            prefs.edit().putInt(perWidgetKey, 0).apply()
+            return 0
+        }
+        val cur = getStopWidgetIndex(appWidgetId) % count
+        val next = ((cur + delta) % count + count) % count
+        prefs.edit().putInt(perWidgetKey, next).apply()
+        return next
+    }
+
+    fun clearStopWidgetIndex(appWidgetId: Int) {
+        prefs.edit().remove("${KEY_STOP_WIDGET_IDX}_$appWidgetId").apply()
     }
 
     private fun readSettings(): UserWidgetSettings {
@@ -119,6 +171,27 @@ class ToBusPreferences private constructor(context: Context) {
             .putBoolean(KEY_HIDE_INACTIVE_WIDGET, s.hideInactiveInWidget)
             .putInt(KEY_REFRESH_MIN, s.refreshInterval.minutes)
             .apply()
+    }
+
+    private fun readFavoriteLines(): List<String> {
+        val raw = prefs.getString(KEY_FAVORITE_LINES, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            val list = ArrayList<String>(arr.length())
+            for (i in 0 until arr.length()) {
+                val code = arr.optString(i).trim().uppercase()
+                if (code.isNotEmpty() && list.none { it.equals(code, ignoreCase = true) }) {
+                    list.add(code)
+                }
+            }
+            list
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveFavoriteLines(lines: List<String>) {
+        val arr = JSONArray()
+        lines.forEach { arr.put(it) }
+        prefs.edit().putString(KEY_FAVORITE_LINES, arr.toString()).apply()
     }
 
     private fun readFavoriteStops(): List<FavoriteStop> {
@@ -179,8 +252,10 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_HIDE_INACTIVE_WIDGET = "hide_inactive_widget"
         private const val KEY_REFRESH_MIN = "refresh_minutes"
         private const val KEY_FAVORITE_STOPS = "favorite_stops_v1"
+        private const val KEY_FAVORITE_LINES = "favorite_lines_v1"
         private const val KEY_STOP_WIDGET_IDX = "stop_widget_fav_idx"
         private const val MAX_FAVORITES = 6
+        private const val MAX_FAVORITE_LINES = 12
 
         @Volatile
         private var instance: ToBusPreferences? = null

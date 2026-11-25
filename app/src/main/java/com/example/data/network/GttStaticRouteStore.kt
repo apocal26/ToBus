@@ -31,21 +31,31 @@ import java.util.zip.ZipFile
  */
 class GttStaticRouteStore(context: Context) {
 
-    private val gtfsDir = File(context.applicationContext.filesDir, "gtt_gtfs").apply { mkdirs() }
-    private val gtfsZipFile = File(gtfsDir, "gtt_gtfs.zip")
+    private val appContext = context.applicationContext
+    private val gtfsDir: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(appContext.filesDir, "gtt_gtfs").apply { mkdirs() }
+    }
+    private val gtfsZipFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(gtfsDir, "gtt_gtfs.zip")
+    }
+    private val stopIndexCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(gtfsDir, "stop_search_index_v1.tsv")
+    }
     private val downloadMutex = Mutex()
     private val stopIndexMutex = Mutex()
     @Volatile
     private var cachedStopSearchIndex: List<StopSearchEntry>? = null
     @Volatile
-    private var cachedStopIndexZipStamp: Long = 0L
+    private var cachedStopIndexZipStamp: String = ""
 
-    private val downloadClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .build()
+    private val downloadClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
 
     fun hasCachedGtfsZip(): Boolean {
         return gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES
@@ -111,8 +121,8 @@ class GttStaticRouteStore(context: Context) {
     }
 
     /**
-     * Builds (and caches in RAM) an indexed directory of all Turin GTFS stops enriched with
-     * the exact lines and primary headsigns serving each individual physical pole (`palina`).
+     * Builds (and caches in RAM + compact disk file) an indexed directory of all Turin GTFS stops
+     * enriched with the exact lines and primary headsigns serving each individual physical pole (`palina`).
      */
     suspend fun getStopSearchIndex(
         nowMillis: Long = System.currentTimeMillis(),
@@ -122,13 +132,19 @@ class GttStaticRouteStore(context: Context) {
         } else {
             ensureGtfsZipReady() ?: return@withContext emptyList()
         }
-        val stamp = zipFile.lastModified()
+        val stamp = "${zipFile.lastModified()}_${zipFile.length()}"
         cachedStopSearchIndex?.let { cached ->
             if (cached.isNotEmpty() && cachedStopIndexZipStamp == stamp) return@withContext cached
         }
         stopIndexMutex.withLock {
             cachedStopSearchIndex?.let { cached ->
                 if (cached.isNotEmpty() && cachedStopIndexZipStamp == stamp) return@withContext cached
+            }
+            val fromDisk = readStopSearchIndexCache(stamp)
+            if (!fromDisk.isNullOrEmpty()) {
+                cachedStopSearchIndex = fromDisk
+                cachedStopIndexZipStamp = stamp
+                return@withLock fromDisk
             }
             val built = try {
                 extractStopSearchIndexFromZip(zipFile, nowMillis)
@@ -139,10 +155,92 @@ class GttStaticRouteStore(context: Context) {
             if (built.isNotEmpty()) {
                 cachedStopSearchIndex = built
                 cachedStopIndexZipStamp = stamp
+                writeStopSearchIndexCache(stamp, built)
             }
             built
         }
     }
+
+    private fun readStopSearchIndexCache(expectedStamp: String): List<StopSearchEntry>? {
+        val file = stopIndexCacheFile
+        if (!file.exists() || file.length() < 64L) return null
+        return try {
+            file.bufferedReader(StandardCharsets.UTF_8).use { reader ->
+                val header = reader.readLine() ?: return null
+                if (header != "#V1|$expectedStamp") return null
+                val out = ArrayList<StopSearchEntry>(4096)
+                var line = reader.readLine()
+                while (line != null) {
+                    if (line.isNotEmpty()) {
+                        val parts = line.split('\t')
+                        if (parts.size >= 7) {
+                            val lat = parts[3].toDoubleOrNull()
+                            val lon = parts[4].toDoubleOrNull()
+                            if (lat != null && lon != null) {
+                                val lines = if (parts[5].isEmpty()) emptyList() else parts[5].split('|')
+                                val headsigns = if (parts[6].isEmpty()) emptyList() else parts[6].split('|')
+                                out.add(
+                                    StopSearchEntry(
+                                        stopId = parts[0],
+                                        stopCode = parts[1],
+                                        name = parts[2],
+                                        lat = lat,
+                                        lon = lon,
+                                        lines = lines,
+                                        headsigns = headsigns,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                    line = reader.readLine()
+                }
+                out.takeIf { it.isNotEmpty() }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Cache disco indice fermate non leggibile: ${e.message}")
+            null
+        }
+    }
+
+    private fun writeStopSearchIndexCache(stamp: String, entries: List<StopSearchEntry>) {
+        try {
+            val tmp = File(gtfsDir, "stop_search_index_v1.tsv.tmp")
+            tmp.bufferedWriter(StandardCharsets.UTF_8).use { writer ->
+                writer.write("#V1|")
+                writer.write(stamp)
+                writer.newLine()
+                for (e in entries) {
+                    writer.write(sanitizeTsvField(e.stopId))
+                    writer.write('\t'.code)
+                    writer.write(sanitizeTsvField(e.stopCode))
+                    writer.write('\t'.code)
+                    writer.write(sanitizeTsvField(e.name))
+                    writer.write('\t'.code)
+                    writer.write(e.lat.toString())
+                    writer.write('\t'.code)
+                    writer.write(e.lon.toString())
+                    writer.write('\t'.code)
+                    writer.write(e.lines.joinToString("|") { sanitizePipeField(it) })
+                    writer.write('\t'.code)
+                    writer.write(e.headsigns.joinToString("|") { sanitizePipeField(it) })
+                    writer.newLine()
+                }
+            }
+            if (stopIndexCacheFile.exists()) {
+                stopIndexCacheFile.delete()
+            }
+            tmp.renameTo(stopIndexCacheFile)
+        } catch (e: Exception) {
+            Log.d(TAG, "Scrittura cache disco indice fermate fallita: ${e.message}")
+        }
+    }
+
+    private fun sanitizeTsvField(value: String): String =
+        value.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+
+    private fun sanitizePipeField(value: String): String =
+        sanitizeTsvField(value).replace('|', '/')
 
     private suspend fun ensureGtfsZipReady(): File? = downloadMutex.withLock {
         if (gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES) {
@@ -1150,7 +1248,7 @@ class GttStaticRouteStore(context: Context) {
             val repTripsByStop = HashMap<String, LinkedHashSet<String>>(4096)
             val lastStopByTrip = HashMap<String, Pair<Int, String>>(repByTripId.size * 2)
             zip.getInputStream(stopTimesEntry).use { stream ->
-                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 64 * 1024).use { reader ->
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 128 * 1024).use { reader ->
                     val cols = parseCsvHeader(reader.readLine() ?: return@use)
                     val idxTrip = cols["trip_id"] ?: return@use
                     val idxStop = cols["stop_id"] ?: return@use
@@ -1158,23 +1256,47 @@ class GttStaticRouteStore(context: Context) {
                     val idxPickup = cols["pickup_type"]
                     var line = reader.readLine()
                     while (line != null) {
-                        if (line.isNotBlank()) {
+                        if (line.isNotEmpty()) {
+                            // Fast-path: reject >99% of stop_times rows without allocating a CSV List
+                            val tid: String
+                            val meta: RepTrip?
+                            if (idxTrip == 0) {
+                                val c0 = line.indexOf(',')
+                                if (c0 <= 0) {
+                                    line = reader.readLine()
+                                    continue
+                                }
+                                tid = if (line[0] == '"' && c0 >= 2 && line[c0 - 1] == '"') {
+                                    line.substring(1, c0 - 1).trim()
+                                } else {
+                                    line.substring(0, c0).trim()
+                                }
+                                meta = repByTripId[tid]
+                                if (meta == null) {
+                                    line = reader.readLine()
+                                    continue
+                                }
+                            } else {
+                                val quickFields = parseCsvLine(line)
+                                tid = quickFields.getOrNull(idxTrip)?.trim().orEmpty()
+                                meta = repByTripId[tid]
+                                if (meta == null) {
+                                    line = reader.readLine()
+                                    continue
+                                }
+                            }
                             val f = parseCsvLine(line)
-                            val tid = f.getOrNull(idxTrip)?.trim().orEmpty()
-                            val meta = repByTripId[tid]
-                            if (meta != null) {
-                                val sid = f.getOrNull(idxStop)?.trim().orEmpty()
-                                if (sid.isNotEmpty()) {
-                                    val seq = idxSeq?.let { f.getOrNull(it)?.trim()?.toIntOrNull() } ?: 0
-                                    val prevLast = lastStopByTrip[tid]
-                                    if (prevLast == null || seq >= prevLast.first) {
-                                        lastStopByTrip[tid] = seq to sid
-                                    }
-                                    val pickup = idxPickup?.let { f.getOrNull(it)?.trim() }
-                                    if (pickup != "1") {
-                                        linesByStop.getOrPut(sid) { LinkedHashSet(4) }.add(meta.lineCode)
-                                        repTripsByStop.getOrPut(sid) { LinkedHashSet(4) }.add(tid)
-                                    }
+                            val sid = f.getOrNull(idxStop)?.trim().orEmpty()
+                            if (sid.isNotEmpty()) {
+                                val seq = idxSeq?.let { f.getOrNull(it)?.trim()?.toIntOrNull() } ?: 0
+                                val prevLast = lastStopByTrip[tid]
+                                if (prevLast == null || seq >= prevLast.first) {
+                                    lastStopByTrip[tid] = seq to sid
+                                }
+                                val pickup = idxPickup?.let { f.getOrNull(it)?.trim() }
+                                if (pickup != "1") {
+                                    linesByStop.getOrPut(sid) { LinkedHashSet(4) }.add(meta.lineCode)
+                                    repTripsByStop.getOrPut(sid) { LinkedHashSet(4) }.add(tid)
                                 }
                             }
                         }
