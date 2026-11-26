@@ -757,7 +757,17 @@ class GttRealtimeRepository private constructor(context: Context) {
                     matoMaxTs,
                 )
 
-                val summaries = GtfsRtProtobufParser.buildLineSummaries(enriched)
+                val rawSummaries = GtfsRtProtobufParser.buildLineSummaries(enriched)
+                if (rawSummaries.size > 1 || (effectiveMode != DataSourceMode.MATO_LIVE && rawSummaries.isNotEmpty())) {
+                    saveActiveLinesCache(rawSummaries)
+                }
+                val summaries = if (rawSummaries.size <= 5) {
+                    val catalogFallback = staticRouteStore.getCachedLineCatalogFast()
+                        .ifEmpty { getCachedActiveLinesFast(maxAgeMillis = Long.MAX_VALUE) }
+                    mergeLineSummariesWithCatalog(rawSummaries, catalogFallback)
+                } else {
+                    rawSummaries
+                }
                 val finalSnapshot = LiveFeedSnapshot(
                     feedTimestampSeconds = feedTs,
                     fetchedAtMillis = nowMillis,
@@ -767,9 +777,6 @@ class GttRealtimeRepository private constructor(context: Context) {
                     alerts = if (includeAlerts) cachedAlerts else emptyList(),
                 )
                 lastSnapshot = finalSnapshot
-                if (summaries.size > 1 || (effectiveMode != DataSourceMode.MATO_LIVE && summaries.isNotEmpty())) {
-                    saveActiveLinesCache(summaries)
-                }
                 if (!normFocus.isNullOrBlank()) {
                     val lineBuses = enriched.filter {
                         it.lineCode.equals(normFocus, ignoreCase = true) ||
@@ -1145,14 +1152,27 @@ class GttRealtimeRepository private constructor(context: Context) {
     fun getLastCachedSnapshot(): LiveFeedSnapshot? = lastSnapshot
 
     /**
-     * Ultra-fast startup hydration of active GTT lines from a tiny TSV cache (~1.5 KB)
-     * so opening the Line Picker right after cold launch is instant even before the first HTTP poll finishes.
+     * Ultra-fast startup hydration of active GTT lines from a tiny TSV cache (~1.5 KB) or
+     * static GTFS `routes.txt` catalog so opening the Line Picker is instant even when live feeds
+     * are unreachable or the previous cache expired.
      */
     fun getCachedActiveLinesFast(maxAgeMillis: Long = ACTIVE_LINES_CACHE_TTL_MS): List<LineSummary> {
+        val file = activeLinesCacheFile
+        val isFresh = file.exists() && (System.currentTimeMillis() - file.lastModified() <= maxAgeMillis)
+        if (isFresh) {
+            val freshLines = readActiveLinesTsv(file, zeroCountsOnly = false)
+            if (freshLines.isNotEmpty()) return freshLines
+        }
+        val staticFast = staticRouteStore.getCachedLineCatalogFast()
+        if (staticFast.isNotEmpty()) return staticFast
+        if (file.exists()) {
+            return readActiveLinesTsv(file, zeroCountsOnly = true)
+        }
+        return emptyList()
+    }
+
+    private fun readActiveLinesTsv(file: File, zeroCountsOnly: Boolean): List<LineSummary> {
         return runCatching {
-            val file = activeLinesCacheFile
-            if (!file.exists()) return emptyList()
-            if (System.currentTimeMillis() - file.lastModified() > maxAgeMillis) return emptyList()
             val out = ArrayList<LineSummary>(120)
             file.bufferedReader().use { reader ->
                 while (true) {
@@ -1166,7 +1186,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                             LineSummary(
                                 lineCode = code,
                                 rawRouteIds = setOf(code),
-                                activeVehicleCount = count,
+                                activeVehicleCount = if (zeroCountsOnly) 0 else count,
                             ),
                         )
                     }
@@ -1184,6 +1204,171 @@ class GttRealtimeRepository private constructor(context: Context) {
             }
             activeLinesCacheFile.writeText(sb.toString())
         }
+    }
+
+    /**
+     * Fetches the full GTT line catalog with strict bounded timeouts across multiple independent sources:
+     * 1. Citywide GTFS-RT feeds (GTT Official + BusOne Proxy) for live vehicle counts
+     * 2. Official static GTFS `routes.txt` (cached locally or downloaded up to 7.5s)
+     * 3. MaTO GraphQL `{ routes { gtfsId shortName } }` endpoint fallback (~3.8s)
+     * Never blocks endlessly; falls back to cached line codes before returning failure.
+     */
+    suspend fun fetchCitywideLineCatalog(): Result<List<LineSummary>> = withContext(Dispatchers.IO) {
+        val nowMillis = System.currentTimeMillis()
+        coroutineScope {
+            val liveJob = async {
+                withTimeoutOrNull(5_500L) {
+                    val gttDeferred = async {
+                        withTimeoutOrNull(5_000L) {
+                            fetchVehicleSource("gtt_official", "GTT Ufficiale", GTT_VP_URLS, nowMillis)
+                        }
+                    }
+                    val busOneDeferred = async {
+                        withTimeoutOrNull(5_000L) {
+                            fetchVehicleSource("busone_proxy", "BusOne Proxy", BUSONE_VP_URLS, nowMillis)
+                        }
+                    }
+                    val gttVehicles = gttDeferred.await()?.snapshot?.allVehicles.orEmpty()
+                    val busOneVehicles = busOneDeferred.await()?.snapshot?.allVehicles.orEmpty()
+                    val merged = mergeMultiSourceVehicles(
+                        matoVehicles = emptyList(),
+                        gttVehicles = gttVehicles,
+                        busOneVehicles = busOneVehicles,
+                        nowMillis = nowMillis,
+                    )
+                    GtfsRtProtobufParser.buildLineSummaries(merged)
+                }.orEmpty()
+            }
+
+            val fastStatic = staticRouteStore.getAllKnownLineSummaries(downloadIfNeeded = false)
+            val matoCatalogJob = if (fastStatic.isEmpty()) {
+                async {
+                    withTimeoutOrNull(3_800L) {
+                        fetchMatoGraphQlLineCatalog()
+                    }.orEmpty()
+                }
+            } else {
+                null
+            }
+
+            val liveSummaries = liveJob.await()
+            if (liveSummaries.size > 5) {
+                saveActiveLinesCache(liveSummaries)
+                return@coroutineScope Result.success(liveSummaries)
+            }
+
+            var catalog = fastStatic
+            if (catalog.isEmpty()) {
+                val matoCatalog = matoCatalogJob?.await().orEmpty()
+                if (matoCatalog.isNotEmpty()) {
+                    catalog = matoCatalog
+                }
+            }
+            if (catalog.isEmpty()) {
+                val downloadedStatic = withTimeoutOrNull(7_500L) {
+                    staticRouteStore.getAllKnownLineSummaries(downloadIfNeeded = true)
+                }.orEmpty()
+                if (downloadedStatic.isNotEmpty()) {
+                    catalog = downloadedStatic
+                }
+            }
+
+            if (liveSummaries.size > 1) {
+                saveActiveLinesCache(liveSummaries)
+            }
+
+            val combined = mergeLineSummariesWithCatalog(liveSummaries, catalog)
+            if (combined.isNotEmpty()) {
+                return@coroutineScope Result.success(combined)
+            }
+
+            val cachedFallback = getCachedActiveLinesFast(maxAgeMillis = Long.MAX_VALUE)
+            if (cachedFallback.isNotEmpty()) {
+                return@coroutineScope Result.success(mergeLineSummariesWithCatalog(liveSummaries, cachedFallback))
+            }
+
+            Result.failure(IOException("Feed linee GTT non raggiungibili al momento"))
+        }
+    }
+
+    private fun fetchMatoGraphQlLineCatalog(): List<LineSummary> {
+        val queries = listOf(
+            """
+            {
+              routes(feeds: ["gtt"]) {
+                gtfsId
+                shortName
+              }
+            }
+            """.trimIndent(),
+            """
+            {
+              routes {
+                gtfsId
+                shortName
+              }
+            }
+            """.trimIndent(),
+        )
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        for (endpoint in MATO_GRAPHQL_ENDPOINTS) {
+            for (query in queries) {
+                try {
+                    val payload = JSONObject().put("query", query).toString()
+                    val request = Request.Builder()
+                        .url(endpoint)
+                        .post(payload.toRequestBody(mediaType))
+                        .header("User-Agent", USER_AGENT)
+                        .header("Accept", "application/json")
+                        .header("Origin", "https://mato.muoversiatorino.it")
+                        .build()
+
+                    matoFastHttpClient.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) continue
+                        val body = response.body?.string() ?: continue
+                        val root = JSONObject(body)
+                        val routes = root.optJSONObject("data")?.optJSONArray("routes") ?: continue
+                        if (routes.length() == 0) continue
+
+                        val rawIdsByLine = HashMap<String, LinkedHashSet<String>>(160)
+                        for (i in 0 until routes.length()) {
+                            val obj = routes.optJSONObject(i) ?: continue
+                            val gtfsId = obj.optString("gtfsId", "").trim()
+                            if (gtfsId.contains(':') &&
+                                !gtfsId.startsWith("gtt:", ignoreCase = true) &&
+                                !gtfsId.startsWith("1:", ignoreCase = true)
+                            ) {
+                                continue
+                            }
+                            val rawId = gtfsId.substringAfter(":").trim()
+                            val shortName = obj.optString("shortName", "").trim()
+                            val candidate = shortName.ifBlank { rawId }
+                            if (candidate.isEmpty()) continue
+                            val normalized = GtfsRtProtobufParser.normalizeGttLineCode(candidate)
+                            if (normalized.isNotBlank() && normalized != "?") {
+                                val set = rawIdsByLine.getOrPut(normalized) { LinkedHashSet(2) }
+                                if (rawId.isNotEmpty()) set.add(rawId)
+                                if (shortName.isNotEmpty()) set.add(shortName)
+                            }
+                        }
+                        if (rawIdsByLine.isNotEmpty()) {
+                            return rawIdsByLine.entries
+                                .map { (lineCode, rawIds) ->
+                                    LineSummary(
+                                        lineCode = lineCode,
+                                        rawRouteIds = rawIds.ifEmpty { setOf(lineCode) },
+                                        activeVehicleCount = 0,
+                                    )
+                                }
+                                .sortedWith(GtfsRtProtobufParser.lineCodeComparator)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "MATO GraphQL catalogo linee skip su $endpoint: ${e.message}")
+                }
+            }
+        }
+        return emptyList()
     }
 
     suspend fun resolveStopNames(stopIds: Set<String>): Map<String, String> = withContext(Dispatchers.IO) {
@@ -2672,13 +2857,45 @@ class GttRealtimeRepository private constructor(context: Context) {
             val merged = ArrayList<LineSummary>(baseSummaries.size + 1)
             merged.addAll(baseSummaries)
             merged.add(added)
-            merged.sortWith(
-                compareBy<LineSummary>(
-                    { it.lineCode.filter { ch -> ch.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE },
-                    { it.lineCode },
-                ),
-            )
+            merged.sortWith(GtfsRtProtobufParser.lineCodeComparator)
             return merged
+        }
+
+        internal fun mergeLineSummariesWithCatalog(
+            liveSummaries: List<LineSummary>,
+            catalogSummaries: List<LineSummary>,
+        ): List<LineSummary> {
+            if (catalogSummaries.isEmpty()) return liveSummaries.sortedWith(GtfsRtProtobufParser.lineCodeComparator)
+            if (liveSummaries.isEmpty()) return catalogSummaries.sortedWith(GtfsRtProtobufParser.lineCodeComparator)
+
+            val byCode = LinkedHashMap<String, LineSummary>(catalogSummaries.size + liveSummaries.size)
+            for (entry in catalogSummaries) {
+                val key = entry.lineCode.trim().uppercase()
+                if (key.isEmpty()) continue
+                val existing = byCode[key]
+                byCode[key] = if (existing == null) {
+                    entry.copy(lineCode = key)
+                } else {
+                    existing.copy(
+                        rawRouteIds = existing.rawRouteIds + entry.rawRouteIds,
+                        activeVehicleCount = maxOf(existing.activeVehicleCount, entry.activeVehicleCount),
+                    )
+                }
+            }
+            for (entry in liveSummaries) {
+                val key = entry.lineCode.trim().uppercase()
+                if (key.isEmpty()) continue
+                val existing = byCode[key]
+                byCode[key] = if (existing == null) {
+                    entry.copy(lineCode = key)
+                } else {
+                    existing.copy(
+                        rawRouteIds = existing.rawRouteIds + entry.rawRouteIds,
+                        activeVehicleCount = maxOf(existing.activeVehicleCount, entry.activeVehicleCount),
+                    )
+                }
+            }
+            return byCode.values.sortedWith(GtfsRtProtobufParser.lineCodeComparator)
         }
 
         /**

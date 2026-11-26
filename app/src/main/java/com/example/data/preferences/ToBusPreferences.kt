@@ -173,7 +173,7 @@ class ToBusPreferences private constructor(context: Context) {
                     prefs.getLong(KEY_FIXED_ZOOM, java.lang.Double.doubleToRawLongBits(13.2)),
                 ).coerceIn(CameraState.MIN_ZOOM, CameraState.MAX_ZOOM),
             ),
-            showVehicleLabels = prefs.getBoolean(KEY_SHOW_LABELS, true),
+            showVehicleLabels = prefs.getBoolean(KEY_SHOW_LABELS, false),
             showRouteLine = prefs.getBoolean(KEY_SHOW_ROUTE, true),
             colorByDirection = prefs.getBoolean(KEY_COLOR_BY_DIR, true),
             hideInactiveInWidget = prefs.getBoolean(KEY_HIDE_INACTIVE_WIDGET, true),

@@ -49,6 +49,7 @@ internal object MapLibreTransitIds {
     const val STOPS_DOT_LAYER = "tobus-stops-dot"
     const val STOPS_FAV_STAR_LAYER = "tobus-stops-fav-star"
     const val STOPS_SELECTED_LABEL_LAYER = "tobus-stops-selected-label"
+    const val STOPS_MIN_ML_ZOOM = 10.8f
 
     const val USER_SOURCE = "tobus-user-source"
     const val USER_PULSE_LAYER = "tobus-user-pulse"
@@ -1445,7 +1446,9 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                         Expression.literal(0f),
                     ),
                 ),
-            ),
+            ).apply {
+                minZoom = MapLibreTransitIds.STOPS_MIN_ML_ZOOM
+            },
         )
     }
 
@@ -1496,13 +1499,16 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                         Expression.interpolate(
                             Expression.linear(),
                             Expression.zoom(),
-                            Expression.stop(11.0, 2.5f),
+                            Expression.stop(10.8, 2.3f),
+                            Expression.stop(11.4, 2.9f),
                             Expression.stop(14.5, 4.1f),
                             Expression.stop(17.5, 5.2f),
                         ),
                     ),
                 ),
-            ),
+            ).apply {
+                minZoom = MapLibreTransitIds.STOPS_MIN_ML_ZOOM
+            },
         )
     }
 
@@ -1530,7 +1536,9 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                             Expression.literal(1.0f),
                         ),
                     ),
-                ),
+                ).apply {
+                    minZoom = MapLibreTransitIds.STOPS_MIN_ML_ZOOM
+                },
         )
     }
 
@@ -1555,7 +1563,9 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                     PropertyFactory.textHaloWidth(2.0f),
                     PropertyFactory.textAllowOverlap(true),
                     PropertyFactory.textIgnorePlacement(true),
-                ),
+                ).apply {
+                    minZoom = MapLibreTransitIds.STOPS_MIN_ML_ZOOM
+                },
         )
     }
 

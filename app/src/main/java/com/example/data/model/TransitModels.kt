@@ -759,7 +759,7 @@ data class UserWidgetSettings(
     val mapStyle: MapStyle = MapStyle.DARK,
     val cameraMode: WidgetCameraMode = WidgetCameraMode.AUTO_FIT_BUSES,
     val fixedCamera: CameraState = CameraState(),
-    val showVehicleLabels: Boolean = true,
+    val showVehicleLabels: Boolean = false,
     val showRouteLine: Boolean = true,
     val colorByDirection: Boolean = true,
     val hideInactiveInWidget: Boolean = true,

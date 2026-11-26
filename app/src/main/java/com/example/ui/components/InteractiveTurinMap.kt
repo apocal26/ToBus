@@ -469,8 +469,8 @@ fun InteractiveTurinMap(
                     return@addOnMapClickListener true
                 }
 
-                // 2. Otherwise check route stops (36dp touch target)
-                if (latestShowRouteLine) {
+                // 2. Otherwise check route stops (36dp touch target) only while stop markers are visible
+                if (latestShowRouteLine && map.cameraPosition.zoom >= MapLibreTransitIds.STOPS_MIN_ML_ZOOM.toDouble()) {
                     var closestStop: TransitStop? = null
                     var closestStopDist = Float.MAX_VALUE
                     for (stop in latestVisibleStops) {

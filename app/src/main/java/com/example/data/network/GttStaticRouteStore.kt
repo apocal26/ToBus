@@ -3,6 +3,7 @@ package com.example.data.network
 import android.content.Context
 import android.util.Log
 import com.example.data.model.GeoPoint
+import com.example.data.model.LineSummary
 import com.example.data.model.RoutePattern
 import com.example.data.model.StopArrival
 import com.example.data.model.StopSearchEntry
@@ -44,12 +45,20 @@ class GttStaticRouteStore(context: Context) {
     private val stopIndexCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         File(gtfsDir, "stop_search_index_v1.tsv")
     }
+    private val lineCatalogCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(gtfsDir, "static_lines_v1.tsv")
+    }
     private val downloadMutex = Mutex()
     private val stopIndexMutex = Mutex()
+    private val lineCatalogMutex = Mutex()
     @Volatile
     private var cachedStopSearchIndex: List<StopSearchEntry>? = null
     @Volatile
     private var cachedStopIndexZipStamp: String = ""
+    @Volatile
+    private var cachedLineCatalog: List<LineSummary>? = null
+    @Volatile
+    private var cachedLineCatalogZipStamp: String = ""
 
     private val downloadClient: OkHttpClient by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         OkHttpClient.Builder()
@@ -161,6 +170,131 @@ class GttStaticRouteStore(context: Context) {
                 writeStopSearchIndexCache(stamp, built)
             }
             built
+        }
+    }
+
+    /**
+     * Ultra-fast non-blocking read of cached static GTT routes (`static_lines_v1.tsv`)
+     * for instant Line Picker hydration when live vehicle feeds are empty or offline.
+     */
+    fun getCachedLineCatalogFast(): List<LineSummary> {
+        val currentZipStamp = if (hasCachedGtfsZip()) {
+            "${gtfsZipFile.lastModified()}_${gtfsZipFile.length()}"
+        } else {
+            null
+        }
+        cachedLineCatalog?.let { cached ->
+            if (cached.isNotEmpty() && (currentZipStamp == null || cachedLineCatalogZipStamp == currentZipStamp)) {
+                return cached
+            }
+        }
+        val fromDisk = readLineCatalogCache(expectedStamp = currentZipStamp)
+        if (!fromDisk.isNullOrEmpty()) {
+            cachedLineCatalog = fromDisk
+            if (currentZipStamp != null) cachedLineCatalogZipStamp = currentZipStamp
+            return fromDisk
+        }
+        return emptyList()
+    }
+
+    suspend fun getAllKnownLineSummaries(
+        downloadIfNeeded: Boolean = false,
+    ): List<LineSummary> = withContext(Dispatchers.IO) {
+        val zipFile = if (hasCachedGtfsZip()) {
+            gtfsZipFile
+        } else if (downloadIfNeeded) {
+            ensureGtfsZipReady() ?: return@withContext getCachedLineCatalogFast()
+        } else {
+            return@withContext getCachedLineCatalogFast()
+        }
+        val stamp = "${zipFile.lastModified()}_${zipFile.length()}"
+        cachedLineCatalog?.let { cached ->
+            if (cached.isNotEmpty() && cachedLineCatalogZipStamp == stamp) return@withContext cached
+        }
+        lineCatalogMutex.withLock {
+            cachedLineCatalog?.let { cached ->
+                if (cached.isNotEmpty() && cachedLineCatalogZipStamp == stamp) return@withLock cached
+            }
+            val fromDisk = readLineCatalogCache(expectedStamp = stamp)
+            if (!fromDisk.isNullOrEmpty()) {
+                cachedLineCatalog = fromDisk
+                cachedLineCatalogZipStamp = stamp
+                return@withLock fromDisk
+            }
+            val built = try {
+                extractAllLineSummariesFromZip(zipFile)
+            } catch (e: Exception) {
+                Log.w(TAG, "Estrazione lista linee statica fallita: ${e.message}")
+                emptyList()
+            }
+            if (built.isNotEmpty()) {
+                cachedLineCatalog = built
+                cachedLineCatalogZipStamp = stamp
+                writeLineCatalogCache(stamp, built)
+            }
+            built
+        }
+    }
+
+    private fun readLineCatalogCache(expectedStamp: String?): List<LineSummary>? {
+        val file = lineCatalogCacheFile
+        if (!file.exists() || file.length() < 8L) return null
+        return try {
+            BufferedReader(InputStreamReader(file.inputStream(), StandardCharsets.UTF_8), 16 * 1024).use { reader ->
+                val header = reader.readLine() ?: return null
+                if (!header.startsWith("#V1|")) return null
+                if (expectedStamp != null && header != "#V1|$expectedStamp") return null
+                val out = ArrayList<LineSummary>(140)
+                var line = reader.readLine()
+                while (line != null) {
+                    if (line.isNotEmpty()) {
+                        val tab = line.indexOf('\t')
+                        val code = (if (tab >= 0) line.substring(0, tab) else line).trim()
+                        val rawIds = if (tab >= 0) {
+                            splitPipeFast(line.substring(tab + 1)).filter { it.isNotEmpty() }.toSet()
+                        } else {
+                            setOf(code)
+                        }
+                        if (code.isNotEmpty()) {
+                            out.add(
+                                LineSummary(
+                                    lineCode = code,
+                                    rawRouteIds = rawIds.ifEmpty { setOf(code) },
+                                    activeVehicleCount = 0,
+                                ),
+                            )
+                        }
+                    }
+                    line = reader.readLine()
+                }
+                out.takeIf { it.isNotEmpty() }
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Cache disco catalogo linee non leggibile: ${e.message}")
+            null
+        }
+    }
+
+    private fun writeLineCatalogCache(stamp: String, entries: List<LineSummary>) {
+        try {
+            val tmp = File(gtfsDir, "static_lines_v1.tsv.tmp")
+            tmp.bufferedWriter(StandardCharsets.UTF_8).use { writer ->
+                writer.write("#V1|")
+                writer.write(stamp)
+                writer.newLine()
+                for (item in entries) {
+                    writer.write(sanitizeTsvField(item.lineCode))
+                    writer.write('\t'.code)
+                    writer.write(item.rawRouteIds.joinToString("|") { sanitizePipeField(it) })
+                    writer.newLine()
+                }
+            }
+            if (lineCatalogCacheFile.exists()) {
+                lineCatalogCacheFile.delete()
+            }
+            tmp.renameTo(lineCatalogCacheFile)
+        } catch (e: Exception) {
+            Log.d(TAG, "Scrittura cache disco catalogo linee fallita: ${e.message}")
         }
     }
 
@@ -1578,6 +1712,50 @@ class GttStaticRouteStore(context: Context) {
             out.add(scored[i].entry)
         }
         return out
+    }
+
+    internal fun extractAllLineSummariesFromZip(zipFile: File): List<LineSummary> {
+        return ZipFile(zipFile).use { zip ->
+            val routesEntry = zip.getEntry("routes.txt") ?: return emptyList()
+            val rawIdsByLine = HashMap<String, LinkedHashSet<String>>(160)
+            zip.getInputStream(routesEntry).use { stream ->
+                BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 16 * 1024).use { reader ->
+                    val header = reader.readLine() ?: return emptyList()
+                    val cols = parseCsvHeader(header)
+                    val idxId = cols["route_id"] ?: -1
+                    val idxShort = cols["route_short_name"] ?: -1
+                    if (idxId < 0 && idxShort < 0) return emptyList()
+
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) {
+                            val f = parseCsvLine(line)
+                            val rawId = if (idxId >= 0) f.getOrNull(idxId)?.trim().orEmpty() else ""
+                            val rawShort = if (idxShort >= 0) f.getOrNull(idxShort)?.trim().orEmpty() else ""
+                            val candidate = rawShort.ifBlank { rawId }
+                            if (candidate.isNotEmpty()) {
+                                val normalized = GtfsRtProtobufParser.normalizeGttLineCode(candidate)
+                                if (normalized.isNotBlank() && normalized != "?") {
+                                    val set = rawIdsByLine.getOrPut(normalized) { LinkedHashSet(2) }
+                                    if (rawId.isNotEmpty()) set.add(rawId)
+                                    if (rawShort.isNotEmpty()) set.add(rawShort)
+                                }
+                            }
+                        }
+                        line = reader.readLine()
+                    }
+                }
+            }
+            rawIdsByLine.entries
+                .map { (lineCode, rawIds) ->
+                    LineSummary(
+                        lineCode = lineCode,
+                        rawRouteIds = rawIds.ifEmpty { setOf(lineCode) },
+                        activeVehicleCount = 0,
+                    )
+                }
+                .sortedWith(GtfsRtProtobufParser.lineCodeComparator)
+        }
     }
     }
 }

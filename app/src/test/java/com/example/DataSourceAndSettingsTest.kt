@@ -23,6 +23,7 @@ class DataSourceAndSettingsTest {
         assertFalse(defaults.keepScreenOn)
         assertTrue(defaults.showServiceAlerts)
         assertFalse(defaults.hideInactiveOnMap)
+        assertFalse(defaults.showVehicleLabels)
     }
 
     @Test

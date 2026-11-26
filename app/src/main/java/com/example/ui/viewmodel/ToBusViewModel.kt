@@ -93,6 +93,8 @@ data class LinePickerUiState(
     val favoriteLines: List<String> = emptyList(),
     val stopSearchResults: List<StopSearchEntry> = emptyList(),
     val isLoadingStopIndex: Boolean = false,
+    val isLoadingLines: Boolean = false,
+    val lineCatalogError: String? = null,
     val userLocation: UserLocationState? = null,
 )
 
@@ -126,6 +128,9 @@ data class ToBusUiState(
     val stopWidgetPreviewByStopId: Map<String, List<StopArrival>> = emptyMap(),
     val isLoadingStopWidgetPreview: Boolean = false,
     val isLoadingFeed: Boolean = true,
+    val isLoadingInitialRoute: Boolean = false,
+    val isLoadingLines: Boolean = false,
+    val lineCatalogError: String? = null,
     val isRefreshing: Boolean = false,
     val lastUpdatedMillis: Long? = null,
     val feedTimestampSeconds: Long = 0L,
@@ -187,6 +192,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             favoriteStops = initialFavoriteStops,
             favoriteStopIds = initialFavoriteStops.map { it.stopId }.toSet(),
             favoriteLines = preferences.currentFavoriteLines(),
+            isLoadingInitialRoute = initialSettings.hasSelectedLine,
             githubRepoSlug = preferences.getGithubRepo(),
         ),
     )
@@ -227,6 +233,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var previewRenderJob: Job? = null
     private var stopPreviewJob: Job? = null
     private var routeLoadJob: Job? = null
+    private var lineCatalogJob: Job? = null
     private var stopArrivalsJob: Job? = null
     private var focusArrivalJob: Job? = null
     private var stopSearchJob: Job? = null
@@ -246,17 +253,19 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         if (initialSettings.hasSelectedLine) {
-            loadRouteGeometry(initialSettings.selectedLine)
+            loadRouteGeometry(initialSettings.selectedLine, isInitialRouteLoad = true)
         }
-        // Hydrate active line list immediately from tiny disk cache (~1.5 KB) for instant Line Picker
-        // before the first live HTTP poll completes.
+        // Hydrate active line list immediately from tiny disk cache or static GTFS routes.txt (~1.5 KB)
+        // for instant Line Picker before the first live HTTP poll completes.
         viewModelScope.launch(Dispatchers.IO) {
             val cachedLines = repository.getCachedActiveLinesFast()
-            if (cachedLines.isNotEmpty() && _uiState.value.allActiveLines.isEmpty()) {
+            if (cachedLines.isNotEmpty()) {
                 _uiState.update { state ->
-                    if (state.allActiveLines.isEmpty()) state.copy(allActiveLines = cachedLines) else state
+                    if (state.allActiveLines.size <= 1) state.copy(allActiveLines = cachedLines) else state
                 }
                 syncLinePickerState()
+            } else if (!initialSettings.hasSelectedLine) {
+                ensureLineCatalogLoaded()
             }
         }
         // Stagger static GTFS zip & stop index warmup after the initial 2.5s cold-start burst
@@ -265,6 +274,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             delay(2_500L)
             repository.prefetchStaticGtfsInBackground()
             runCatching { repository.getStopSearchIndex() }
+            if (_uiState.value.allActiveLines.size <= 1) {
+                ensureLineCatalogLoaded()
+            }
         }
         // Clean up any previously downloaded update APKs automatically on startup, then run the
         // lightweight once-per-24h GitHub Releases check after cold boot settles.
@@ -286,6 +298,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             favoriteLines = s.favoriteLines,
             stopSearchResults = s.stopSearchResults,
             isLoadingStopIndex = s.isLoadingStopIndex,
+            isLoadingLines = s.isLoadingLines,
+            lineCatalogError = s.lineCatalogError,
             userLocation = s.userLocation,
         )
         if (_linePickerState.value != next) {
@@ -337,12 +351,66 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     fun setLinePickerOpen(open: Boolean) {
         if (isLinePickerOpen == open) return
         isLinePickerOpen = open
-        if (!open) {
+        if (open) {
+            if (_uiState.value.allActiveLines.size <= 1) {
+                ensureLineCatalogLoaded()
+            }
+        } else {
             if (pendingMatoSyncOnPickerClose) {
                 pendingMatoSyncOnPickerClose = false
                 onMatoLivePush()
             } else {
                 _uiState.update { it.copy(nowMillis = System.currentTimeMillis()) }
+            }
+        }
+    }
+
+    fun ensureLineCatalogLoaded(force: Boolean = false) {
+        if (!force && _uiState.value.allActiveLines.size > 1) {
+            if (_uiState.value.isLoadingLines || _uiState.value.lineCatalogError != null) {
+                _uiState.update { it.copy(isLoadingLines = false, lineCatalogError = null) }
+                syncLinePickerState()
+            }
+            return
+        }
+        if (lineCatalogJob?.isActive == true && !force) return
+        lineCatalogJob?.cancel()
+        _uiState.update { it.copy(isLoadingLines = true, lineCatalogError = null) }
+        syncLinePickerState()
+
+        lineCatalogJob = viewModelScope.launch {
+            try {
+                val result = repository.fetchCitywideLineCatalog()
+                _uiState.update { state ->
+                    result.fold(
+                        onSuccess = { lines ->
+                            val merged = GttRealtimeRepository.mergeLineSummariesWithCatalog(
+                                liveSummaries = state.allActiveLines,
+                                catalogSummaries = lines,
+                            )
+                            state.copy(
+                                allActiveLines = merged,
+                                isLoadingLines = false,
+                                lineCatalogError = if (merged.isEmpty()) "Nessuna linea GTT disponibile al momento" else null,
+                            )
+                        },
+                        onFailure = { err ->
+                            state.copy(
+                                isLoadingLines = false,
+                                lineCatalogError = if (state.allActiveLines.isEmpty()) {
+                                    err.message ?: "Impossibile caricare la lista linee"
+                                } else {
+                                    null
+                                },
+                            )
+                        },
+                    )
+                }
+            } finally {
+                if (_uiState.value.isLoadingLines) {
+                    _uiState.update { it.copy(isLoadingLines = false) }
+                }
+                syncLinePickerState()
             }
         }
     }
@@ -678,13 +746,18 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                         val nextActiveLines = if (
                             snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1
                         ) {
-                            state.allActiveLines
+                            GttRealtimeRepository.mergeLineSummariesWithCatalog(
+                                liveSummaries = snapshot.availableLines,
+                                catalogSummaries = state.allActiveLines,
+                            )
                         } else {
                             snapshot.availableLines
                         }
                         state.copy(
                             lineVehicles = filtered,
                             allActiveLines = nextActiveLines,
+                            isLoadingLines = if (nextActiveLines.size > 1) false else state.isLoadingLines,
+                            lineCatalogError = if (nextActiveLines.isNotEmpty()) null else state.lineCatalogError,
                             sourceStatuses = snapshot.sourceStatuses,
                             allAlerts = effectiveAlerts,
                             lineAlerts = lineAlerts,
@@ -918,42 +991,50 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         lineCode: String,
         activeTripIds: Set<String> = emptySet(),
         forceRefresh: Boolean = false,
+        isInitialRouteLoad: Boolean = false,
     ) {
         routeLoadJob?.cancel()
         routeLoadJob = viewModelScope.launch {
-            val patterns = repository.fetchRoutePatterns(
-                lineCode = lineCode,
-                activeTripIds = activeTripIds,
-                forceRefresh = forceRefresh,
-            )
-            if (patterns.isNotEmpty() && _uiState.value.settings.selectedLine.equals(lineCode, ignoreCase = true)) {
-                val shouldRefit = needsRouteRefit && _uiState.value.selectedStop == null && _uiState.value.selectedVehicleId == null
-                needsRouteRefit = false
-                val refitFly = if (shouldRefit) {
-                    hasAutoCenteredCurrentLine = true
-                    val target = if (_uiState.value.settings.cameraMode == WidgetCameraMode.FIXED_AREA) {
-                        _uiState.value.settings.fixedCamera
+            try {
+                val patterns = repository.fetchRoutePatterns(
+                    lineCode = lineCode,
+                    activeTripIds = activeTripIds,
+                    forceRefresh = forceRefresh,
+                )
+                if (patterns.isNotEmpty() && _uiState.value.settings.selectedLine.equals(lineCode, ignoreCase = true)) {
+                    val shouldRefit = needsRouteRefit && _uiState.value.selectedStop == null && _uiState.value.selectedVehicleId == null
+                    needsRouteRefit = false
+                    val refitFly = if (shouldRefit) {
+                        hasAutoCenteredCurrentLine = true
+                        val target = if (_uiState.value.settings.cameraMode == WidgetCameraMode.FIXED_AREA) {
+                            _uiState.value.settings.fixedCamera
+                        } else {
+                            WebMercator.computeAutoFitCamera(
+                                vehicles = _uiState.value.lineVehicles,
+                                patterns = patterns,
+                                viewportWidthPx = lastViewportPx.first,
+                                viewportHeightPx = lastViewportPx.second,
+                            )
+                        }
+                        cameraFlySeq++
+                        CameraFlyRequest(target = target, id = cameraFlySeq)
                     } else {
-                        WebMercator.computeAutoFitCamera(
-                            vehicles = _uiState.value.lineVehicles,
-                            patterns = patterns,
-                            viewportWidthPx = lastViewportPx.first,
-                            viewportHeightPx = lastViewportPx.second,
+                        null
+                    }
+                    _uiState.update { state ->
+                        state.copy(
+                            routePatterns = patterns,
+                            isLoadingInitialRoute = false,
+                            cameraFlyRequest = refitFly ?: state.cameraFlyRequest,
                         )
                     }
-                    cameraFlySeq++
-                    CameraFlyRequest(target = target, id = cameraFlySeq)
-                } else {
-                    null
+                    regenerateWidgetPreview()
+                    requestWidgetUpdatesAsync(includeStops = false)
                 }
-                _uiState.update { state ->
-                    state.copy(
-                        routePatterns = patterns,
-                        cameraFlyRequest = refitFly ?: state.cameraFlyRequest,
-                    )
+            } finally {
+                if (isInitialRouteLoad || _uiState.value.isLoadingInitialRoute) {
+                    _uiState.update { it.copy(isLoadingInitialRoute = false) }
                 }
-                regenerateWidgetPreview()
-                requestWidgetUpdatesAsync(includeStops = false)
             }
         }
     }

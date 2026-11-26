@@ -163,6 +163,7 @@ class TurinVectorStyleAndOverlayTest {
 
         assertEquals("tobus-stops-fav-star", MapLibreTransitIds.STOPS_FAV_STAR_LAYER)
         assertEquals("tobus-fav-stop-star", MapLibreTransitIds.ICON_FAV_STOP_STAR)
+        assertTrue(MapLibreTransitIds.STOPS_MIN_ML_ZOOM in 10.5f..11.1f)
 
         val fc = com.example.ui.components.buildStopsFeatureCollection(
             stops = p0.stops,

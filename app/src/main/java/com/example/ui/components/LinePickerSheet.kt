@@ -37,6 +37,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Place
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Star
 import com.example.ui.icons.ToBusIcons
@@ -75,6 +76,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
@@ -187,11 +189,14 @@ fun LinePickerSheet(
     favoriteLines: List<String> = emptyList(),
     stopSearchResults: List<StopSearchEntry>,
     isLoadingStopIndex: Boolean,
+    isLoadingLines: Boolean = false,
+    lineCatalogError: String? = null,
     userLocation: UserLocationState?,
     onSelectLine: (String) -> Unit,
     onToggleFavoriteLine: (String) -> Unit = {},
     onSearchStops: (String) -> Unit,
     onSelectStop: (StopSearchEntry) -> Unit,
+    onRetryLoadLines: () -> Unit = {},
     onDismiss: () -> Unit,
     isInitialSetup: Boolean = false,
     modifier: Modifier = Modifier,
@@ -200,11 +205,17 @@ fun LinePickerSheet(
     var lineQuery by remember { mutableStateOf("") }
     var stopQuery by remember { mutableStateOf("") }
 
-    // Freeze activeLines snapshot while the picker is open so background live telemetry never causes
-    // grid recompositions mid-scroll; updates only if list was initially empty.
+    // Freeze activeLines snapshot while the picker is open so background telemetry never causes
+    // grid recompositions mid-scroll; allow upgrade from empty, single-line, or 0-count fallback.
     var stableActiveLines by remember { mutableStateOf(activeLines) }
-    LaunchedEffect(activeLines.size) {
-        if (stableActiveLines.isEmpty() && activeLines.isNotEmpty()) {
+    LaunchedEffect(activeLines) {
+        val shouldUpdate = when {
+            stableActiveLines.isEmpty() && activeLines.isNotEmpty() -> true
+            stableActiveLines.size <= 1 && activeLines.size > 1 -> true
+            stableActiveLines.none { it.activeVehicleCount > 0 } && activeLines.any { it.activeVehicleCount > 0 } -> true
+            else -> false
+        }
+        if (shouldUpdate) {
             stableActiveLines = activeLines
         }
     }
@@ -253,7 +264,11 @@ fun LinePickerSheet(
     val latestOnSelectLine by rememberUpdatedState(onSelectLine)
     val latestOnToggleFavoriteLine by rememberUpdatedState(onToggleFavoriteLine)
     val latestOnSelectStop by rememberUpdatedState(onSelectStop)
+    val latestOnRetryLoadLines by rememberUpdatedState(onRetryLoadLines)
     val latestOnDismiss by rememberUpdatedState(onDismiss)
+    val activeNowCount = remember(stableActiveLines) {
+        stableActiveLines.count { it.activeVehicleCount > 0 }
+    }
 
     val sheetScope = rememberCoroutineScope()
     val headerDragOffsetY = remember { Animatable(0f) }
@@ -373,12 +388,16 @@ fun LinePickerSheet(
                         Text(
                             text = if (activeTab == PickerTab.LINES) {
                                 when {
+                                    isInitialSetup && activeNowCount > 0 ->
+                                        "$activeNowCount linee attive ora · usata su mappa e widget"
                                     isInitialSetup && stableActiveLines.isNotEmpty() ->
-                                        "${stableActiveLines.size} linee attive ora · usata su mappa e widget"
+                                        "${stableActiveLines.size} linee GTT disponibili · usata su mappa e widget"
                                     isInitialSetup ->
                                         "Seleziona la linea da seguire su mappa e widget"
+                                    activeNowCount > 0 ->
+                                        "$activeNowCount linee attive ora su Torino"
                                     stableActiveLines.isNotEmpty() ->
-                                        "${stableActiveLines.size} linee attive ora su Torino"
+                                        "${stableActiveLines.size} linee GTT disponibili · tocca o cerca"
                                     else ->
                                         "Cerca o inserisci il numero della linea"
                                 }
@@ -575,30 +594,90 @@ fun LinePickerSheet(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .weight(1f),
+                            .weight(1f)
+                            .padding(horizontal = 24.dp),
                         contentAlignment = Alignment.Center,
                     ) {
                         if (cleanedLineQuery.isEmpty()) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = AccentGold,
-                                )
-                                Text(
-                                    text = "Caricamento linee attive GTT…",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = TextSubtitle,
-                                )
+                            if (isLoadingLines) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                            color = AccentGold,
+                                        )
+                                        Text(
+                                            text = "Caricamento linee GTT…",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = TextPrimary,
+                                        )
+                                    }
+                                    Text(
+                                        text = "Puoi comunque digitare subito un numero linea qui sopra",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextSubtitle,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                }
+                            } else {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    Text(
+                                        text = lineCatalogError ?: "Elenco linee non disponibile",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = TextPrimary,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                    Text(
+                                        text = "Cerca manualmente qualsiasi numero linea qui sopra oppure riprova",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextSubtitle,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    val retryInteraction = remember { MutableInteractionSource() }
+                                    Row(
+                                        modifier = Modifier
+                                            .heightIn(min = 48.dp)
+                                            .glassInteractive(retryInteraction) {
+                                                latestOnRetryLoadLines()
+                                            }
+                                            .background(RegularTileSelectedFill, PillShape)
+                                            .border(1.dp, AccentGold.copy(alpha = 0.65f), PillShape)
+                                            .padding(horizontal = 20.dp, vertical = 12.dp)
+                                            .testTag("retry_load_lines_button"),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Refresh,
+                                            contentDescription = null,
+                                            tint = AccentGold,
+                                            modifier = Modifier.size(18.dp),
+                                        )
+                                        Text(
+                                            text = "Riprova",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = AccentGold,
+                                        )
+                                    }
+                                }
                             }
                         } else {
                             Text(
-                                text = "Nessuna linea attiva per \"$cleanedLineQuery\"",
+                                text = "Nessuna linea trovata per \"$cleanedLineQuery\"",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextSubtitle,
+                                textAlign = TextAlign.Center,
                             )
                         }
                     }

@@ -251,6 +251,34 @@ fun ToBusApp(
     }
 
     val isLightMapVisible = currentTab == AppDestination.MAP && !uiState.settings.mapStyle.isDark && !showLinePicker
+
+    var startupGateReleased by rememberSaveable { mutableStateOf(!uiState.settings.hasSelectedLine) }
+    var startupGraceElapsed by remember { mutableStateOf(false) }
+    val stillNeedsInitialStartupData = !startupGateReleased &&
+        uiState.settings.hasSelectedLine &&
+        ((uiState.isLoadingInitialRoute && uiState.routePatterns.isEmpty()) ||
+            (uiState.isLoadingFeed && uiState.lastUpdatedMillis == null))
+
+    LaunchedEffect(startupGateReleased) {
+        if (!startupGateReleased) {
+            kotlinx.coroutines.delay(180L)
+            startupGraceElapsed = true
+            kotlinx.coroutines.delay(8_500L)
+            startupGateReleased = true
+        }
+    }
+
+    LaunchedEffect(stillNeedsInitialStartupData) {
+        if (!stillNeedsInitialStartupData) {
+            startupGateReleased = true
+        }
+    }
+
+    val showStartupGlassOverlay = !startupGateReleased &&
+        startupGraceElapsed &&
+        stillNeedsInitialStartupData &&
+        currentTab == AppDestination.MAP &&
+        !showLinePicker
     val activity = LocalContext.current as? ComponentActivity
     LaunchedEffect(activity, isLightMapVisible) {
         activity?.enableEdgeToEdge(
@@ -347,6 +375,7 @@ fun ToBusApp(
                             pollProgressFlow = viewModel.pollProgress,
                             isForegroundActive = isForegroundActive && !showLinePicker,
                             isWideScreen = useNavigationRail,
+                            showStartupOverlay = showStartupGlassOverlay,
                             bottomNavClearance = bottomClearance,
                             onCameraChange = viewModel::updateCamera,
                             onViewportSizeChange = viewModel::updateViewportSize,
@@ -551,11 +580,14 @@ private fun LinePickerHost(
         favoriteLines = pickerState.favoriteLines,
         stopSearchResults = pickerState.stopSearchResults,
         isLoadingStopIndex = pickerState.isLoadingStopIndex,
+        isLoadingLines = pickerState.isLoadingLines,
+        lineCatalogError = pickerState.lineCatalogError,
         userLocation = pickerState.userLocation,
         onSelectLine = viewModel::selectLine,
         onToggleFavoriteLine = viewModel::toggleFavoriteLine,
         onSearchStops = viewModel::searchStops,
         onSelectStop = onSelectStop,
+        onRetryLoadLines = { viewModel.ensureLineCatalogLoaded(force = true) },
         onDismiss = onDismiss,
         isInitialSetup = isInitialSetup,
     )

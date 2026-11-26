@@ -110,6 +110,47 @@ class GttStaticRouteStoreTest {
         assertTrue(patterns[0].points[2].lon in 7.665..7.667)
     }
 
+    @Test
+    fun extractsNormalizedDeduplicatedLineCatalogSortedCorrectly() {
+        val zipFile = createGtfsZip(
+            routesCsv = "\uFEFFroute_id,agency_id,route_short_name,route_long_name,route_type\n" +
+                "55U,GTT,55,Gerbido - Corso Tortona,3\n" +
+                "4U,GTT,4,Falchera - Strada del Drosso,0\n" +
+                "4F,GTT,4,Falchera Festivo,0\n" +
+                "12U,GTT,12,Allamano - Corso Toscana,3\n" +
+                "VE1U,GTT,VE1,Venaria Express,3\n" +
+                "5BU,GTT,5B,Borgata Paradiso,3\n",
+            tripsCsv = "route_id,trip_id,direction_id,shape_id\n",
+            shapesCsv = null,
+        )
+
+        val catalog = GttStaticRouteStore.extractAllLineSummariesFromZip(zipFile)
+        assertEquals(listOf("4", "5B", "12", "55", "VE1"), catalog.map { it.lineCode })
+        val line4 = catalog.first { it.lineCode == "4" }
+        assertEquals(setOf("4U", "4F", "4"), line4.rawRouteIds)
+        assertTrue(catalog.all { it.activeVehicleCount == 0 })
+    }
+
+    @Test
+    fun mergesLiveVehicleCountsIntoStaticCatalogWithoutDuplicates() {
+        val catalog = listOf(
+            com.example.data.model.LineSummary("4", setOf("4U"), 0),
+            com.example.data.model.LineSummary("55", setOf("55U"), 0),
+            com.example.data.model.LineSummary("VE1", setOf("VE1U"), 0),
+        )
+        val live = listOf(
+            com.example.data.model.LineSummary("55", setOf("55"), 4),
+            com.example.data.model.LineSummary("15", setOf("15U"), 2),
+        )
+
+        val merged = com.example.data.network.GttRealtimeRepository.mergeLineSummariesWithCatalog(live, catalog)
+        assertEquals(listOf("4", "15", "55", "VE1"), merged.map { it.lineCode })
+        assertEquals(4, merged.first { it.lineCode == "55" }.activeVehicleCount)
+        assertEquals(2, merged.first { it.lineCode == "15" }.activeVehicleCount)
+        assertEquals(0, merged.first { it.lineCode == "4" }.activeVehicleCount)
+        assertEquals(setOf("55U", "55"), merged.first { it.lineCode == "55" }.rawRouteIds)
+    }
+
     private fun createGtfsZip(
         routesCsv: String,
         tripsCsv: String,

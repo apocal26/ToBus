@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,7 +15,9 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -34,6 +37,7 @@ import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -59,6 +63,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Place
@@ -83,6 +88,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.StateFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -114,6 +121,8 @@ import com.example.ui.glass.AccentIconBadge
 import com.example.ui.glass.DirectionColorBadge
 import com.example.ui.glass.GlassCircleIconButton
 import com.example.ui.glass.GlassModalDialog
+import com.example.ui.glass.GlassProgressBar
+import com.example.ui.glass.GlassShimmerBox
 import com.example.ui.glass.HeroEntranceText
 import com.example.ui.glass.LightHapticKind
 import com.example.ui.glass.LiquidGlassOverlaySurface
@@ -123,6 +132,7 @@ import com.example.ui.glass.glassInteractive
 import com.example.ui.glass.glassSpring
 import com.example.ui.glass.liquidGlassRimBrush
 import com.example.ui.glass.performLightHaptic
+import com.example.ui.glass.rememberGlassShimmerBrush
 import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
@@ -142,6 +152,7 @@ import com.example.ui.theme.ScrimTopStart
 import com.example.ui.theme.SmokedGlassBorder
 import com.example.ui.theme.SmokedGlassFill
 import com.example.ui.theme.TextBody
+import com.example.ui.theme.TextHero
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSubtitle
 import com.example.ui.viewmodel.ToBusUiState
@@ -162,6 +173,7 @@ fun MapScreen(
     pollProgressFlow: StateFlow<Float>,
     isForegroundActive: Boolean,
     isWideScreen: Boolean = false,
+    showStartupOverlay: Boolean = false,
     bottomNavClearance: Dp,
     onCameraChange: (CameraState) -> Unit,
     onViewportSizeChange: (Int, Int) -> Unit,
@@ -336,6 +348,12 @@ fun MapScreen(
             )
     }
 
+    val startupBlurDp by animateDpAsState(
+        targetValue = if (showStartupOverlay) 14.dp else 0.dp,
+        animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
+        label = "startup_map_blur",
+    )
+
     Box(modifier = modifier.fillMaxSize()) {
         // 1. Full-bleed interactive Torino slippy map (clean street tiles, smooth bus motion & optional GPS dot)
         InteractiveTurinMap(
@@ -364,6 +382,11 @@ fun MapScreen(
             onViewportSizeChange = onViewportSizeChange,
             onVehicleTap = handleSelectVehicle,
             onStopTap = handleSelectStop,
+            modifier = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && startupBlurDp > 0.5.dp) {
+                Modifier.blur(startupBlurDp)
+            } else {
+                Modifier
+            },
         )
 
         val isLightBasemap = !uiState.settings.mapStyle.isDark
@@ -1061,6 +1084,21 @@ fun MapScreen(
                 }
             }
         }
+
+        AnimatedVisibility(
+            visible = showStartupOverlay,
+            enter = fadeIn(animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing)) +
+                scaleIn(initialScale = 0.96f, animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing)),
+            exit = fadeOut(animationSpec = tween(durationMillis = 340, easing = FastOutSlowInEasing)) +
+                scaleOut(targetScale = 1.03f, animationSpec = tween(durationMillis = 340, easing = FastOutSlowInEasing)),
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            StartupGlassLoadingOverlay(
+                selectedLine = uiState.settings.selectedLine,
+                isRouteReady = uiState.routePatterns.isNotEmpty() || !uiState.isLoadingInitialRoute,
+                isFeedReady = uiState.lastUpdatedMillis != null || !uiState.isLoadingFeed,
+            )
+        }
     }
 
     if (showAlertsDialog && uiState.settings.showServiceAlerts) {
@@ -1069,6 +1107,215 @@ fun MapScreen(
             lineAlerts = uiState.lineAlerts,
             allAlerts = uiState.allAlerts,
             onDismiss = { showAlertsDialog = false },
+        )
+    }
+}
+
+@Composable
+private fun StartupGlassLoadingOverlay(
+    selectedLine: String,
+    isRouteReady: Boolean,
+    isFeedReady: Boolean,
+) {
+    val shimmerBrush = rememberGlassShimmerBrush()
+    val backdropBrush = remember {
+        Brush.verticalGradient(
+            colors = listOf(
+                Color(0x9C070A12),
+                Color(0xB405070D),
+            ),
+        )
+    }
+    val stepProgressTarget = when {
+        isRouteReady && isFeedReady -> 1f
+        isRouteReady || isFeedReady -> 0.76f
+        else -> 0.40f
+    }
+    val animatedProgress by animateFloatAsState(
+        targetValue = stepProgressTarget,
+        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        label = "startup_glass_progress",
+    )
+    val cardShape = remember { RoundedCornerShape(28.dp) }
+    val statusText = when {
+        !isRouteReady && !isFeedReady -> "Caricamento percorso e fonti live…"
+        !isRouteReady -> "Caricamento percorso e fermate…"
+        else -> "Sincronizzazione mezzi live…"
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(backdropBrush)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = {},
+            )
+            .padding(horizontal = 24.dp)
+            .testTag("startup_loading_overlay"),
+        contentAlignment = Alignment.Center,
+    ) {
+        LiquidGlassOverlaySurface(
+            isLightBasemap = false,
+            accentTint = AccentGold,
+            shape = cardShape,
+            modifier = Modifier
+                .widthIn(max = 316.dp)
+                .fillMaxWidth(),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(shimmerBrush),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 22.dp, vertical = 22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        if (selectedLine.isNotBlank()) {
+                            Box(
+                                modifier = Modifier
+                                    .background(AccentGold, RoundedCornerShape(999.dp))
+                                    .padding(horizontal = 12.dp, vertical = 5.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = selectedLine,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = DarkInkOnAccent,
+                                )
+                            }
+                        }
+                        Text(
+                            text = "Preparazione mappa",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TextHero,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+
+                    // Widget-style frosted glass shimmer preview block
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0x14FFFFFF), RoundedCornerShape(18.dp))
+                            .border(1.dp, Color(0x1EFFFFFF), RoundedCornerShape(18.dp))
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            GlassShimmerBox(
+                                modifier = Modifier
+                                    .width(120.dp)
+                                    .height(12.dp),
+                                shape = RoundedCornerShape(999.dp),
+                                brush = shimmerBrush,
+                            )
+                            GlassShimmerBox(
+                                modifier = Modifier
+                                    .width(42.dp)
+                                    .height(12.dp),
+                                shape = RoundedCornerShape(999.dp),
+                                brush = shimmerBrush,
+                            )
+                        }
+                        GlassShimmerBox(
+                            modifier = Modifier
+                                .fillMaxWidth(0.76f)
+                                .height(10.dp),
+                            shape = RoundedCornerShape(999.dp),
+                            brush = shimmerBrush,
+                        )
+                    }
+
+                    GlassProgressBar(progress = animatedProgress)
+
+                    Text(
+                        text = statusText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSubtitle,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        StartupStepChip(
+                            label = "Percorso",
+                            done = isRouteReady,
+                            modifier = Modifier.weight(1f),
+                        )
+                        StartupStepChip(
+                            label = "Fonti live",
+                            done = isFeedReady,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StartupStepChip(
+    label: String,
+    done: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val accent = if (done) AccentEmerald else AccentGold
+    Row(
+        modifier = modifier
+            .background(
+                color = if (done) AccentEmerald.copy(alpha = 0.14f) else Color(0x14FFFFFF),
+                shape = RoundedCornerShape(999.dp),
+            )
+            .border(
+                width = 1.dp,
+                color = if (done) AccentEmerald.copy(alpha = 0.45f) else Color(0x22FFFFFF),
+                shape = RoundedCornerShape(999.dp),
+            )
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        if (done) {
+            Icon(
+                imageVector = Icons.Rounded.Check,
+                contentDescription = null,
+                tint = AccentEmerald,
+                modifier = Modifier.size(14.dp),
+            )
+        } else {
+            CircularProgressIndicator(
+                modifier = Modifier.size(12.dp),
+                strokeWidth = 1.8.dp,
+                color = accent,
+            )
+        }
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (done) TextPrimary else TextSubtitle,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }

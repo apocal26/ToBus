@@ -45,6 +45,43 @@ Toccando un mezzo o una fermata direttamente sulla mappa si aprono i relativi pa
 
 ---
 
+### Selezione linee e ricerca fermate
+
+Dal pannello inferiore puoi cambiare linea al volo o cercare qualsiasi fermata di Torino per nome o numero palina:
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/line_picker.jpg" alt="Selettore linee GTT attive e preferite" width="320" />
+      <br />
+      <sub><b>Selettore linee</b>: elenca tutte le linee attive con il conteggio dei mezzi live su strada, le linee preferite salvate in cima e la ricerca immediata per numero o sigla.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/search_stops.jpg" alt="Ricerca fermate per nome o palina" width="320" />
+      <br />
+      <sub><b>Cerca fermata</b>: per ogni risultato mostra il numero di <code>#palina</code>, la direzione principale e tutte le linee in transito, con accesso diretto ai passaggi live.</sub>
+    </td>
+  </tr>
+</table>
+</div>
+
+---
+
+### Avvisi di servizio GTT
+
+La campanella in alto apre il pannello degli avvisi ufficiali GTT, mettendo in evidenza le variazioni della linea che stai seguendo rispetto al resto della rete:
+
+<div align="center">
+
+<img src="docs/images/service_alerts.png" alt="Pannello Avvisi di servizio GTT" width="340" />
+
+<sub><b>Avvisi filtrati e rete</b>: segnala fermate sospese, deviazioni e validità temporale per la linea selezionata, oltre agli aggiornamenti attuali su metro e ascensori.</sub>
+
+</div>
+
+---
+
 ### 4 stili di mappa
 
 Puoi scegliere liberamente lo stile grafico della mappa dalle impostazioni; i tracciati delle due direzioni restano sempre ben distinti (ambra e ciano):
