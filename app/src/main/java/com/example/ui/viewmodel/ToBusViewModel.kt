@@ -233,6 +233,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var previewRenderJob: Job? = null
     private var stopPreviewJob: Job? = null
     private var routeLoadJob: Job? = null
+    private var routeLoadSeq: Long = 0L
     private var lineCatalogJob: Job? = null
     private var stopArrivalsJob: Job? = null
     private var focusArrivalJob: Job? = null
@@ -906,16 +907,20 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         val allAlerts = if (updated.showServiceAlerts) cachedSnapshot?.alerts.orEmpty() else emptyList()
         val lineAlerts = if (updated.showServiceAlerts) filterAlertsForLine(allAlerts, cleaned) else emptyList()
 
+        val previousState = _uiState.value
+        val isSameLoadedLine = previousState.settings.selectedLine.equals(cleaned, ignoreCase = true) &&
+            previousState.routePatterns.isNotEmpty()
+
         val nextCamera = if (filtered.isNotEmpty()) {
             hasAutoCenteredCurrentLine = true
             WebMercator.computeAutoFitCamera(
                 vehicles = filtered,
-                patterns = emptyList(),
+                patterns = if (isSameLoadedLine) previousState.routePatterns else emptyList(),
                 viewportWidthPx = lastViewportPx.first,
                 viewportHeightPx = lastViewportPx.second,
             )
         } else {
-            _uiState.value.camera
+            previousState.camera
         }
 
         _uiState.update {
@@ -924,7 +929,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 lineVehicles = filtered,
                 allAlerts = allAlerts,
                 lineAlerts = lineAlerts,
-                routePatterns = emptyList(),
+                routePatterns = if (isSameLoadedLine) it.routePatterns else emptyList(),
+                isLoadingInitialRoute = !isSameLoadedLine,
                 selectedVehicleId = null,
                 focusedExternalVehicle = null,
                 focusedExternalTerminus = null,
@@ -938,10 +944,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
         syncLinePickerState()
 
-        loadRouteGeometry(cleaned)
+        if (!isSameLoadedLine) {
+            loadRouteGeometry(cleaned, isInitialRouteLoad = true)
+        }
         resolveMissingVehicleStopNames(filtered)
         if (filtered.isEmpty() || updated.dataSourceMode == DataSourceMode.MATO_LIVE) {
-            refreshLiveData(isInitial = false)
+            refreshLiveData(isInitial = cachedSnapshot == null)
         }
         regenerateWidgetPreview()
         requestWidgetUpdatesAsync(includeMap = true, includeStops = false)
@@ -994,6 +1002,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         isInitialRouteLoad: Boolean = false,
     ) {
         routeLoadJob?.cancel()
+        val currentSeq = ++routeLoadSeq
         routeLoadJob = viewModelScope.launch {
             try {
                 val patterns = repository.fetchRoutePatterns(
@@ -1032,7 +1041,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     requestWidgetUpdatesAsync(includeStops = false)
                 }
             } finally {
-                if (isInitialRouteLoad || _uiState.value.isLoadingInitialRoute) {
+                if (routeLoadSeq == currentSeq && (isInitialRouteLoad || _uiState.value.isLoadingInitialRoute)) {
                     _uiState.update { it.copy(isLoadingInitialRoute = false) }
                 }
             }

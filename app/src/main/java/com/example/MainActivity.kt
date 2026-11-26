@@ -252,31 +252,30 @@ fun ToBusApp(
 
     val isLightMapVisible = currentTab == AppDestination.MAP && !uiState.settings.mapStyle.isDark && !showLinePicker
 
-    var startupGateReleased by rememberSaveable { mutableStateOf(!uiState.settings.hasSelectedLine) }
-    var startupGraceElapsed by remember { mutableStateOf(false) }
-    val stillNeedsInitialStartupData = !startupGateReleased &&
-        uiState.settings.hasSelectedLine &&
+    val selectedLineKey = uiState.settings.selectedLine.trim().uppercase()
+    val needsBlockingLoadOverlay = uiState.settings.hasSelectedLine &&
         ((uiState.isLoadingInitialRoute && uiState.routePatterns.isEmpty()) ||
             (uiState.isLoadingFeed && uiState.lastUpdatedMillis == null))
 
-    LaunchedEffect(startupGateReleased) {
-        if (!startupGateReleased) {
-            kotlinx.coroutines.delay(180L)
-            startupGraceElapsed = true
-            kotlinx.coroutines.delay(8_500L)
-            startupGateReleased = true
+    var overlayTimedOutForKey by rememberSaveable(selectedLineKey) { mutableStateOf(false) }
+    var overlayGraceElapsed by remember(selectedLineKey) { mutableStateOf(false) }
+
+    LaunchedEffect(selectedLineKey, needsBlockingLoadOverlay) {
+        if (!needsBlockingLoadOverlay) {
+            overlayGraceElapsed = false
+            return@LaunchedEffect
         }
+        if (overlayTimedOutForKey) return@LaunchedEffect
+        overlayGraceElapsed = false
+        kotlinx.coroutines.delay(200L)
+        overlayGraceElapsed = true
+        kotlinx.coroutines.delay(8_500L)
+        overlayTimedOutForKey = true
     }
 
-    LaunchedEffect(stillNeedsInitialStartupData) {
-        if (!stillNeedsInitialStartupData) {
-            startupGateReleased = true
-        }
-    }
-
-    val showStartupGlassOverlay = !startupGateReleased &&
-        startupGraceElapsed &&
-        stillNeedsInitialStartupData &&
+    val showStartupGlassOverlay = needsBlockingLoadOverlay &&
+        overlayGraceElapsed &&
+        !overlayTimedOutForKey &&
         currentTab == AppDestination.MAP &&
         !showLinePicker
     val activity = LocalContext.current as? ComponentActivity
