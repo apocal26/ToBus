@@ -682,6 +682,63 @@ enum class RefreshInterval(
     }
 }
 
+enum class DataSourceMode(
+    val id: String,
+    val labelIt: String,
+    val shortLabelIt: String,
+    val descriptionIt: String,
+) {
+    AUTO(
+        id = "auto",
+        labelIt = "Automatico",
+        shortLabelIt = "Auto",
+        descriptionIt = "Combina MaTO Live, GTT e BusOne con fallback automatico se i GPS si bloccano",
+    ),
+    MATO_LIVE(
+        id = "mato_live",
+        labelIt = "MaTO Live",
+        shortLabelIt = "MaTO",
+        descriptionIt = "Usa solo Muoversi a Torino (MQTT + GraphQL in tempo reale)",
+    ),
+    GTT_OFFICIAL(
+        id = "gtt_official",
+        labelIt = "GTT Ufficiale",
+        shortLabelIt = "GTT",
+        descriptionIt = "Usa solo il feed GTFS-RT ufficiale GTT senza fallback",
+    ),
+    BUSONE_PROXY(
+        id = "busone_proxy",
+        labelIt = "BusOne Proxy",
+        shortLabelIt = "BusOne",
+        descriptionIt = "Usa solo il proxy GTFS-RT BusOne normalizzato",
+    );
+
+    val isFixed: Boolean
+        get() = this != AUTO
+
+    companion object {
+        fun fromId(id: String?): DataSourceMode =
+            entries.firstOrNull { it.id == id } ?: AUTO
+    }
+}
+
+enum class LivePollInterval(
+    val seconds: Int,
+    val labelIt: String,
+) {
+    SEC_15(15, "15 s"),
+    SEC_25(25, "25 s"),
+    SEC_45(45, "45 s");
+
+    val millis: Long
+        get() = seconds * 1_000L
+
+    companion object {
+        fun fromSeconds(seconds: Int): LivePollInterval =
+            entries.firstOrNull { it.seconds == seconds } ?: SEC_25
+    }
+}
+
 @Immutable
 data class CameraState(
     val centerLat: Double = TURIN_CENTER_LAT,
@@ -698,7 +755,7 @@ data class CameraState(
 
 @Immutable
 data class UserWidgetSettings(
-    val selectedLine: String = "12",
+    val selectedLine: String = "",
     val mapStyle: MapStyle = MapStyle.DARK,
     val cameraMode: WidgetCameraMode = WidgetCameraMode.AUTO_FIT_BUSES,
     val fixedCamera: CameraState = CameraState(),
@@ -707,4 +764,12 @@ data class UserWidgetSettings(
     val colorByDirection: Boolean = true,
     val hideInactiveInWidget: Boolean = true,
     val refreshInterval: RefreshInterval = RefreshInterval.MIN_5,
-)
+    val dataSourceMode: DataSourceMode = DataSourceMode.AUTO,
+    val livePollInterval: LivePollInterval = LivePollInterval.SEC_25,
+    val keepScreenOn: Boolean = false,
+    val showServiceAlerts: Boolean = true,
+    val hideInactiveOnMap: Boolean = false,
+) {
+    val hasSelectedLine: Boolean
+        get() = selectedLine.isNotBlank()
+}

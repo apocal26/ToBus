@@ -296,14 +296,29 @@ fun MapScreen(
             }
             .filterValues { it.isNotBlank() }
     }
-    val sortedVehicles = remember(
+    val visibleMapVehicles = remember(
         uiState.lineVehicles,
+        healthByVehicleId,
+        uiState.settings.hideInactiveOnMap,
+        uiState.selectedVehicleId,
+    ) {
+        if (!uiState.settings.hideInactiveOnMap) {
+            uiState.lineVehicles
+        } else {
+            uiState.lineVehicles.filter { bus ->
+                bus.vehicleId == uiState.selectedVehicleId ||
+                    healthByVehicleId[bus.vehicleId]?.let { !it.isInDepot && !it.isStaleGps } != false
+            }
+        }
+    }
+    val sortedVehicles = remember(
+        visibleMapVehicles,
         healthByVehicleId,
         resolvedDirectionById,
         focusedDirectionFilter,
         uiState.selectedVehicleId,
     ) {
-        uiState.lineVehicles
+        visibleMapVehicles
             .filter { bus ->
                 focusedDirectionFilter == null ||
                     bus.vehicleId == uiState.selectedVehicleId ||
@@ -323,7 +338,7 @@ fun MapScreen(
         InteractiveTurinMap(
             camera = uiState.camera,
             mapStyle = uiState.settings.mapStyle,
-            vehicles = uiState.lineVehicles,
+            vehicles = visibleMapVehicles,
             focusedExternalVehicle = uiState.focusedExternalVehicle,
             focusedExternalRoutePatterns = uiState.focusedExternalRoutePatterns,
             userLocation = uiState.userLocation,
@@ -417,7 +432,7 @@ fun MapScreen(
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                text = uiState.settings.selectedLine,
+                                text = uiState.settings.selectedLine.ifBlank { "—" },
                                 style = MaterialTheme.typography.labelLarge,
                                 color = DarkInkOnAccent,
                             )
@@ -431,6 +446,7 @@ fun MapScreen(
                                         .background(
                                             color = when {
                                                 uiState.errorMessage != null -> AccentRed
+                                                !uiState.settings.hasSelectedLine -> AccentGold
                                                 activeReliableCount == 0 -> AccentGold
                                                 else -> AccentEmerald
                                             },
@@ -440,6 +456,7 @@ fun MapScreen(
                                 Spacer(modifier = Modifier.width(6.dp))
                                 HeroEntranceText(
                                     text = when {
+                                        !uiState.settings.hasSelectedLine -> "Scegli una linea"
                                         uiState.isLoadingFeed -> "Connessione…"
                                         uiState.lineVehicles.isEmpty() -> "Nessun mezzo"
                                         activeReliableCount == 0 && depotCount > 0 -> "$depotCount in deposito"
@@ -454,6 +471,10 @@ fun MapScreen(
                             }
                             Text(
                                 text = when {
+                                    !uiState.settings.hasSelectedLine ->
+                                        "Tocca per scegliere linea o fermata"
+                                    uiState.settings.dataSourceMode.isFixed ->
+                                        "Solo ${uiState.settings.dataSourceMode.labelIt} · Cambia linea"
                                     depotCount > 0 && staleOrStuckCount > 0 ->
                                         "$depotCount deposito · $staleOrStuckCount fermo · Cambia"
                                     depotCount > 0 && activeReliableCount > 0 ->
@@ -467,7 +488,7 @@ fun MapScreen(
                                     else -> "Linee e fermate GTT"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSubtitle,
+                                color = if (uiState.settings.dataSourceMode.isFixed) AccentGold else TextSubtitle,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -488,18 +509,20 @@ fun MapScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    // Glowing Glass GTT Alerts Button (Neutral -> Warm Gold -> Red for selected line)
-                    GttAlertsGlassButton(
-                        hasLineAlert = uiState.lineAlerts.isNotEmpty(),
-                        hasGeneralAlerts = uiState.allAlerts.isNotEmpty(),
-                        badgeCount = if (uiState.lineAlerts.isNotEmpty()) {
-                            uiState.lineAlerts.size
-                        } else {
-                            uiState.allAlerts.size
-                        },
-                        isLightBasemap = isLightBasemap,
-                        onClick = { showAlertsDialog = true },
-                    )
+                    // Glowing Glass GTT Alerts Button (optional via Settings)
+                    if (uiState.settings.showServiceAlerts) {
+                        GttAlertsGlassButton(
+                            hasLineAlert = uiState.lineAlerts.isNotEmpty(),
+                            hasGeneralAlerts = uiState.allAlerts.isNotEmpty(),
+                            badgeCount = if (uiState.lineAlerts.isNotEmpty()) {
+                                uiState.lineAlerts.size
+                            } else {
+                                uiState.allAlerts.size
+                            },
+                            isLightBasemap = isLightBasemap,
+                            onClick = { showAlertsDialog = true },
+                        )
+                    }
 
                     // Discreet optional GPS Location button right beside Refresh
                     UserLocationGlassButton(
@@ -913,7 +936,7 @@ fun MapScreen(
                         )
                     }
                 }
-            } else if (!uiState.isLoadingFeed && uiState.errorMessage == null) {
+            } else if (uiState.settings.hasSelectedLine && !uiState.isLoadingFeed && uiState.errorMessage == null) {
                 MapOverlayGlassPill(
                     isLightBasemap = isLightBasemap,
                     modifier = Modifier.padding(horizontal = 16.dp),
@@ -930,7 +953,11 @@ fun MapScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Nessun mezzo attivo ora sulla linea ${uiState.settings.selectedLine}",
+                            text = if (uiState.settings.hideInactiveOnMap && uiState.lineVehicles.isNotEmpty()) {
+                                "${uiState.lineVehicles.size} mezzi in deposito o fermi nascosti"
+                            } else {
+                                "Nessun mezzo attivo ora sulla linea ${uiState.settings.selectedLine}"
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = TextBody,
                         )
@@ -996,7 +1023,7 @@ fun MapScreen(
         }
     }
 
-    if (showAlertsDialog) {
+    if (showAlertsDialog && uiState.settings.showServiceAlerts) {
         GttAlertsDialog(
             selectedLine = uiState.settings.selectedLine,
             lineAlerts = uiState.lineAlerts,

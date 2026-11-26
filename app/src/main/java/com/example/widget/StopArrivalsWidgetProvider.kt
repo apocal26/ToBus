@@ -228,7 +228,9 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
                     repo.fetchLiveVehicles(
                         includeSecondaryFeeds = false,
                         widgetFastMode = true,
-                        focusLine = primaryFocusLine,
+                        focusLine = primaryFocusLine.takeIf { it.isNotBlank() },
+                        dataSourceMode = settings.dataSourceMode,
+                        includeAlerts = false,
                     ).getOrNull()
                 } ?: cached
             } else {

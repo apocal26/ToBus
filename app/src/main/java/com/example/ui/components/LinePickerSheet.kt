@@ -192,6 +192,7 @@ fun LinePickerSheet(
     onSearchStops: (String) -> Unit,
     onSelectStop: (StopSearchEntry) -> Unit,
     onDismiss: () -> Unit,
+    isInitialSetup: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     var activeTab by remember { mutableStateOf(PickerTab.LINES) }
@@ -266,13 +267,13 @@ fun LinePickerSheet(
     val linesListState = rememberLazyListState()
     val stopListState = rememberLazyListState()
 
-    BackHandler(onBack = latestOnDismiss)
+    BackHandler(enabled = !isInitialSetup, onBack = latestOnDismiss)
 
     Box(
         modifier = modifier.fillMaxSize(),
         contentAlignment = Alignment.BottomCenter,
     ) {
-        // Clickable scrim behind sheet (absorbs map touches)
+        // Clickable scrim behind sheet (absorbs map touches; non-dismissible during initial line choice)
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -280,6 +281,7 @@ fun LinePickerSheet(
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
+                    enabled = !isInitialSetup,
                     onClick = latestOnDismiss,
                 ),
         )
@@ -309,38 +311,48 @@ fun LinePickerSheet(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(SheetHeaderTopWash, SheetTopShape)
-                    .pointerInput(dismissThresholdPx) {
-                        detectVerticalDragGestures(
-                            onVerticalDrag = { _, dragAmount ->
-                                val next = (headerDragOffsetY.value + dragAmount).coerceAtLeast(0f)
-                                sheetScope.launch { headerDragOffsetY.snapTo(next) }
-                            },
-                            onDragEnd = {
-                                if (headerDragOffsetY.value >= dismissThresholdPx) {
-                                    latestOnDismiss()
-                                } else {
-                                    sheetScope.launch {
-                                        headerDragOffsetY.animateTo(0f, animationSpec = glassSpring())
-                                    }
-                                }
-                            },
-                            onDragCancel = {
-                                sheetScope.launch {
-                                    headerDragOffsetY.animateTo(0f, animationSpec = glassSpring())
-                                }
-                            },
-                        )
-                    }
+                    .then(
+                        if (!isInitialSetup) {
+                            Modifier.pointerInput(dismissThresholdPx) {
+                                detectVerticalDragGestures(
+                                    onVerticalDrag = { _, dragAmount ->
+                                        val next = (headerDragOffsetY.value + dragAmount).coerceAtLeast(0f)
+                                        sheetScope.launch { headerDragOffsetY.snapTo(next) }
+                                    },
+                                    onDragEnd = {
+                                        if (headerDragOffsetY.value >= dismissThresholdPx) {
+                                            latestOnDismiss()
+                                        } else {
+                                            sheetScope.launch {
+                                                headerDragOffsetY.animateTo(0f, animationSpec = glassSpring())
+                                            }
+                                        }
+                                    },
+                                    onDragCancel = {
+                                        sheetScope.launch {
+                                            headerDragOffsetY.animateTo(0f, animationSpec = glassSpring())
+                                        }
+                                    },
+                                )
+                            }
+                        } else {
+                            Modifier
+                        },
+                    )
                     .padding(horizontal = 20.dp, vertical = 12.dp),
             ) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.CenterHorizontally)
-                        .padding(bottom = 10.dp)
-                        .width(40.dp)
-                        .height(4.dp)
-                        .background(Color(0x45FFFFFF), CircleShape),
-                )
+                if (!isInitialSetup) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterHorizontally)
+                            .padding(bottom = 10.dp)
+                            .width(40.dp)
+                            .height(4.dp)
+                            .background(Color(0x45FFFFFF), CircleShape),
+                    )
+                } else {
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -348,23 +360,32 @@ fun LinePickerSheet(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = if (activeTab == PickerTab.LINES) "Linea GTT" else "Cerca Fermata",
+                            text = when {
+                                isInitialSetup && activeTab == PickerTab.LINES -> "Scegli la tua linea"
+                                activeTab == PickerTab.LINES -> "Linea GTT"
+                                else -> "Cerca Fermata"
+                            },
                             style = MaterialTheme.typography.headlineMedium,
                             color = TextHero,
                         )
                         Spacer(modifier = Modifier.height(3.dp))
                         Text(
                             text = if (activeTab == PickerTab.LINES) {
-                                if (stableActiveLines.isNotEmpty()) {
-                                    "${stableActiveLines.size} linee attive ora su Torino"
-                                } else {
-                                    "Cerca o inserisci il numero della linea"
+                                when {
+                                    isInitialSetup && stableActiveLines.isNotEmpty() ->
+                                        "${stableActiveLines.size} linee attive ora · usata su mappa e widget"
+                                    isInitialSetup ->
+                                        "Seleziona la linea da seguire su mappa e widget"
+                                    stableActiveLines.isNotEmpty() ->
+                                        "${stableActiveLines.size} linee attive ora su Torino"
+                                    else ->
+                                        "Cerca o inserisci il numero della linea"
                                 }
                             } else {
                                 if (stopQuery.isBlank() && userLocation != null) {
                                     "Paline più vicine con linee e direzione"
                                 } else if (stopQuery.isBlank()) {
-                                    "Scrivi nome, #palina o anche la linea (es. Porta Nuova 12)"
+                                    "Scrivi nome, #palina o anche la linea (es. Porta Nuova 4)"
                                 } else {
                                     "Ogni risultato mostra #palina, direzione e linee"
                                 }
@@ -375,12 +396,14 @@ fun LinePickerSheet(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    GlassCircleIconButton(
-                        icon = Icons.Rounded.Close,
-                        contentDescription = stringResource(R.string.cd_close),
-                        onClick = latestOnDismiss,
-                        modifier = Modifier.testTag("close_line_picker_button"),
-                    )
+                    if (!isInitialSetup) {
+                        GlassCircleIconButton(
+                            icon = Icons.Rounded.Close,
+                            contentDescription = stringResource(R.string.cd_close),
+                            onClick = latestOnDismiss,
+                            modifier = Modifier.testTag("close_line_picker_button"),
+                        )
+                    }
                 }
             }
 
@@ -554,15 +577,29 @@ fun LinePickerSheet(
                             .weight(1f),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Text(
-                            text = if (stableActiveLines.isEmpty()) {
-                                "Caricamento linee dai feed GTT…"
-                            } else {
-                                "Nessuna linea attiva per \"$cleanedLineQuery\""
-                            },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = TextSubtitle,
-                        )
+                        if (cleanedLineQuery.isEmpty()) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = AccentGold,
+                                )
+                                Text(
+                                    text = "Caricamento linee attive GTT…",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = TextSubtitle,
+                                )
+                            }
+                        } else {
+                            Text(
+                                text = "Nessuna linea attiva per \"$cleanedLineQuery\"",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextSubtitle,
+                            )
+                        }
                     }
                 } else {
                     BoxWithConstraints(

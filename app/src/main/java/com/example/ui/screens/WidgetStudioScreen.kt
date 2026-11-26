@@ -30,6 +30,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
@@ -62,8 +63,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.BuildConfig
 import com.example.R
+import com.example.data.model.DataSourceMode
 import com.example.data.model.FavoriteStop
 import com.example.data.model.GttFleetAnalyzer
+import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
 import com.example.data.model.StopArrival
@@ -85,6 +88,7 @@ import com.example.ui.glass.rememberGlassShimmerBrush
 import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
+import com.example.ui.theme.AccentRed
 import com.example.ui.theme.DarkInkOnAccent
 import com.example.ui.theme.GlassBandBorder
 import com.example.ui.theme.GlassPillBorder
@@ -120,6 +124,11 @@ fun WidgetStudioScreen(
     onToggleRouteLine: (Boolean) -> Unit,
     onToggleColorByDirection: (Boolean) -> Unit,
     onToggleHideInactiveInWidget: (Boolean) -> Unit,
+    onToggleHideInactiveOnMap: (Boolean) -> Unit = {},
+    onToggleShowServiceAlerts: (Boolean) -> Unit = {},
+    onToggleKeepScreenOn: (Boolean) -> Unit = {},
+    onSelectDataSourceMode: (DataSourceMode) -> Unit = {},
+    onSelectLivePollInterval: (LivePollInterval) -> Unit = {},
     onSelectRefreshInterval: (RefreshInterval) -> Unit,
     onSelectPreviewSize: (WidgetPreviewSize) -> Unit,
     onSyncWidgetNow: () -> Unit,
@@ -128,6 +137,7 @@ fun WidgetStudioScreen(
     onRemoveFavoriteStop: (String) -> Unit,
     onCheckUpdates: () -> Unit = {},
     onSaveGithubRepo: (String) -> Unit = {},
+    onClearAppCaches: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -257,6 +267,11 @@ fun WidgetStudioScreen(
                         onToggleRouteLine = onToggleRouteLine,
                         onToggleColorByDirection = onToggleColorByDirection,
                         onToggleHideInactiveInWidget = onToggleHideInactiveInWidget,
+                        onToggleHideInactiveOnMap = onToggleHideInactiveOnMap,
+                        onToggleShowServiceAlerts = onToggleShowServiceAlerts,
+                        onToggleKeepScreenOn = onToggleKeepScreenOn,
+                        onSelectDataSourceMode = onSelectDataSourceMode,
+                        onSelectLivePollInterval = onSelectLivePollInterval,
                         onSelectRefreshInterval = onSelectRefreshInterval,
                         onOpenFavoriteStop = onOpenFavoriteStop,
                         onRemoveFavoriteStop = onRemoveFavoriteStop,
@@ -268,6 +283,7 @@ fun WidgetStudioScreen(
                             }
                         },
                         onEditGithubRepo = { showGithubRepoDialog = true },
+                        onClearAppCaches = onClearAppCaches,
                     )
                     Spacer(modifier = Modifier.height(20.dp))
                 }
@@ -311,6 +327,11 @@ fun WidgetStudioScreen(
                         onToggleRouteLine = onToggleRouteLine,
                         onToggleColorByDirection = onToggleColorByDirection,
                         onToggleHideInactiveInWidget = onToggleHideInactiveInWidget,
+                        onToggleHideInactiveOnMap = onToggleHideInactiveOnMap,
+                        onToggleShowServiceAlerts = onToggleShowServiceAlerts,
+                        onToggleKeepScreenOn = onToggleKeepScreenOn,
+                        onSelectDataSourceMode = onSelectDataSourceMode,
+                        onSelectLivePollInterval = onSelectLivePollInterval,
                         onSelectRefreshInterval = onSelectRefreshInterval,
                         onOpenFavoriteStop = onOpenFavoriteStop,
                         onRemoveFavoriteStop = onRemoveFavoriteStop,
@@ -322,6 +343,7 @@ fun WidgetStudioScreen(
                             }
                         },
                         onEditGithubRepo = { showGithubRepoDialog = true },
+                        onClearAppCaches = onClearAppCaches,
                     )
                     Spacer(modifier = Modifier.height(bottomNavClearance + 16.dp))
                 }
@@ -349,7 +371,11 @@ private fun StudioTopBar(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "Linea $lineCode · Widget Home e mappa",
+                text = if (lineCode.isNotBlank()) {
+                    "Linea $lineCode · Widget Home e mappa"
+                } else {
+                    "Widget Home e mappa Torino"
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextSubtitle,
                 maxLines = 1,
@@ -509,7 +535,7 @@ private fun LiveWidgetShowcaseBand(
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
-                                text = uiState.settings.selectedLine,
+                                text = uiState.settings.selectedLine.ifBlank { "—" },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = DarkInkOnAccent,
                             )
@@ -973,11 +999,17 @@ private fun WidgetControlsColumn(
     onToggleRouteLine: (Boolean) -> Unit,
     onToggleColorByDirection: (Boolean) -> Unit,
     onToggleHideInactiveInWidget: (Boolean) -> Unit,
+    onToggleHideInactiveOnMap: (Boolean) -> Unit,
+    onToggleShowServiceAlerts: (Boolean) -> Unit,
+    onToggleKeepScreenOn: (Boolean) -> Unit,
+    onSelectDataSourceMode: (DataSourceMode) -> Unit,
+    onSelectLivePollInterval: (LivePollInterval) -> Unit,
     onSelectRefreshInterval: (RefreshInterval) -> Unit,
     onOpenFavoriteStop: (FavoriteStop) -> Unit,
     onRemoveFavoriteStop: (String) -> Unit,
     onCheckUpdates: () -> Unit,
     onEditGithubRepo: () -> Unit,
+    onClearAppCaches: () -> Unit,
 ) {
     val settings = uiState.settings
 
@@ -1011,7 +1043,11 @@ private fun WidgetControlsColumn(
                 Spacer(modifier = Modifier.width(12.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Linea ${settings.selectedLine}",
+                        text = if (settings.hasSelectedLine) {
+                            "Linea ${settings.selectedLine}"
+                        } else {
+                            "Nessuna linea selezionata"
+                        },
                         style = MaterialTheme.typography.titleLarge,
                         color = TextPrimary,
                     )
@@ -1029,6 +1065,7 @@ private fun WidgetControlsColumn(
                     }
                     Text(
                         text = when {
+                            !settings.hasSelectedLine -> "Scegli una linea per iniziare"
                             uiState.lineVehicles.isEmpty() -> "Nessun mezzo attivo ora"
                             activeReliableCount == 0 -> "${uiState.lineVehicles.size} in deposito o fermi · ${uiState.onlineSourcesCount} fonti"
                             activeReliableCount == 1 -> "1 pullman attivo · ${uiState.onlineSourcesCount} fonti"
@@ -1045,10 +1082,116 @@ private fun WidgetControlsColumn(
                         .padding(horizontal = 14.dp, vertical = 8.dp),
                 ) {
                     Text(
-                        text = "Cambia",
+                        text = if (settings.hasSelectedLine) "Cambia" else "Scegli",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextPrimary,
                     )
+                }
+            }
+        }
+    }
+
+    // 1a. Live Data Source Mode Selector (Auto Multi-source vs Fixed Source)
+    GlassBand {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AccentIconBadge(
+                icon = ToBusIcons.Sensors,
+                accent = if (settings.dataSourceMode.isFixed) AccentGold else AccentCyan,
+                size = 40.dp,
+                iconSize = 20.dp,
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Fonte dati live",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TextHero,
+                )
+                Text(
+                    text = if (settings.dataSourceMode.isFixed) {
+                        "Fonte fissa · nessun fallback automatico"
+                    } else {
+                        "Multi-fonte intelligente con fallback"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSubtitle,
+                )
+            }
+            val badgeAccent = if (settings.dataSourceMode.isFixed) AccentGold else AccentEmerald
+            Box(
+                modifier = Modifier
+                    .background(badgeAccent.copy(alpha = 0.16f), RoundedCornerShape(999.dp))
+                    .border(1.dp, badgeAccent.copy(alpha = 0.42f), RoundedCornerShape(999.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+            ) {
+                Text(
+                    text = if (settings.dataSourceMode.isFixed) "Fissa" else "Auto",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = badgeAccent,
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        val modes = DataSourceMode.entries
+        SlidingGlassSegmentedControl(
+            items = modes,
+            selectedIndex = modes.indexOf(settings.dataSourceMode).coerceAtLeast(0),
+            labelProvider = { it.shortLabelIt },
+            onSelect = { _, item -> onSelectDataSourceMode(item) },
+            tagPrefix = "data_source_mode",
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(GlassRowFill, RoundedCornerShape(14.dp))
+                .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = settings.dataSourceMode.descriptionIt,
+                style = MaterialTheme.typography.bodySmall,
+                color = TextBody,
+            )
+            val vehicleStatuses = remember(uiState.sourceStatuses) {
+                uiState.sourceStatuses.filter {
+                    it.id == "mato_live" || it.id == "gtt_official" || it.id == "busone_proxy"
+                }
+            }
+            if (vehicleStatuses.isNotEmpty()) {
+                HorizontalDivider(color = GlassBandBorder)
+                vehicleStatuses.forEach { st ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .background(
+                                    color = if (st.isOnline) AccentEmerald else AccentRed,
+                                    shape = CircleShape,
+                                ),
+                        )
+                        Text(
+                            text = st.name,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TextPrimary,
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        Text(
+                            text = st.detail,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextSubtitle,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
         }
@@ -1253,10 +1396,10 @@ private fun WidgetControlsColumn(
         }
     }
 
-    // 4. Visual Details
+    // 4. Visual Details & Map Experience
     GlassBand {
         Text(
-            text = "Dettagli grafici",
+            text = "Mappa e dettagli",
             style = MaterialTheme.typography.titleMedium,
             color = TextHero,
         )
@@ -1270,11 +1413,19 @@ private fun WidgetControlsColumn(
         )
         HorizontalDivider(color = GlassBandBorder)
         GlassToggleRow(
-            title = "Nascondi mezzi in deposito o fermi",
+            title = "Nascondi mezzi fermi nel widget",
             subtitle = "Esclude dal widget bus in deposito o con GPS vecchio",
             checked = settings.hideInactiveInWidget,
             onCheckedChange = onToggleHideInactiveInWidget,
             testTag = "toggle_hide_inactive_widget",
+        )
+        HorizontalDivider(color = GlassBandBorder)
+        GlassToggleRow(
+            title = "Nascondi mezzi fermi sulla mappa",
+            subtitle = "Pulisce la mappa da bus in deposito o con GPS vecchio",
+            checked = settings.hideInactiveOnMap,
+            onCheckedChange = onToggleHideInactiveOnMap,
+            testTag = "toggle_hide_inactive_map",
         )
         HorizontalDivider(color = GlassBandBorder)
         GlassToggleRow(
@@ -1293,9 +1444,25 @@ private fun WidgetControlsColumn(
             checked = settings.colorByDirection,
             onCheckedChange = onToggleColorByDirection,
         )
+        HorizontalDivider(color = GlassBandBorder)
+        GlassToggleRow(
+            title = "Avvisi e deviazioni GTT",
+            subtitle = "Mostra il pulsante avvisi e controlla le deviazioni",
+            checked = settings.showServiceAlerts,
+            onCheckedChange = onToggleShowServiceAlerts,
+            testTag = "toggle_service_alerts",
+        )
+        HorizontalDivider(color = GlassBandBorder)
+        GlassToggleRow(
+            title = "Schermo sempre acceso sulla mappa",
+            subtitle = "Evita lo spegnimento mentre aspetti il pullman",
+            checked = settings.keepScreenOn,
+            onCheckedChange = onToggleKeepScreenOn,
+            testTag = "toggle_keep_screen_on",
+        )
     }
 
-    // 5. Battery & Auto-Refresh Cadence
+    // 5. Battery & Auto-Refresh Cadence (Live Map + Home Widget)
     GlassBand {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1314,13 +1481,34 @@ private fun WidgetControlsColumn(
                     color = TextHero,
                 )
                 Text(
-                    text = "Scegli ogni quanto aggiornare il widget sulla Home.",
+                    text = "Bilancia reattività in app e autonomia del widget.",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSubtitle,
                 )
             }
         }
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(14.dp))
+        Text(
+            text = "Mappa live in app",
+            style = MaterialTheme.typography.labelLarge,
+            color = TextPrimary,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        val liveIntervals = LivePollInterval.entries
+        SlidingGlassSegmentedControl(
+            items = liveIntervals,
+            selectedIndex = liveIntervals.indexOf(settings.livePollInterval).coerceAtLeast(0),
+            labelProvider = { it.labelIt },
+            onSelect = { _, item -> onSelectLivePollInterval(item) },
+            tagPrefix = "live_poll_interval",
+        )
+        Spacer(modifier = Modifier.height(14.dp))
+        Text(
+            text = "Widget sulla Home",
+            style = MaterialTheme.typography.labelLarge,
+            color = TextPrimary,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
         val intervals = RefreshInterval.entries
         SlidingGlassSegmentedControl(
             items = intervals,
@@ -1331,7 +1519,7 @@ private fun WidgetControlsColumn(
         )
     }
 
-    // 6. Lightweight Daily GitHub Updates (zero background services)
+    // 6. Lightweight Daily GitHub Updates & Cache Maintenance (zero background services)
     GlassBand {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1394,6 +1582,48 @@ private fun WidgetControlsColumn(
                     .padding(vertical = 4.dp)
                     .testTag("edit_github_repo_button"),
             )
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+        HorizontalDivider(color = GlassBandBorder)
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AccentIconBadge(
+                icon = Icons.Rounded.Delete,
+                accent = AccentGold,
+                size = 40.dp,
+                iconSize = 19.dp,
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Cache percorsi e linee",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary,
+                )
+                Text(
+                    text = "Ricarica tracciati e fermate GTT aggiornati",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSubtitle,
+                )
+            }
+            val clearInt = remember { MutableInteractionSource() }
+            Box(
+                modifier = Modifier
+                    .glassInteractive(clearInt, enableHoverScale = false, onClick = onClearAppCaches)
+                    .background(GlassPillFill, RoundedCornerShape(999.dp))
+                    .border(1.dp, GlassPillBorder, RoundedCornerShape(999.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .testTag("clear_cache_button"),
+            ) {
+                Text(
+                    text = "Svuota",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextPrimary,
+                )
+            }
         }
     }
 }

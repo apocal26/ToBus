@@ -20,6 +20,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -155,8 +156,20 @@ fun ToBusApp(
     val lifecycleOwner = LocalLifecycleOwner.current
     var isForegroundActive by remember { mutableStateOf(true) }
     var currentTab by rememberSaveable { mutableStateOf(AppDestination.MAP) }
-    var showLinePicker by rememberSaveable { mutableStateOf(false) }
+    var showLinePicker by rememberSaveable { mutableStateOf(!uiState.settings.hasSelectedLine) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val rootView = LocalView.current
+    val shouldKeepScreenOn = uiState.settings.keepScreenOn &&
+        currentTab == AppDestination.MAP &&
+        isForegroundActive &&
+        !showLinePicker
+
+    DisposableEffect(rootView, shouldKeepScreenOn) {
+        rootView.keepScreenOn = shouldKeepScreenOn
+        onDispose {
+            rootView.keepScreenOn = false
+        }
+    }
 
     LaunchedEffect(pendingOpenStopId) {
         val targetStopId = pendingOpenStopId ?: return@LaunchedEffect
@@ -356,6 +369,11 @@ fun ToBusApp(
                             onToggleRouteLine = viewModel::setShowRouteLine,
                             onToggleColorByDirection = viewModel::setColorByDirection,
                             onToggleHideInactiveInWidget = viewModel::setHideInactiveInWidget,
+                            onToggleHideInactiveOnMap = viewModel::setHideInactiveOnMap,
+                            onToggleShowServiceAlerts = viewModel::setShowServiceAlerts,
+                            onToggleKeepScreenOn = viewModel::setKeepScreenOn,
+                            onSelectDataSourceMode = viewModel::setDataSourceMode,
+                            onSelectLivePollInterval = viewModel::setLivePollInterval,
                             onSelectRefreshInterval = viewModel::setRefreshInterval,
                             onSelectPreviewSize = viewModel::setPreviewSize,
                             onSyncWidgetNow = viewModel::triggerHomeWidgetSync,
@@ -367,6 +385,7 @@ fun ToBusApp(
                             onRemoveFavoriteStop = viewModel::removeFavoriteStop,
                             onCheckUpdates = viewModel::checkForUpdatesManually,
                             onSaveGithubRepo = viewModel::saveGithubRepoSlug,
+                            onClearAppCaches = viewModel::clearAppCaches,
                         )
                     }
                 }
@@ -430,6 +449,7 @@ fun ToBusApp(
         ) {
             LinePickerHost(
                 viewModel = viewModel,
+                isInitialSetup = !uiState.settings.hasSelectedLine,
                 onSelectStop = selectSearchedStop,
                 onDismiss = closeLinePicker,
             )
@@ -463,6 +483,7 @@ fun ToBusApp(
 @Composable
 private fun LinePickerHost(
     viewModel: ToBusViewModel,
+    isInitialSetup: Boolean,
     onSelectStop: (com.example.data.model.StopSearchEntry) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -479,6 +500,7 @@ private fun LinePickerHost(
         onSearchStops = viewModel::searchStops,
         onSelectStop = onSelectStop,
         onDismiss = onDismiss,
+        isInitialSetup = isInitialSetup,
     )
 }
 

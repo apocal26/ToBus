@@ -17,9 +17,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.model.BusVehicle
 import com.example.data.model.CameraState
+import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.FavoriteStop
 import com.example.data.model.LineSummary
+import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
 import com.example.data.model.RoutePattern
@@ -84,7 +86,7 @@ data class CameraFlyRequest(
 
 @androidx.compose.runtime.Immutable
 data class LinePickerUiState(
-    val selectedLine: String = "4",
+    val selectedLine: String = "",
     val activeLines: List<LineSummary> = emptyList(),
     val favoriteLines: List<String> = emptyList(),
     val stopSearchResults: List<StopSearchEntry> = emptyList(),
@@ -238,7 +240,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingCenterOnNextFix: Boolean = false
 
     init {
-        loadRouteGeometry(_uiState.value.settings.selectedLine)
+        if (initialSettings.hasSelectedLine) {
+            loadRouteGeometry(initialSettings.selectedLine)
+        }
         // Hydrate active line list immediately from tiny disk cache (~1.5 KB) for instant Line Picker
         // before the first live HTTP poll completes.
         viewModelScope.launch(Dispatchers.IO) {
@@ -289,12 +293,16 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun setForegroundActive(active: Boolean) {
         if (active) {
-            // Re-arm periodic widget updates off main thread so ON_START never blocks on Binder IPC
-            val interval = _uiState.value.settings.refreshInterval
+            val currentSettings = _uiState.value.settings
+            val interval = currentSettings.refreshInterval
             viewModelScope.launch(Dispatchers.IO) {
                 BusMapWidgetProvider.schedulePeriodicUpdates(appContext, interval)
             }
-            repository.startMatoLiveStream(_uiState.value.settings.selectedLine) { onMatoLivePush() }
+            if (currentSettings.hasSelectedLine && GttRealtimeRepository.shouldRunMatoStream(currentSettings.dataSourceMode)) {
+                repository.startMatoLiveStream(currentSettings.selectedLine) { onMatoLivePush() }
+            } else {
+                repository.stopMatoLiveStream()
+            }
             startForegroundJobs()
             if (_uiState.value.isUserLocationEnabled && hasLocationPermission()) {
                 startLocationUpdates(centerOnNextFix = false)
@@ -560,12 +568,13 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     val startMs = System.currentTimeMillis()
                     lastPollElapsedMs = startMs
                     while (isActive) {
+                        val pollIntervalMs = _uiState.value.settings.livePollInterval.millis
                         val elapsed = System.currentTimeMillis() - startMs
                         if (!isLinePickerOpen) {
-                            val progress = (elapsed.toFloat() / POLL_INTERVAL_MS.toFloat()).coerceIn(0f, 1f)
+                            val progress = (elapsed.toFloat() / pollIntervalMs.toFloat()).coerceIn(0f, 1f)
                             _pollProgress.value = progress
                         }
-                        if (elapsed >= POLL_INTERVAL_MS) break
+                        if (elapsed >= pollIntervalMs) break
                         delay(1000L)
                     }
                 }
@@ -602,27 +611,39 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             // Ensure route geometry retries automatically if initial fetch hadn't completed yet
-            val currentLine = _uiState.value.settings.selectedLine
-            if (_uiState.value.routePatterns.isEmpty() && routeLoadJob?.isActive != true) {
+            val settingsBeforeFetch = _uiState.value.settings
+            val currentLine = settingsBeforeFetch.selectedLine.trim().uppercase()
+            if (currentLine.isNotEmpty() && _uiState.value.routePatterns.isEmpty() && routeLoadJob?.isActive != true) {
                 loadRouteGeometry(currentLine)
             }
 
             val result = repository.fetchLiveVehicles(
                 includeSecondaryFeeds = true,
-                focusLine = currentLine,
+                focusLine = currentLine.takeIf { it.isNotEmpty() },
+                dataSourceMode = settingsBeforeFetch.dataSourceMode,
+                includeAlerts = settingsBeforeFetch.showServiceAlerts,
             )
             result.fold(
                 onSuccess = { snapshot ->
                     val currentSettings = _uiState.value.settings
                     val line = currentSettings.selectedLine.trim().uppercase()
-                    val filtered = snapshot.allVehicles
-                        .filter {
-                            it.lineCode.equals(line, ignoreCase = true) ||
-                                it.rawRouteId.equals(line, ignoreCase = true)
-                        }
-                        .sortedBy { it.vehicleId }
+                    val filtered = if (line.isEmpty()) {
+                        emptyList()
+                    } else {
+                        snapshot.allVehicles
+                            .filter {
+                                it.lineCode.equals(line, ignoreCase = true) ||
+                                    it.rawRouteId.equals(line, ignoreCase = true)
+                            }
+                            .sortedBy { it.vehicleId }
+                    }
 
-                    val lineAlerts = filterAlertsForLine(snapshot.alerts, line)
+                    val effectiveAlerts = if (currentSettings.showServiceAlerts) snapshot.alerts else emptyList()
+                    val lineAlerts = if (line.isEmpty() || !currentSettings.showServiceAlerts) {
+                        emptyList()
+                    } else {
+                        filterAlertsForLine(effectiveAlerts, line)
+                    }
 
                     val nextCamera = if (!hasAutoCenteredCurrentLine && filtered.isNotEmpty()) {
                         hasAutoCenteredCurrentLine = true
@@ -647,11 +668,18 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                         val keepSelected = state.selectedVehicleId?.takeIf { id ->
                             filtered.any { it.vehicleId == id } || updatedExternal?.vehicleId == id
                         }
+                        val nextActiveLines = if (
+                            snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1
+                        ) {
+                            state.allActiveLines
+                        } else {
+                            snapshot.availableLines
+                        }
                         state.copy(
                             lineVehicles = filtered,
-                            allActiveLines = snapshot.availableLines,
+                            allActiveLines = nextActiveLines,
                             sourceStatuses = snapshot.sourceStatuses,
-                            allAlerts = snapshot.alerts,
+                            allAlerts = effectiveAlerts,
                             lineAlerts = lineAlerts,
                             camera = nextCamera,
                             selectedVehicleId = keepSelected,
@@ -671,7 +699,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     // Once live vehicles with tripIds arrive on this line, verify route geometry against
                     // the live tripIds so active Sunday/holiday detours match the street immediately!
                     val liveTripIds = filtered.mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }.toSet()
-                    if (liveTripIds.isNotEmpty() && hasVerifiedLiveRouteForLine != line && routeLoadJob?.isActive != true) {
+                    if (line.isNotEmpty() && liveTripIds.isNotEmpty() && hasVerifiedLiveRouteForLine != line && routeLoadJob?.isActive != true) {
                         hasVerifiedLiveRouteForLine = line
                         loadRouteGeometry(line, activeTripIds = liveTripIds, forceRefresh = true)
                     }
@@ -713,14 +741,22 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun onMatoLivePush() {
+        val currentSettingsBefore = _uiState.value.settings
+        if (!currentSettingsBefore.hasSelectedLine ||
+            !GttRealtimeRepository.shouldRunMatoStream(currentSettingsBefore.dataSourceMode)
+        ) {
+            return
+        }
         if (isLinePickerOpen) {
             pendingMatoSyncOnPickerClose = true
             return
         }
         viewModelScope.launch(Dispatchers.Default) {
-            val snapshot = repository.getLiveMatoOverlaySnapshot() ?: return@launch
             val currentSettings = _uiState.value.settings
+            if (!GttRealtimeRepository.shouldRunMatoStream(currentSettings.dataSourceMode)) return@launch
+            val snapshot = repository.getLiveMatoOverlaySnapshot(currentSettings.dataSourceMode) ?: return@launch
             val line = currentSettings.selectedLine.trim().uppercase()
+            if (line.isEmpty()) return@launch
             val filtered = snapshot.allVehicles
                 .filter {
                     it.lineCode.equals(line, ignoreCase = true) ||
@@ -738,9 +774,16 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 val keepSelected = state.selectedVehicleId?.takeIf { id ->
                     filtered.any { it.vehicleId == id } || updatedExternal?.vehicleId == id
                 }
+                val nextActiveLines = if (
+                    snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1
+                ) {
+                    state.allActiveLines
+                } else {
+                    snapshot.availableLines
+                }
                 state.copy(
                     lineVehicles = filtered,
-                    allActiveLines = snapshot.availableLines,
+                    allActiveLines = nextActiveLines,
                     sourceStatuses = snapshot.sourceStatuses,
                     selectedVehicleId = keepSelected,
                     focusedExternalVehicle = if (keepSelected != null && updatedExternal?.vehicleId == keepSelected) updatedExternal else null,
@@ -761,7 +804,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     fun selectLine(lineCode: String) {
         val cleaned = lineCode.trim().uppercase().ifBlank { return }
         val updated = preferences.updateSettings { it.copy(selectedLine = cleaned) }
-        repository.updateMatoLiveLine(cleaned)
+        if (GttRealtimeRepository.shouldRunMatoStream(updated.dataSourceMode)) {
+            repository.startMatoLiveStream(cleaned) { onMatoLivePush() }
+            repository.updateMatoLiveLine(cleaned)
+        } else {
+            repository.stopMatoLiveStream()
+        }
         hasAutoCenteredCurrentLine = false
         needsRouteRefit = true
         hasVerifiedLiveRouteForLine = null
@@ -775,8 +823,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             ?.sortedBy { it.vehicleId }
             .orEmpty()
 
-        val allAlerts = cachedSnapshot?.alerts.orEmpty()
-        val lineAlerts = filterAlertsForLine(allAlerts, cleaned)
+        val allAlerts = if (updated.showServiceAlerts) cachedSnapshot?.alerts.orEmpty() else emptyList()
+        val lineAlerts = if (updated.showServiceAlerts) filterAlertsForLine(allAlerts, cleaned) else emptyList()
 
         val nextCamera = if (filtered.isNotEmpty()) {
             hasAutoCenteredCurrentLine = true
@@ -812,8 +860,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
         loadRouteGeometry(cleaned)
         resolveMissingVehicleStopNames(filtered)
+        if (filtered.isEmpty() || updated.dataSourceMode == DataSourceMode.MATO_LIVE) {
+            refreshLiveData(isInitial = false)
+        }
         regenerateWidgetPreview()
-        requestWidgetUpdatesAsync(includeStops = false)
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = false)
     }
 
     private fun filterAlertsForLine(
@@ -1177,6 +1228,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
      * and loads its real-time arrivals without cluttering or unexpectedly replacing the active line.
      */
     fun openSearchedStop(entry: StopSearchEntry) {
+        if (!_uiState.value.settings.hasSelectedLine) {
+            val inferredLine = entry.lines.firstOrNull { it.isNotBlank() }
+            if (inferredLine != null) {
+                selectLine(inferredLine)
+            }
+        }
         val state = _uiState.value
         val baseStop = entry.toTransitStop(directionId = 0)
         val resolvedDirOnCurrentLine = GttRealtimeRepository.resolveStopDirectionOnLinePatterns(
@@ -1385,6 +1442,82 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         val updated = preferences.updateSettings { it.copy(refreshInterval = interval) }
         _uiState.update { it.copy(settings = updated) }
         requestWidgetUpdatesAsync(includeMap = true, rescheduleInterval = interval)
+    }
+
+    fun setDataSourceMode(mode: DataSourceMode) {
+        val previous = _uiState.value.settings.dataSourceMode
+        if (previous == mode) return
+        val updated = preferences.updateSettings { it.copy(dataSourceMode = mode) }
+        if (updated.hasSelectedLine && GttRealtimeRepository.shouldRunMatoStream(mode)) {
+            repository.startMatoLiveStream(updated.selectedLine) { onMatoLivePush() }
+        } else {
+            repository.stopMatoLiveStream()
+        }
+        consecutivePollFailures = 0
+        _uiState.update {
+            it.copy(
+                settings = updated,
+                errorMessage = null,
+                statusToast = if (mode == DataSourceMode.AUTO) {
+                    "Fonte dati: Automatico (multi-fonte)"
+                } else {
+                    "Fonte fissa: ${mode.labelIt}"
+                },
+            )
+        }
+        refreshLiveData(isInitial = false)
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = false)
+    }
+
+    fun setLivePollInterval(interval: LivePollInterval) {
+        val updated = preferences.updateSettings { it.copy(livePollInterval = interval) }
+        _uiState.update {
+            it.copy(
+                settings = updated,
+                statusToast = "Aggiornamento mappa ogni ${interval.labelIt}",
+            )
+        }
+    }
+
+    fun setKeepScreenOn(enabled: Boolean) {
+        val updated = preferences.updateSettings { it.copy(keepScreenOn = enabled) }
+        _uiState.update { it.copy(settings = updated) }
+    }
+
+    fun setShowServiceAlerts(enabled: Boolean) {
+        val updated = preferences.updateSettings { it.copy(showServiceAlerts = enabled) }
+        _uiState.update { state ->
+            state.copy(
+                settings = updated,
+                allAlerts = if (enabled) state.allAlerts else emptyList(),
+                lineAlerts = if (enabled) state.lineAlerts else emptyList(),
+            )
+        }
+        if (enabled) {
+            refreshLiveData(isInitial = false)
+        }
+    }
+
+    fun setHideInactiveOnMap(hide: Boolean) {
+        val updated = preferences.updateSettings { it.copy(hideInactiveOnMap = hide) }
+        _uiState.update { it.copy(settings = updated) }
+    }
+
+    fun clearAppCaches() {
+        viewModelScope.launch {
+            repository.clearLocalCaches()
+            hasVerifiedLiveRouteForLine = null
+            val currentLine = _uiState.value.settings.selectedLine.trim().uppercase()
+            _uiState.update {
+                it.copy(
+                    statusToast = "Cache svuotata · percorsi ricaricati",
+                )
+            }
+            if (currentLine.isNotEmpty()) {
+                loadRouteGeometry(currentLine, forceRefresh = true)
+            }
+            refreshLiveData(isInitial = false)
+        }
     }
 
     fun setPreviewSize(size: WidgetPreviewSize) {

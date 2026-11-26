@@ -618,6 +618,51 @@ object ToBusIcons {
         }
     }
 
+    val Sensors: ImageVector by lazy(LazyThreadSafetyMode.NONE) {
+        icon("Sensors") {
+            path(fill = SolidColor(Color.Black)) {
+                moveTo(12f, 10f)
+                curveToRelative(-1.1f, 0f, -2f, 0.9f, -2f, 2f)
+                reflectiveCurveToRelative(0.9f, 2f, 2f, 2f)
+                reflectiveCurveToRelative(2f, -0.9f, 2f, -2f)
+                reflectiveCurveToRelative(-0.9f, -2f, -2f, -2f)
+                close()
+                moveTo(7.76f, 16.24f)
+                lineToRelative(-1.41f, 1.41f)
+                curveTo(4.9f, 16.2f, 4f, 14.2f, 4f, 12f)
+                reflectiveCurveToRelative(0.9f, -4.2f, 2.34f, -5.66f)
+                lineToRelative(1.41f, 1.41f)
+                curveTo(6.67f, 8.84f, 6f, 10.34f, 6f, 12f)
+                reflectiveCurveToRelative(0.67f, 3.16f, 1.76f, 4.24f)
+                close()
+                moveTo(16.24f, 7.76f)
+                lineToRelative(1.41f, -1.41f)
+                curveTo(19.1f, 7.8f, 20f, 9.8f, 20f, 12f)
+                reflectiveCurveToRelative(-0.9f, 4.2f, -2.34f, 5.66f)
+                lineToRelative(-1.41f, -1.41f)
+                curveTo(17.33f, 15.16f, 18f, 13.66f, 18f, 12f)
+                reflectiveCurveToRelative(-0.67f, -3.16f, -1.76f, -4.24f)
+                close()
+                moveTo(4.93f, 19.07f)
+                lineToRelative(-1.41f, 1.41f)
+                curveTo(1.34f, 18.31f, 0f, 15.31f, 0f, 12f)
+                reflectiveCurveToRelative(1.34f, -6.31f, 3.51f, -8.49f)
+                lineToRelative(1.41f, 1.41f)
+                curveTo(3.12f, 6.73f, 2f, 9.23f, 2f, 12f)
+                reflectiveCurveToRelative(1.12f, 5.27f, 2.93f, 7.07f)
+                close()
+                moveTo(19.07f, 4.93f)
+                lineToRelative(1.41f, -1.41f)
+                curveTo(22.66f, 5.69f, 24f, 8.69f, 24f, 12f)
+                reflectiveCurveToRelative(-1.34f, 6.31f, -3.51f, 8.49f)
+                lineToRelative(-1.41f, -1.41f)
+                curveTo(20.88f, 17.27f, 22f, 14.77f, 22f, 12f)
+                reflectiveCurveToRelative(-1.12f, -5.27f, -2.93f, -7.07f)
+                close()
+            }
+        }
+    }
+
     private inline fun icon(
         name: String,
         block: ImageVector.Builder.() -> Unit,

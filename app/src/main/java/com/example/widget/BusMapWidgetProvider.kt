@@ -195,6 +195,9 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             val settings = ToBusPreferences.getInstance(context).currentSettings()
             val repo = GttRealtimeRepository.getInstance(context)
             val lineCode = settings.selectedLine.trim().uppercase()
+            if (lineCode.isEmpty()) {
+                return WidgetFetchBundle(snapshot = null, fetchFailed = false, patterns = emptyList())
+            }
 
             if (useCachedOnly) {
                 val cached = repo.getLastCachedSnapshot()
@@ -217,6 +220,8 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
                             includeSecondaryFeeds = false,
                             widgetFastMode = true,
                             focusLine = lineCode,
+                            dataSourceMode = settings.dataSourceMode,
+                            includeAlerts = false,
                         )
                     }
                 }
@@ -419,15 +424,20 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             }
             val renderDensity = effectiveDensity.coerceIn(1.75f, 3.0f)
 
+            val lineCode = settings.selectedLine.trim().uppercase()
             val snapshot: LiveFeedSnapshot?
             val failed: Boolean
             val patterns: List<RoutePattern>
-            if (preloadedSnapshot != null || fetchFailed) {
+            if (lineCode.isEmpty()) {
+                snapshot = null
+                failed = false
+                patterns = emptyList()
+            } else if (preloadedSnapshot != null || fetchFailed) {
                 snapshot = preloadedSnapshot ?: repo.getLastCachedSnapshot()
                 failed = fetchFailed
                 patterns = preloadedPatterns ?: if (settings.showRouteLine) {
                     withTimeoutOrNull(2_500L) {
-                        runCatching { repo.fetchRoutePatterns(settings.selectedLine.trim().uppercase()) }
+                        runCatching { repo.fetchRoutePatterns(lineCode) }
                             .getOrDefault(emptyList())
                     }.orEmpty()
                 } else {
@@ -440,11 +450,14 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
                 patterns = bundle.patterns
             }
 
-            val lineCode = settings.selectedLine.trim().uppercase()
-            var vehicles = snapshot?.allVehicles?.filter {
-                it.lineCode.equals(lineCode, ignoreCase = true) ||
-                    it.rawRouteId.equals(lineCode, ignoreCase = true)
-            }.orEmpty()
+            var vehicles = if (lineCode.isEmpty()) {
+                emptyList()
+            } else {
+                snapshot?.allVehicles?.filter {
+                    it.lineCode.equals(lineCode, ignoreCase = true) ||
+                        it.rawRouteId.equals(lineCode, ignoreCase = true)
+                }.orEmpty()
+            }
             var effectiveTimestampMillis: Long? = snapshot?.fetchedAtMillis
             var usedDiskCacheFallback = false
 
@@ -495,9 +508,10 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
                 views.setImageViewBitmap(R.id.widget_map_image, mapBitmap)
             }
 
-            views.setTextViewText(R.id.widget_line_badge, lineCode)
+            views.setTextViewText(R.id.widget_line_badge, lineCode.ifEmpty { "—" })
 
             val statusLabel = when {
+                lineCode.isEmpty() -> if (compactVisual) "—" else "Scegli linea"
                 failed && snapshot == null && !usedDiskCacheFallback -> context.getString(R.string.widget_error)
                 compactVisual -> "$displayedVehiclesCount"
                 displayedVehiclesCount == 0 -> context.getString(R.string.widget_no_buses)

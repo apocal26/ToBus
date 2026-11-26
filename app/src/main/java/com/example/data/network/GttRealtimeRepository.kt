@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.example.data.model.BusVehicle
+import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.GeoPoint
 import com.example.data.model.LineSummary
@@ -140,29 +141,51 @@ class GttRealtimeRepository private constructor(context: Context) {
     private var preferredMatoVpQueryIdx: Int = 0
 
     fun startMatoLiveStream(lineCode: String, onFocusedUpdate: () -> Unit) {
-        lastFocusLine = lineCode.trim().uppercase().takeIf { it.isNotEmpty() }
-        matoMqttClient.start(lineCode, onFocusedUpdate)
+        val cleaned = lineCode.trim().uppercase()
+        if (cleaned.isEmpty()) return
+        lastFocusLine = cleaned
+        matoMqttClient.start(cleaned, onFocusedUpdate)
     }
 
     fun updateMatoLiveLine(lineCode: String) {
-        lastFocusLine = lineCode.trim().uppercase().takeIf { it.isNotEmpty() }
-        matoMqttClient.setFocusedLine(lineCode)
+        val cleaned = lineCode.trim().uppercase()
+        if (cleaned.isEmpty()) return
+        lastFocusLine = cleaned
+        matoMqttClient.setFocusedLine(cleaned)
     }
 
     fun stopMatoLiveStream() {
         matoMqttClient.stop()
     }
 
+    suspend fun clearLocalCaches(): Int = withContext(Dispatchers.IO) {
+        routeMemoryCache.clear()
+        stopNameMemoryCache.clear()
+        var deleted = 0
+        runCatching {
+            routeCacheDir.listFiles()?.forEach { f ->
+                if (f.isFile && f.delete()) deleted++
+            }
+        }
+        runCatching { if (activeLinesCacheFile.exists() && activeLinesCacheFile.delete()) deleted++ }
+        runCatching { if (widgetVehiclesCacheFile.exists() && widgetVehiclesCacheFile.delete()) deleted++ }
+        deleted
+    }
+
     /**
      * Fast in-memory merge of fresh MaTO MQTT live positions over the latest snapshot,
      * allowing active buses to glide smoothly on the map in real time between HTTP polls.
      */
-    fun getLiveMatoOverlaySnapshot(): LiveFeedSnapshot? {
+    fun getLiveMatoOverlaySnapshot(
+        dataSourceMode: DataSourceMode = DataSourceMode.AUTO,
+    ): LiveFeedSnapshot? {
+        if (!shouldRunMatoStream(dataSourceMode)) return null
         val nowMillis = System.currentTimeMillis()
         val matoLive = matoMqttClient.snapshotFreshVehicles(nowMillis)
         val connected = matoMqttClient.isConnected()
         if (matoLive.isEmpty() && !connected) return null
 
+        val isFixedMato = dataSourceMode == DataSourceMode.MATO_LIVE
         val base = lastSnapshot
         if (matoLive.isEmpty() && base != null) {
             // MQTT just connected before first vehicle frame arrived -> immediately reflect online status
@@ -172,9 +195,14 @@ class GttRealtimeRepository private constructor(context: Context) {
                 isOnline = true,
                 latencyMs = 0L,
                 itemCount = 0,
-                detail = "MQTT connesso",
+                detail = if (isFixedMato) "MQTT connesso · Fonte fissa" else "MQTT connesso",
             )
-            val updatedStatuses = listOf(matoStatus) + base.sourceStatuses.filterNot { it.id == "mato_live" }
+            val filteredBaseStatuses = if (isFixedMato) {
+                base.sourceStatuses.filterNot { it.id == "mato_live" || it.id == "gtt_official" || it.id == "busone_proxy" }
+            } else {
+                base.sourceStatuses.filterNot { it.id == "mato_live" }
+            }
+            val updatedStatuses = listOf(matoStatus) + filteredBaseStatuses
             val updated = base.copy(sourceStatuses = updatedStatuses)
             lastSnapshot = updated
             return updated
@@ -192,11 +220,19 @@ class GttRealtimeRepository private constructor(context: Context) {
             nowMillis = nowMillis,
         )
 
-        val gttInputs = lastGttRawVehicles.ifEmpty {
-            base?.allVehicles?.filter { it.sourceName == "GTT Ufficiale" }.orEmpty()
+        val gttInputs = if (isFixedMato) {
+            emptyList()
+        } else {
+            lastGttRawVehicles.ifEmpty {
+                base?.allVehicles?.filter { it.sourceName == "GTT Ufficiale" }.orEmpty()
+            }
         }
-        val busOneInputs = lastBusOneRawVehicles.ifEmpty {
-            base?.allVehicles?.filter { it.sourceName == "BusOne Proxy" }.orEmpty()
+        val busOneInputs = if (isFixedMato) {
+            emptyList()
+        } else {
+            lastBusOneRawVehicles.ifEmpty {
+                base?.allVehicles?.filter { it.sourceName == "BusOne Proxy" }.orEmpty()
+            }
         }
 
         val activeFocus = lastFocusLine
@@ -222,25 +258,30 @@ class GttRealtimeRepository private constructor(context: Context) {
         )
         val enriched = enrichWithTripUpdatesAndMovement(merged, lastTripUpdates, nowMillis)
 
-        val anyGtfsFrozen = sourceReports["GTT Ufficiale"]?.isFrozenForLine(activeFocus ?: "", activeFocus) == true ||
-            sourceReports["BusOne Proxy"]?.isFrozenForLine(activeFocus ?: "", activeFocus) == true
+        val anyGtfsFrozen = !isFixedMato && (
+            sourceReports["GTT Ufficiale"]?.isFrozenForLine(activeFocus ?: "", activeFocus) == true ||
+                sourceReports["BusOne Proxy"]?.isFrozenForLine(activeFocus ?: "", activeFocus) == true
+            )
         val matoStatus = DataSourceStatus(
             id = "mato_live",
             name = "MaTO Live",
             isOnline = true,
             latencyMs = 0L,
             itemCount = matoCombined.size,
-            detail = if (anyGtfsFrozen) {
-                "${matoCombined.size} mezzi · Priorità attiva"
-            } else {
-                "${matoCombined.size} mezzi · MQTT Live"
+            detail = when {
+                isFixedMato -> "${matoCombined.size} mezzi · Fonte fissa"
+                anyGtfsFrozen -> "${matoCombined.size} mezzi · Priorità attiva"
+                else -> "${matoCombined.size} mezzi · MQTT Live"
             },
         )
         val existingStatuses = base?.sourceStatuses
-            ?.filterNot { it.id == "mato_live" }
+            ?.filterNot { status ->
+                status.id == "mato_live" ||
+                    (isFixedMato && (status.id == "gtt_official" || status.id == "busone_proxy"))
+            }
             ?.map { status ->
                 val report = sourceReports[status.name]
-                if (report != null && report.isFrozenForLine(activeFocus ?: "", activeFocus)) {
+                if (!isFixedMato && report != null && report.isFrozenForLine(activeFocus ?: "", activeFocus)) {
                     status.copy(detail = "GPS fermi · fallback attivo")
                 } else {
                     status
@@ -274,10 +315,30 @@ class GttRealtimeRepository private constructor(context: Context) {
         includeSecondaryFeeds: Boolean = true,
         widgetFastMode: Boolean = false,
         focusLine: String? = null,
+        dataSourceMode: DataSourceMode = DataSourceMode.AUTO,
+        includeAlerts: Boolean = true,
     ): Result<LiveFeedSnapshot> =
         withContext(Dispatchers.IO) {
             val nowMillis = System.currentTimeMillis()
-            if (!widgetFastMode) {
+            val normFocus = focusLine?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+            if (normFocus != null) {
+                lastFocusLine = normFocus
+            }
+
+            // When no line is selected yet (initial launch), always query at least one citywide feed
+            // so the Line Picker can display all active Torino lines immediately.
+            val effectiveMode = if (normFocus == null && dataSourceMode == DataSourceMode.MATO_LIVE) {
+                DataSourceMode.AUTO
+            } else {
+                dataSourceMode
+            }
+            val useMato = shouldRunMatoStream(effectiveMode)
+            val useGtt = effectiveMode == DataSourceMode.AUTO || effectiveMode == DataSourceMode.GTT_OFFICIAL
+            val useBusOne = (effectiveMode == DataSourceMode.AUTO && (includeSecondaryFeeds || widgetFastMode)) ||
+                effectiveMode == DataSourceMode.BUSONE_PROXY
+            val allowCrossSourceFallback = effectiveMode == DataSourceMode.AUTO
+
+            if (!widgetFastMode && useMato && normFocus != null) {
                 matoMqttClient.ensureHealthyConnection(nowMillis)
             }
 
@@ -286,23 +347,27 @@ class GttRealtimeRepository private constructor(context: Context) {
             val matoGqlTimeoutMs = if (widgetFastMode) 4_800L else 6_000L
 
             coroutineScope {
-                val gttJob = async {
-                    withTimeoutOrNull(gttTimeoutMs) {
-                        fetchVehicleSource("gtt_official", "GTT Ufficiale", GTT_VP_URLS, nowMillis)
-                    } ?: VehicleSourceResult(
-                        snapshot = null,
-                        status = DataSourceStatus(
-                            id = "gtt_official",
-                            name = "GTT Ufficiale",
-                            isOnline = false,
-                            latencyMs = gttTimeoutMs,
-                            itemCount = 0,
-                            detail = "Timeout",
-                        ),
-                        error = IOException("Timeout GTT Ufficiale"),
-                    )
+                val gttJob = if (useGtt) {
+                    async {
+                        withTimeoutOrNull(gttTimeoutMs) {
+                            fetchVehicleSource("gtt_official", "GTT Ufficiale", GTT_VP_URLS, nowMillis)
+                        } ?: VehicleSourceResult(
+                            snapshot = null,
+                            status = DataSourceStatus(
+                                id = "gtt_official",
+                                name = "GTT Ufficiale",
+                                isOnline = false,
+                                latencyMs = gttTimeoutMs,
+                                itemCount = 0,
+                                detail = "Timeout",
+                            ),
+                            error = IOException("Timeout GTT Ufficiale"),
+                        )
+                    }
+                } else {
+                    null
                 }
-                val busOneJob = if (includeSecondaryFeeds || widgetFastMode) {
+                val busOneJob = if (useBusOne) {
                     async {
                         withTimeoutOrNull(busOneTimeoutMs) {
                             fetchVehicleSource("busone_proxy", "BusOne Proxy", BUSONE_VP_URLS, nowMillis)
@@ -322,12 +387,11 @@ class GttRealtimeRepository private constructor(context: Context) {
                 } else {
                     null
                 }
-                // Always query MaTO GraphQL when focusLine is set — BOTH in foreground AND in widgetFastMode!
-                // This ensures widgets and map stay live whenever GTT GTFS-RT drops a line or lags.
-                val matoGqlJob = if (!focusLine.isNullOrBlank()) {
+                // Always query MaTO GraphQL when MaTO is enabled and focusLine is set — BOTH in foreground AND widgetFastMode.
+                val matoGqlJob = if (useMato && !normFocus.isNullOrBlank()) {
                     async {
                         withTimeoutOrNull(matoGqlTimeoutMs) {
-                            fetchMatoGraphQlVehiclePositions(focusLine, nowMillis)
+                            fetchMatoGraphQlVehiclePositions(normFocus, nowMillis)
                         }.orEmpty()
                     }
                 } else {
@@ -340,7 +404,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                 } else {
                     null
                 }
-                val alertsJob = if (includeSecondaryFeeds && !widgetFastMode && nowMillis - lastAlertsFetchMillis > ALERTS_TTL_MS) {
+                val alertsJob = if (includeAlerts && includeSecondaryFeeds && !widgetFastMode && nowMillis - lastAlertsFetchMillis > ALERTS_TTL_MS) {
                     async {
                         withTimeoutOrNull(5_000L) { fetchAlertsSource() }
                     }
@@ -348,39 +412,38 @@ class GttRealtimeRepository private constructor(context: Context) {
                     null
                 }
 
-                val normFocus = focusLine?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
-                if (normFocus != null) {
-                    lastFocusLine = normFocus
-                }
-
-                val gttRes = gttJob.await()
+                val gttRes = gttJob?.await()
                 var busOneRes = busOneJob?.await()
                 var matoGqlVehicles = matoGqlJob?.await().orEmpty()
                 val tripRes = tripUpdatesJob?.await()
                 val alertsRes = alertsJob?.await()
 
-                val matoMqttVehicles = if (!widgetFastMode) {
+                val matoMqttVehicles = if (!widgetFastMode && useMato) {
                     matoMqttClient.snapshotFreshVehicles(nowMillis)
                 } else {
                     emptyList()
                 }
-                var matoCombined = mergeMultiSourceVehicles(
-                    matoVehicles = matoMqttVehicles,
-                    gttVehicles = matoGqlVehicles,
-                    busOneVehicles = emptyList(),
-                    nowMillis = nowMillis,
-                )
+                var matoCombined = if (useMato) {
+                    mergeMultiSourceVehicles(
+                        matoVehicles = matoMqttVehicles,
+                        gttVehicles = matoGqlVehicles,
+                        busOneVehicles = emptyList(),
+                        nowMillis = nowMillis,
+                    )
+                } else {
+                    emptyList()
+                }
 
-                val gttVehicles = gttRes.snapshot?.allVehicles.orEmpty()
-                var busOneVehicles = busOneRes?.snapshot?.allVehicles.orEmpty()
+                val gttVehicles = if (useGtt) gttRes?.snapshot?.allVehicles.orEmpty() else emptyList()
+                var busOneVehicles = if (useBusOne) busOneRes?.snapshot?.allVehicles.orEmpty() else emptyList()
 
-                if (gttRes.snapshot != null) {
+                if (useGtt && gttRes?.snapshot != null) {
                     lastGttRawVehicles = gttVehicles
                 }
-                if (busOneRes?.snapshot != null) {
+                if (useBusOne && busOneRes?.snapshot != null) {
                     lastBusOneRawVehicles = busOneVehicles
                 }
-                if (matoGqlVehicles.isNotEmpty()) {
+                if (useMato && matoGqlVehicles.isNotEmpty()) {
                     lastMatoGqlRawVehicles = matoGqlVehicles
                     lastMatoGqlFetchedAtMillis = nowMillis
                 }
@@ -403,10 +466,9 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val busOneFrozen = sourceReports["BusOne Proxy"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
                 val anyGtfsFrozen = gttFrozen || busOneFrozen
 
-                // Active lightweight fallback ONLY when a GTFS-RT source is detected as frozen:
-                // kick MaTO MQTT if silent on the focused line, retry MaTO GraphQL across fallback
-                // endpoints if empty, and query BusOne if it wasn't included yet.
-                if (anyGtfsFrozen) {
+                // Active lightweight fallback ONLY in AUTO mode when a GTFS-RT source is detected as frozen,
+                // OR single-endpoint MaTO retry when fixed on MATO_LIVE and first query returned empty.
+                if (allowCrossSourceFallback && anyGtfsFrozen) {
                     if (!widgetFastMode) {
                         val hasFocusedMqtt = normFocus != null && matoMqttVehicles.any {
                             it.lineCode.equals(normFocus, ignoreCase = true) ||
@@ -463,16 +525,41 @@ class GttRealtimeRepository private constructor(context: Context) {
                         }
                     }
                     sourceReports = SourceHealthTracker.refineWithCrossSourceComparison(rawReports)
+                } else if (effectiveMode == DataSourceMode.MATO_LIVE && !normFocus.isNullOrBlank() && matoCombined.isEmpty()) {
+                    if (!widgetFastMode) {
+                        matoMqttClient.nudgeFocusedLineSubscription(normFocus, nowMillis)
+                    }
+                    preferredMatoVpEndpointIdx = 0
+                    preferredMatoVpQueryIdx = 0
+                    val retriedMato = withTimeoutOrNull(3_500L) {
+                        fetchMatoGraphQlVehiclePositions(normFocus, nowMillis)
+                    }.orEmpty()
+                    if (retriedMato.isNotEmpty()) {
+                        matoGqlVehicles = retriedMato
+                        lastMatoGqlRawVehicles = retriedMato
+                        lastMatoGqlFetchedAtMillis = nowMillis
+                        matoCombined = mergeMultiSourceVehicles(
+                            matoVehicles = matoMqttVehicles,
+                            gttVehicles = matoGqlVehicles,
+                            busOneVehicles = emptyList(),
+                            nowMillis = nowMillis,
+                        )
+                    }
                 }
 
-                val finalGttFrozen = sourceReports["GTT Ufficiale"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
-                val finalBusOneFrozen = sourceReports["BusOne Proxy"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
-                val finalMatoFrozen = sourceReports["MaTO Live"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
+                val finalGttFrozen = allowCrossSourceFallback &&
+                    sourceReports["GTT Ufficiale"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
+                val finalBusOneFrozen = allowCrossSourceFallback &&
+                    sourceReports["BusOne Proxy"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
+                val finalMatoFrozen = allowCrossSourceFallback &&
+                    sourceReports["MaTO Live"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
 
                 val statuses = mutableListOf<DataSourceStatus>()
-                if (!widgetFastMode || matoGqlVehicles.isNotEmpty()) {
-                    val matoOnline = (!widgetFastMode && matoMqttClient.isConnected()) || matoCombined.isNotEmpty()
+                val matoOnline = useMato && ((!widgetFastMode && matoMqttClient.isConnected()) || matoCombined.isNotEmpty())
+                if (useMato && (!widgetFastMode || matoGqlVehicles.isNotEmpty() || effectiveMode == DataSourceMode.MATO_LIVE)) {
                     val matoMode = when {
+                        effectiveMode == DataSourceMode.MATO_LIVE && matoCombined.isNotEmpty() -> "Fonte fissa"
+                        effectiveMode == DataSourceMode.MATO_LIVE && !widgetFastMode && matoMqttClient.isConnected() -> "Fonte fissa · Stream attivo"
                         finalMatoFrozen && matoCombined.isNotEmpty() -> "GPS fermi · fallback attivo"
                         (finalGttFrozen || finalBusOneFrozen) && matoCombined.isNotEmpty() -> "Priorità attiva"
                         matoMqttVehicles.isNotEmpty() && matoGqlVehicles.isNotEmpty() -> "MQTT + GraphQL"
@@ -496,21 +583,27 @@ class GttRealtimeRepository private constructor(context: Context) {
                         ),
                     )
                 }
-                statuses.add(
-                    if (finalGttFrozen && gttRes.status.isOnline) {
-                        gttRes.status.copy(detail = "GPS fermi · fallback attivo")
-                    } else {
-                        gttRes.status
-                    },
-                )
+                gttRes?.let { res ->
+                    statuses.add(
+                        when {
+                            effectiveMode == DataSourceMode.GTT_OFFICIAL && res.status.isOnline ->
+                                res.status.copy(detail = "${gttVehicles.size} mezzi · Fonte fissa")
+                            finalGttFrozen && res.status.isOnline ->
+                                res.status.copy(detail = "GPS fermi · fallback attivo")
+                            else -> res.status
+                        },
+                    )
+                }
                 busOneRes?.let { res ->
                     statuses.add(
-                        if (finalBusOneFrozen && res.status.isOnline) {
-                            res.status.copy(detail = "GPS fermi · fallback attivo")
-                        } else if (finalGttFrozen && !finalBusOneFrozen && res.status.isOnline) {
-                            res.status.copy(detail = "${busOneVehicles.size} mezzi · Fallback attivo")
-                        } else {
-                            res.status
+                        when {
+                            effectiveMode == DataSourceMode.BUSONE_PROXY && res.status.isOnline ->
+                                res.status.copy(detail = "${busOneVehicles.size} mezzi · Fonte fissa")
+                            finalBusOneFrozen && res.status.isOnline ->
+                                res.status.copy(detail = "GPS fermi · fallback attivo")
+                            finalGttFrozen && !finalBusOneFrozen && res.status.isOnline ->
+                                res.status.copy(detail = "${busOneVehicles.size} mezzi · Fallback attivo")
+                            else -> res.status
                         },
                     )
                 }
@@ -521,31 +614,59 @@ class GttRealtimeRepository private constructor(context: Context) {
                         lastTripUpdatesFetchMillis = nowMillis
                     }
                 }
-                if (alertsRes != null) {
-                    if (alertsRes.alerts != null) {
-                        cachedAlerts = alertsRes.alerts
-                        lastAlertsFetchMillis = nowMillis
+                if (includeAlerts) {
+                    if (alertsRes != null) {
+                        if (alertsRes.alerts != null) {
+                            cachedAlerts = alertsRes.alerts
+                            lastAlertsFetchMillis = nowMillis
+                        }
+                        statuses.add(alertsRes.status)
+                    } else if (includeSecondaryFeeds && !widgetFastMode) {
+                        statuses.add(
+                            DataSourceStatus(
+                                id = "gtt_alerts",
+                                name = "Avvisi GTT",
+                                isOnline = true,
+                                latencyMs = 0L,
+                                itemCount = cachedAlerts.size,
+                                detail = "Cache locale",
+                            ),
+                        )
                     }
-                    statuses.add(alertsRes.status)
-                } else if (includeSecondaryFeeds && !widgetFastMode) {
-                    statuses.add(
-                        DataSourceStatus(
-                            id = "gtt_alerts",
-                            name = "Avvisi GTT",
-                            isOnline = true,
-                            latencyMs = 0L,
-                            itemCount = cachedAlerts.size,
-                            detail = "Cache locale",
-                        ),
-                    )
                 }
 
-                val primarySnap = gttRes.snapshot
+                val primarySnap = gttRes?.snapshot
                 val secondarySnap = busOneRes?.snapshot
 
-                if (primarySnap == null && secondarySnap == null && matoCombined.isEmpty()) {
-                    val err = gttRes.error ?: busOneRes?.error ?: IOException("Tutte le fonti GTT/MaTO sono irraggiungibili")
-                    return@coroutineScope Result.failure(err)
+                when (effectiveMode) {
+                    DataSourceMode.GTT_OFFICIAL -> {
+                        if (primarySnap == null) {
+                            return@coroutineScope Result.failure(
+                                gttRes?.error ?: IOException("Feed GTT Ufficiale non raggiungibile"),
+                            )
+                        }
+                    }
+                    DataSourceMode.BUSONE_PROXY -> {
+                        if (secondarySnap == null) {
+                            return@coroutineScope Result.failure(
+                                busOneRes?.error ?: IOException("Feed BusOne Proxy non raggiungibile"),
+                            )
+                        }
+                    }
+                    DataSourceMode.MATO_LIVE -> {
+                        if (matoCombined.isEmpty() && !matoOnline) {
+                            return@coroutineScope Result.failure(
+                                IOException("Feed MaTO Live non raggiungibile"),
+                            )
+                        }
+                    }
+                    DataSourceMode.AUTO -> {
+                        if (primarySnap == null && secondarySnap == null && matoCombined.isEmpty()) {
+                            val err = gttRes?.error ?: busOneRes?.error
+                                ?: IOException("Tutte le fonti GTT/MaTO sono irraggiungibili")
+                            return@coroutineScope Result.failure(err)
+                        }
+                    }
                 }
 
                 // Merge by physical vehicleId prioritizing non-frozen & actively moving sources
@@ -556,7 +677,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                     busOneVehicles = busOneVehicles,
                     nowMillis = nowMillis,
                     focusLine = normFocus,
-                    sourceReports = sourceReports,
+                    sourceReports = if (allowCrossSourceFallback) sourceReports else emptyMap(),
                 )
 
                 val activeTripUpdates = tripRes?.updates ?: lastTripUpdates
@@ -569,20 +690,20 @@ class GttRealtimeRepository private constructor(context: Context) {
                     matoMaxTs,
                 )
 
+                val summaries = GtfsRtProtobufParser.buildLineSummaries(enriched)
                 val finalSnapshot = LiveFeedSnapshot(
                     feedTimestampSeconds = feedTs,
                     fetchedAtMillis = nowMillis,
                     allVehicles = enriched,
-                    availableLines = GtfsRtProtobufParser.buildLineSummaries(enriched),
+                    availableLines = summaries,
                     sourceStatuses = statuses,
-                    alerts = cachedAlerts,
+                    alerts = if (includeAlerts) cachedAlerts else emptyList(),
                 )
                 lastSnapshot = finalSnapshot
-                if (finalSnapshot.availableLines.isNotEmpty()) {
-                    saveActiveLinesCache(finalSnapshot.availableLines)
+                if (summaries.size > 1 || (effectiveMode != DataSourceMode.MATO_LIVE && summaries.isNotEmpty())) {
+                    saveActiveLinesCache(summaries)
                 }
-                if (!focusLine.isNullOrBlank()) {
-                    val normFocus = focusLine.trim().uppercase()
+                if (!normFocus.isNullOrBlank()) {
                     val lineBuses = enriched.filter {
                         it.lineCode.equals(normFocus, ignoreCase = true) ||
                             it.rawRouteId.equals(normFocus, ignoreCase = true)
@@ -2326,6 +2447,9 @@ class GttRealtimeRepository private constructor(context: Context) {
     companion object {
         private const val TAG = "GttRealtimeRepo"
         private const val USER_AGENT = "ToBusTorino/2.0 (Android Transit Widget)"
+
+        fun shouldRunMatoStream(mode: DataSourceMode): Boolean =
+            mode == DataSourceMode.AUTO || mode == DataSourceMode.MATO_LIVE
         private val GTT_VP_URLS = listOf(
             "https://percorsieorari.gtt.to.it/das_gtfsrt/vehicle_position.aspx",
             "http://percorsieorari.gtt.to.it/das_gtfsrt/vehicle_position.aspx",

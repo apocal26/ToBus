@@ -4,7 +4,9 @@ import android.content.Context
 import android.content.SharedPreferences
 import com.example.BuildConfig
 import com.example.data.model.CameraState
+import com.example.data.model.DataSourceMode
 import com.example.data.model.FavoriteStop
+import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
 import com.example.data.model.UserWidgetSettings
@@ -155,7 +157,7 @@ class ToBusPreferences private constructor(context: Context) {
 
     private fun readSettings(): UserWidgetSettings {
         return UserWidgetSettings(
-            selectedLine = prefs.getString(KEY_LINE, "12")?.ifBlank { "12" } ?: "12",
+            selectedLine = prefs.getString(KEY_LINE, "")?.trim()?.uppercase().orEmpty(),
             mapStyle = MapStyle.fromId(prefs.getString(KEY_MAP_STYLE, MapStyle.DARK.id)),
             cameraMode = WidgetCameraMode.fromId(
                 prefs.getString(KEY_CAMERA_MODE, WidgetCameraMode.AUTO_FIT_BUSES.id),
@@ -176,12 +178,17 @@ class ToBusPreferences private constructor(context: Context) {
             colorByDirection = prefs.getBoolean(KEY_COLOR_BY_DIR, true),
             hideInactiveInWidget = prefs.getBoolean(KEY_HIDE_INACTIVE_WIDGET, true),
             refreshInterval = RefreshInterval.fromMinutes(prefs.getInt(KEY_REFRESH_MIN, 5)),
+            dataSourceMode = DataSourceMode.fromId(prefs.getString(KEY_DATA_SOURCE_MODE, DataSourceMode.AUTO.id)),
+            livePollInterval = LivePollInterval.fromSeconds(prefs.getInt(KEY_LIVE_POLL_SEC, LivePollInterval.SEC_25.seconds)),
+            keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, false),
+            showServiceAlerts = prefs.getBoolean(KEY_SHOW_SERVICE_ALERTS, true),
+            hideInactiveOnMap = prefs.getBoolean(KEY_HIDE_INACTIVE_MAP, false),
         )
     }
 
     private fun saveSettings(s: UserWidgetSettings) {
         prefs.edit()
-            .putString(KEY_LINE, s.selectedLine)
+            .putString(KEY_LINE, s.selectedLine.trim().uppercase())
             .putString(KEY_MAP_STYLE, s.mapStyle.id)
             .putString(KEY_CAMERA_MODE, s.cameraMode.id)
             .putLong(KEY_FIXED_LAT, java.lang.Double.doubleToRawLongBits(s.fixedCamera.centerLat))
@@ -192,6 +199,11 @@ class ToBusPreferences private constructor(context: Context) {
             .putBoolean(KEY_COLOR_BY_DIR, s.colorByDirection)
             .putBoolean(KEY_HIDE_INACTIVE_WIDGET, s.hideInactiveInWidget)
             .putInt(KEY_REFRESH_MIN, s.refreshInterval.minutes)
+            .putString(KEY_DATA_SOURCE_MODE, s.dataSourceMode.id)
+            .putInt(KEY_LIVE_POLL_SEC, s.livePollInterval.seconds)
+            .putBoolean(KEY_KEEP_SCREEN_ON, s.keepScreenOn)
+            .putBoolean(KEY_SHOW_SERVICE_ALERTS, s.showServiceAlerts)
+            .putBoolean(KEY_HIDE_INACTIVE_MAP, s.hideInactiveOnMap)
             .apply()
     }
 
@@ -232,7 +244,7 @@ class ToBusPreferences private constructor(context: Context) {
                         name = obj.optString("name", "Fermata $stopId"),
                         lat = obj.optDouble("lat", CameraState.TURIN_CENTER_LAT),
                         lon = obj.optDouble("lon", CameraState.TURIN_CENTER_LON),
-                        lineCode = obj.optString("line", "12"),
+                        lineCode = obj.optString("line", ""),
                         directionId = obj.optInt("dir", 0),
                         terminusName = obj.optString("terminus", "").ifBlank { null },
                     ),
@@ -273,6 +285,11 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_COLOR_BY_DIR = "color_by_direction"
         private const val KEY_HIDE_INACTIVE_WIDGET = "hide_inactive_widget"
         private const val KEY_REFRESH_MIN = "refresh_minutes"
+        private const val KEY_DATA_SOURCE_MODE = "data_source_mode"
+        private const val KEY_LIVE_POLL_SEC = "live_poll_seconds"
+        private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
+        private const val KEY_SHOW_SERVICE_ALERTS = "show_service_alerts"
+        private const val KEY_HIDE_INACTIVE_MAP = "hide_inactive_map"
         private const val KEY_FAVORITE_STOPS = "favorite_stops_v1"
         private const val KEY_FAVORITE_LINES = "favorite_lines_v1"
         private const val KEY_STOP_WIDGET_IDX = "stop_widget_fav_idx"

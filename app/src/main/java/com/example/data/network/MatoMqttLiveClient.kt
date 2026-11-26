@@ -64,7 +64,7 @@ class MatoMqttLiveClient(
     private var activeWebSocket: WebSocket? = null
 
     @Volatile
-    private var focusedLine: String = "12"
+    private var focusedLine: String = ""
 
     @Volatile
     private var onFocusedLineUpdate: (() -> Unit)? = null
@@ -90,7 +90,9 @@ class MatoMqttLiveClient(
     fun lastReceivedMillis(): Long = lastMessageReceivedAtMillis.get()
 
     fun start(lineCode: String, onFocusedUpdate: () -> Unit) {
-        focusedLine = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
+        val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
+        if (norm.isEmpty() || norm == "?") return
+        focusedLine = norm
         onFocusedLineUpdate = onFocusedUpdate
         val wasActive = isActiveDesired.getAndSet(true)
         scope.launch {
@@ -374,6 +376,7 @@ class MatoMqttLiveClient(
         lineCode: String,
     ) {
         val ws = webSocket ?: return
+        if (lineCode.isBlank() || lineCode == "?") return
         val groups = buildLineSubscriptionGroups(lineCode)
         for (topics in groups) {
             if (topics.isEmpty()) continue
