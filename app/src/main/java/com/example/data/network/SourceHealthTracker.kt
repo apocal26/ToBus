@@ -143,7 +143,7 @@ internal class SourceHealthTracker {
             var recentlyMovedFocusCount = 0
 
             for (v in vehicles) {
-                val vid = v.vehicleId.trim()
+                val vid = GtfsRtProtobufParser.canonicalFleetId(v.vehicleId)
                 if (vid.isEmpty()) continue
                 val inDepot = GttFleetAnalyzer.findDepot(v.latitude, v.longitude) != null
                 val prev = mem.vehicles[vid]
@@ -328,7 +328,7 @@ internal class SourceHealthTracker {
             var recentlyMovedFocusCount = 0
 
             for (v in currentVehicles) {
-                val vid = v.vehicleId.trim()
+                val vid = GtfsRtProtobufParser.canonicalFleetId(v.vehicleId)
                 if (vid.isEmpty()) continue
                 val rec = mem.vehicles[vid] ?: continue
                 if (rec.isInDepot) continue

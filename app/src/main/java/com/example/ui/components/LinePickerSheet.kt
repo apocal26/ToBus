@@ -66,6 +66,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -447,7 +448,7 @@ fun LinePickerSheet(
                             {
                                 Box(
                                     modifier = Modifier
-                                        .size(36.dp)
+                                        .size(48.dp)
                                         .clip(CircleShape)
                                         .clickable { lineQuery = "" },
                                     contentAlignment = Alignment.Center,
@@ -535,7 +536,7 @@ fun LinePickerSheet(
                             {
                                 Box(
                                     modifier = Modifier
-                                        .size(36.dp)
+                                        .size(48.dp)
                                         .clip(CircleShape)
                                         .clickable { stopQuery = "" },
                                     contentAlignment = Alignment.Center,
@@ -1190,17 +1191,19 @@ private fun GlassLineTile(
             )
         }
 
-        // Top-right favorite star toggle — shares a single pre-built Path across all tiles (zero per-tile allocations)
+        // Top-right favorite star toggle — 48dp touch target preserving visual 32dp top-right star placement
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .size(32.dp)
+                .size(48.dp)
                 .semantics { contentDescription = starContentDesc }
                 .drawBehind {
-                    if (isFavorite) {
-                        drawPath(path = starPath, color = AccentGold)
-                    } else {
-                        drawPath(path = starPath, color = TextTertiary, style = starOutlineStroke)
+                    translate(left = size.width - 32.dp.toPx(), top = 0f) {
+                        if (isFavorite) {
+                            drawPath(path = starPath, color = AccentGold)
+                        } else {
+                            drawPath(path = starPath, color = TextTertiary, style = starOutlineStroke)
+                        }
                     }
                 }
                 .clickable(

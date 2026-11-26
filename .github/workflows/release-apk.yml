@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Versione della release (es. v1.0.0)'
+        description: 'Versione della release (es. v1.1.0)'
         required: true
-        default: 'v1.0.0'
+        default: 'v1.1.0'
         type: string
       notes:
         description: 'Note di rilascio (opzionale)'

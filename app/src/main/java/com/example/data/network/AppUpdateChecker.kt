@@ -35,8 +35,8 @@ sealed interface UpdateCheckResult {
  * - Zero background services, WorkManager, or periodic timers.
  * - Strict 24-hour throttle persisted in SharedPreferences (returns in < 0.1 ms when already checked today).
  * - Single tiny (~2 KB) GET to `api.github.com/repos/{owner}/{repo}/releases/latest` on `Dispatchers.IO`.
- * - Opens verified GitHub Release / APK links via the system browser (`Intent.ACTION_VIEW`),
- *   avoiding `REQUEST_INSTALL_PACKAGES` and any in-app downloader memory overhead.
+ * - Pairs with [AppUpdateDownloader] for verified HTTPS in-app APK download via `FileProvider`
+ *   and system `PackageInstaller` confirmation (or GitHub Release fallback when no APK asset is attached).
  */
 object AppUpdateChecker {
     private const val TAG = "AppUpdateChecker"

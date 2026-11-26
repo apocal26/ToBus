@@ -378,7 +378,6 @@ class GttStaticRouteStore(context: Context) {
         private val GTFS_ZIP_URLS = listOf(
             "https://proxy.busone.app/gtt/gtfs.zip",
             "https://www.gtt.to.it/open_data/gtt_gtfs.zip",
-            "http://www.gtt.to.it/open_data/gtt_gtfs.zip",
         )
 
         internal fun extractPatternsFromZip(

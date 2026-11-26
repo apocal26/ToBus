@@ -212,9 +212,11 @@ class GttFleetAnalyzerTest {
 
     @Test
     fun shortensTurinPlaceNamesCleanly() {
-        assertEquals("Mirafiori Nord", shortTurinPlaceName("MIRAFIORI NORD, VIA ALLASON"))
-        assertEquals("Porta Nuova", shortTurinPlaceName("PORTA NUOVA, C. VITTORIO EMANUELE II"))
-        assertEquals("Allamano", shortTurinPlaceName("Cap. ALLAMANO"))
+        assertEquals("Mirafiori Nord, Via Allason", shortTurinPlaceName("MIRAFIORI NORD, VIA ALLASON"))
+        assertEquals("Porta Nuova, C. Vittorio Emanuele II", shortTurinPlaceName("PORTA NUOVA, C. VITTORIO EMANUELE II"))
+        assertEquals("Cap. ALLAMANO", shortTurinPlaceName("Cap. ALLAMANO"))
+        assertEquals("Cap. Allamano", shortTurinPlaceName("CAP. ALLAMANO"))
+        assertEquals("Via Siccardi", shortTurinPlaceName("CENTRO, VIA SICCARDI"))
         assertEquals("P.za Castello", shortTurinPlaceName("P.ZA CASTELLO"))
         assertEquals("Politecnico", shortTurinPlaceName("Fermata 3284 - POLITECNICO"))
         assertEquals("Santa Rita", shortTurinPlaceName("Fermata 317 - SANTA RITA"))

@@ -1841,7 +1841,8 @@ internal fun buildBusesFeatureCollection(
             }
         }
 
-        val label = if (showVehicleLabels) "#${bus.vehicleId}" else ""
+        val displayId = bus.label.ifBlank { bus.vehicleId }
+        val label = if (showVehicleLabels) "#$displayId" else ""
         val sortKey = when {
             isSelected -> 100
             isDepotOrOffRoute || isStaleOrStuck -> 1

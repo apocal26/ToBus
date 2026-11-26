@@ -1832,8 +1832,4 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             checkForUpdatesManually()
         }
     }
-
-    companion object {
-        private const val POLL_INTERVAL_MS = 25_000L
-    }
 }

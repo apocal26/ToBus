@@ -16,6 +16,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 100% keyless, high-speed map tile manager:
@@ -53,6 +54,7 @@ class MapTileManager private constructor(context: Context) {
     }
 
     private val inFlightRequests = ConcurrentHashMap<String, CompletableDeferred<Bitmap?>>()
+    private val tileWriteCount = AtomicInteger(0)
 
     /**
      * Strictly RAM-only lookup safe to call on the Main Thread during Compose layout/draw.
@@ -214,10 +216,22 @@ class MapTileManager private constructor(context: Context) {
     private fun tileFile(key: String): File = File(tileCacheDir, "$key.tile")
 
     private fun saveToDisk(key: String, bytes: ByteArray) {
+        val file = tileFile(key)
+        val tmpFile = File(tileCacheDir, "$key.tile.tmp")
         runCatching {
-            val file = tileFile(key)
-            FileOutputStream(file).use { it.write(bytes) }
-            trimDiskCacheIfNeeded()
+            FileOutputStream(tmpFile).use { it.write(bytes) }
+            if (file.exists()) {
+                file.delete()
+            }
+            if (!tmpFile.renameTo(file)) {
+                tmpFile.delete()
+                return
+            }
+            if (tileWriteCount.incrementAndGet() % DISK_TRIM_WRITE_INTERVAL == 0) {
+                trimDiskCacheIfNeeded()
+            }
+        }.onFailure {
+            runCatching { tmpFile.delete() }
         }
     }
 
@@ -234,6 +248,7 @@ class MapTileManager private constructor(context: Context) {
         private const val USER_AGENT = "ToBusTorinoAndroid/2.2 (https://tobus.torino.app; transit widget)"
         private val OSM_FR_SUBDOMAINS = arrayOf("a", "b", "c")
         private const val MAX_DISK_TILES = 600
+        private const val DISK_TRIM_WRITE_INTERVAL = 25
 
         @Volatile
         private var instance: MapTileManager? = null

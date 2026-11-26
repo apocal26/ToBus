@@ -112,7 +112,13 @@ class GttRealtimeRepository private constructor(context: Context) {
     private var lastGttRawVehicles: List<BusVehicle> = emptyList()
 
     @Volatile
+    private var lastGttFetchedAtMillis: Long = 0L
+
+    @Volatile
     private var lastBusOneRawVehicles: List<BusVehicle> = emptyList()
+
+    @Volatile
+    private var lastBusOneFetchedAtMillis: Long = 0L
 
     @Volatile
     private var lastMatoGqlRawVehicles: List<BusVehicle> = emptyList()
@@ -259,16 +265,12 @@ class GttRealtimeRepository private constructor(context: Context) {
         val gttInputs = if (isFixedMato) {
             emptyList()
         } else {
-            lastGttRawVehicles.ifEmpty {
-                base?.allVehicles?.filter { it.sourceName == "GTT Ufficiale" }.orEmpty()
-            }
+            filterFreshOverlayVehicles(lastGttRawVehicles, lastGttFetchedAtMillis, nowMillis)
         }
         val busOneInputs = if (isFixedMato) {
             emptyList()
         } else {
-            lastBusOneRawVehicles.ifEmpty {
-                base?.allVehicles?.filter { it.sourceName == "BusOne Proxy" }.orEmpty()
-            }
+            filterFreshOverlayVehicles(lastBusOneRawVehicles, lastBusOneFetchedAtMillis, nowMillis)
         }
 
         val activeFocus = lastFocusLine
@@ -491,15 +493,36 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val gttVehicles = if (useGtt) gttRes?.snapshot?.allVehicles.orEmpty() else emptyList()
                 var busOneVehicles = if (useBusOne) busOneRes?.snapshot?.allVehicles.orEmpty() else emptyList()
 
-                if (useGtt && gttRes?.snapshot != null) {
-                    lastGttRawVehicles = gttVehicles
+                if (useGtt) {
+                    if (gttRes?.snapshot != null) {
+                        lastGttRawVehicles = gttVehicles
+                        lastGttFetchedAtMillis = nowMillis
+                    } else {
+                        lastGttRawVehicles = emptyList()
+                        lastGttFetchedAtMillis = 0L
+                    }
+                } else {
+                    lastGttRawVehicles = emptyList()
+                    lastGttFetchedAtMillis = 0L
                 }
-                if (useBusOne && busOneRes?.snapshot != null) {
-                    lastBusOneRawVehicles = busOneVehicles
+                if (useBusOne) {
+                    if (busOneRes?.snapshot != null) {
+                        lastBusOneRawVehicles = busOneVehicles
+                        lastBusOneFetchedAtMillis = nowMillis
+                    } else {
+                        lastBusOneRawVehicles = emptyList()
+                        lastBusOneFetchedAtMillis = 0L
+                    }
+                } else if (effectiveMode != DataSourceMode.AUTO) {
+                    lastBusOneRawVehicles = emptyList()
+                    lastBusOneFetchedAtMillis = 0L
                 }
                 if (useMato && matoGqlVehicles.isNotEmpty()) {
                     lastMatoGqlRawVehicles = matoGqlVehicles
                     lastMatoGqlFetchedAtMillis = nowMillis
+                } else if (!useMato) {
+                    lastMatoGqlRawVehicles = emptyList()
+                    lastMatoGqlFetchedAtMillis = 0L
                 }
 
                 // Track real physical GPS movement per individual source to detect frozen feeds
@@ -573,6 +596,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                         busOneVehicles = fallbackBusOne.snapshot?.allVehicles.orEmpty()
                         if (fallbackBusOne.snapshot != null) {
                             lastBusOneRawVehicles = busOneVehicles
+                            lastBusOneFetchedAtMillis = nowMillis
                         }
                         if (busOneVehicles.isNotEmpty()) {
                             rawReports["BusOne Proxy"] = sourceHealthTracker.recordAndEvaluate("BusOne Proxy", busOneVehicles, normFocus, nowMillis)
@@ -764,16 +788,10 @@ class GttRealtimeRepository private constructor(context: Context) {
         activeTripUpdates: List<TripDelayInfo>,
         nowMillis: Long,
     ): List<BusVehicle> {
-        val tripByTripId = mutableMapOf<String, TripDelayInfo>()
-        val tripByVehicleId = mutableMapOf<String, TripDelayInfo>()
-        activeTripUpdates.forEach { tu ->
-            tu.tripId?.takeIf { it.isNotBlank() }?.let { tripByTripId[it] = tu }
-            tu.vehicleId?.takeIf { it.isNotBlank() }?.let { tripByVehicleId[it] = tu }
-        }
-
-        val enriched = vehicles.map { bus ->
-            val tu = bus.tripId?.let { tripByTripId[it] } ?: tripByVehicleId[bus.vehicleId]
-            val prev = movementTracker[bus.vehicleId]
+        val withDelays = enrichWithTripUpdates(vehicles, activeTripUpdates)
+        val enriched = withDelays.map { bus ->
+            val canonVid = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
+            val prev = movementTracker[canonVid]
             val movedDistMeters = if (prev != null) {
                 haversineMeters(prev.lat, prev.lon, bus.latitude, bus.longitude)
             } else {
@@ -800,15 +818,10 @@ class GttRealtimeRepository private constructor(context: Context) {
             } else {
                 prev.copy(inferredBearing = computedBearing ?: prev.inferredBearing)
             }
-            movementTracker[bus.vehicleId] = record
-
-            val extraSource = if (tu != null) bus.contributingSources + "TripUpdates" else bus.contributingSources
+            movementTracker[canonVid] = record
 
             bus.copy(
-                contributingSources = extraSource,
                 bearing = bus.bearing ?: record.inferredBearing,
-                delaySeconds = tu?.delaySeconds,
-                nextStopId = tu?.nextStopId ?: bus.nextStopId ?: bus.stopId,
                 lastMovedAtMillis = record.lastMovedAtMillis,
                 stationarySinceMillis = if (!moved) record.firstSeenAtPositionMillis else null,
             )
@@ -959,7 +972,10 @@ class GttRealtimeRepository private constructor(context: Context) {
 
                                     val rawVeh = vp.optString("vehicleId").substringAfterLast(":").trim()
                                         .ifBlank { vp.optString("label").trim() }
-                                    if (rawVeh.isEmpty()) continue
+                                    val cleanVeh = GtfsRtProtobufParser.canonicalFleetId(rawVeh)
+                                    if (cleanVeh.isEmpty()) continue
+                                    val cleanLabel = GtfsRtProtobufParser.canonicalFleetId(vp.optString("label"))
+                                        .ifBlank { cleanVeh }
 
                                     val heading = if (vp.isNull("heading")) null else {
                                         vp.optDouble("heading", Double.NaN).toFloat()
@@ -971,13 +987,16 @@ class GttRealtimeRepository private constructor(context: Context) {
                                             ?.let { s -> if (s <= 25f) s * 3.6f else s }
                                     }
                                     val lastUpdRaw = vp.optLong("lastUpdated", 0L)
+                                    val normalizedUpd = if (lastUpdRaw > 1_000_000_000_000L) lastUpdRaw / 1000L else lastUpdRaw
                                     val tsSec = when {
-                                        lastUpdRaw > 1_000_000_000_000L -> lastUpdRaw / 1000L
-                                        lastUpdRaw in 1_600_000_000L..(nowSec + 120L) -> lastUpdRaw
-                                        else -> nowSec
+                                        normalizedUpd <= 0L -> 0L
+                                        normalizedUpd > nowSec + 120L -> nowSec
+                                        normalizedUpd >= 1_600_000_000L -> normalizedUpd
+                                        else -> 0L
                                     }
-                                    val tripId = vp.optJSONObject("trip")?.optString("gtfsId")
-                                        ?.substringAfterLast(":")?.takeIf { it.isNotBlank() }
+                                    val tripId = GtfsRtProtobufParser.normalizeTripId(
+                                        vp.optJSONObject("trip")?.optString("gtfsId"),
+                                    )
                                     val stopRel = vp.optJSONObject("stopRelationship")
                                     val stopObj = stopRel?.optJSONObject("stop")
                                     val stopId = stopObj?.optString("code")?.takeIf { it.isNotBlank() }
@@ -990,9 +1009,9 @@ class GttRealtimeRepository private constructor(context: Context) {
 
                                     out.add(
                                         BusVehicle(
-                                            entityId = "mato_gql_${rawVeh}_$normRoute",
-                                            vehicleId = rawVeh,
-                                            label = vp.optString("label").trim().ifBlank { rawVeh },
+                                            entityId = "mato_gql_${cleanVeh}_$normRoute",
+                                            vehicleId = cleanVeh,
+                                            label = cleanLabel,
                                             rawRouteId = rawRouteId.uppercase(),
                                             lineCode = normRoute,
                                             tripId = tripId,
@@ -1541,13 +1560,16 @@ class GttRealtimeRepository private constructor(context: Context) {
         // Match against ALL live Turin vehicles so even other lines at this stop (e.g. 55, 5) link to their exact bus!
         val allLivePool: List<BusVehicle> = (getLastCachedSnapshot()?.allVehicles ?: emptyList()).ifEmpty { liveVehicles }
         val vehicleByTrip = allLivePool.mapNotNull { v ->
-            v.tripId?.trim()?.takeIf { it.isNotEmpty() }?.let { it.substringAfterLast(":") to v }
+            GtfsRtProtobufParser.normalizeTripId(v.tripId)?.let { it to v }
         }.toMap()
+        val vehicleByCanonId = allLivePool.associateBy {
+            GtfsRtProtobufParser.canonicalFleetId(it.vehicleId).ifBlank { it.vehicleId }
+        }
         val stopKeys = setOf(stop.stopId.trim(), stop.stopCode.trim()).filter { it.isNotEmpty() }.toSet()
 
         // Enrich MATO arrivals with exact vehicleId when tripId matches a live bus
         val enrichedMato = matoArrivals.map { arr ->
-            val cleanTrip = arr.tripId?.substringAfterLast(":")
+            val cleanTrip = GtfsRtProtobufParser.normalizeTripId(arr.tripId)
             val matchedVeh = cleanTrip?.let { vehicleByTrip[it] }
             if (matchedVeh != null && arr.vehicleId.isNullOrBlank()) {
                 arr.copy(vehicleId = matchedVeh.vehicleId)
@@ -1577,9 +1599,15 @@ class GttRealtimeRepository private constructor(context: Context) {
             val pred = tu.stopPredictions.firstOrNull { it.stopId.trim() in stopKeys } ?: continue
             val arrSec = pred.arrivalEpochSeconds ?: pred.departureEpochSeconds ?: continue
             if (arrSec < nowSec - 60L || arrSec > nowSec + STOP_ARRIVAL_HORIZON_SEC) continue
-            val cleanTrip = tu.tripId?.substringAfterLast(":")
+            val cleanTrip = GtfsRtProtobufParser.normalizeTripId(tu.tripId)
+            val cleanTuVeh = GtfsRtProtobufParser.canonicalFleetId(tu.vehicleId).ifBlank { null }
             val matchedVeh = cleanTrip?.let { vehicleByTrip[it] }
-                ?: tu.vehicleId?.let { vid -> allLivePool.firstOrNull { it.vehicleId == vid || it.label == vid } }
+                ?: cleanTuVeh?.let { vid ->
+                    vehicleByCanonId[vid] ?: allLivePool.firstOrNull {
+                        GtfsRtProtobufParser.canonicalFleetId(it.vehicleId) == vid ||
+                            GtfsRtProtobufParser.canonicalFleetId(it.label) == vid
+                    }
+                }
 
             if (matchedVeh == null) continue
             val vehHealth = com.example.data.model.GttFleetAnalyzer.assess(matchedVeh, emptyList(), nowMillis)
@@ -2505,7 +2533,6 @@ class GttRealtimeRepository private constructor(context: Context) {
             mode == DataSourceMode.AUTO || mode == DataSourceMode.MATO_LIVE
         private val GTT_VP_URLS = listOf(
             "https://percorsieorari.gtt.to.it/das_gtfsrt/vehicle_position.aspx",
-            "http://percorsieorari.gtt.to.it/das_gtfsrt/vehicle_position.aspx",
         )
         private val BUSONE_VP_URLS = listOf(
             "https://proxy.busone.app/gtt/gtfs-rt/vehicle-positions.pb",
@@ -2514,12 +2541,10 @@ class GttRealtimeRepository private constructor(context: Context) {
             "https://percorsieorari.gtt.to.it/das_gtfsrt/trip_update.aspx",
             "https://percorsieorari.gtt.to.it/das_gtfsrt/trip_updates.aspx",
             "https://proxy.busone.app/gtt/gtfs-rt/trip-updates.pb",
-            "http://percorsieorari.gtt.to.it/das_gtfsrt/trip_update.aspx",
         )
         private val ALERTS_URLS = listOf(
             "https://percorsieorari.gtt.to.it/das_gtfsrt/alerts.aspx",
             "https://proxy.busone.app/gtt/gtfs-rt/service-alerts.pb",
-            "http://percorsieorari.gtt.to.it/das_gtfsrt/alerts.aspx",
         )
         private val MATO_GRAPHQL_ENDPOINTS = listOf(
             "https://mato.muoversiatorino.it/otp/gtfs/v1",
@@ -2538,8 +2563,61 @@ class GttRealtimeRepository private constructor(context: Context) {
         private const val STOP_ARRIVAL_HORIZON_SEC = 50L * 60L
         private const val MAX_VEHICLE_ZOMBIE_AGE_SECONDS = 360L
         private const val MATO_PRECEDENCE_WINDOW_SECONDS = 25L
+        internal const val OVERLAY_HTTP_CACHE_TTL_MS = 120_000L
         private val SAFE_ROUTE_KEY_REGEX = Regex("[^A-Z0-9_]")
         private val OVERPASS_SAFE_REF_REGEX = Regex("[^A-Za-z0-9/\\- ]")
+
+        internal fun filterFreshOverlayVehicles(
+            rawVehicles: List<BusVehicle>,
+            fetchedAtMillis: Long,
+            nowMillis: Long,
+            ttlMillis: Long = OVERLAY_HTTP_CACHE_TTL_MS,
+        ): List<BusVehicle> {
+            if (rawVehicles.isEmpty() || fetchedAtMillis <= 0L) return emptyList()
+            return if ((nowMillis - fetchedAtMillis) <= ttlMillis) rawVehicles else emptyList()
+        }
+
+        internal fun enrichWithTripUpdates(
+            vehicles: List<BusVehicle>,
+            activeTripUpdates: List<TripDelayInfo>,
+        ): List<BusVehicle> {
+            if (vehicles.isEmpty() || activeTripUpdates.isEmpty()) return vehicles
+            val tripByTripId = HashMap<String, TripDelayInfo>(activeTripUpdates.size)
+            val tripByVehicleId = HashMap<String, TripDelayInfo>(activeTripUpdates.size)
+            for (tu in activeTripUpdates) {
+                GtfsRtProtobufParser.normalizeTripId(tu.tripId)?.let { tripByTripId[it] = tu }
+                val rawVid = tu.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+                if (rawVid != null) {
+                    tripByVehicleId[rawVid] = tu
+                    val canonVid = GtfsRtProtobufParser.canonicalFleetId(rawVid)
+                    if (canonVid.isNotEmpty()) {
+                        tripByVehicleId[canonVid] = tu
+                    }
+                }
+            }
+            return vehicles.map { bus ->
+                val normTrip = GtfsRtProtobufParser.normalizeTripId(bus.tripId)
+                val canonVid = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId.trim() }
+                val tripMatch = normTrip?.let { tripByTripId[it] }?.takeIf { tu ->
+                    tu.routeId.isNullOrBlank() ||
+                        GtfsRtProtobufParser.normalizeGttLineCode(tu.routeId).equals(bus.lineCode, ignoreCase = true)
+                }
+                val vehMatch = (tripByVehicleId[canonVid] ?: tripByVehicleId[bus.vehicleId.trim()])?.takeIf { tu ->
+                    tu.routeId.isNullOrBlank() ||
+                        GtfsRtProtobufParser.normalizeGttLineCode(tu.routeId).equals(bus.lineCode, ignoreCase = true)
+                }
+                val tu = tripMatch ?: vehMatch
+                if (tu == null) {
+                    bus
+                } else {
+                    bus.copy(
+                        contributingSources = bus.contributingSources + "TripUpdates",
+                        delaySeconds = tu.delaySeconds ?: bus.delaySeconds,
+                        nextStopId = tu.nextStopId ?: bus.nextStopId ?: bus.stopId,
+                    )
+                }
+            }
+        }
 
         @Volatile
         private var instance: GttRealtimeRepository? = null
@@ -2631,25 +2709,76 @@ class GttRealtimeRepository private constructor(context: Context) {
             if (allRaw.isEmpty()) return emptyList()
 
             val hasAnyFreshTelemetry = allRaw.any { v ->
-                v.timestampSeconds <= 0L || (nowSec - v.timestampSeconds) <= MAX_VEHICLE_ZOMBIE_AGE_SECONDS
+                val ts = if (v.timestampSeconds > 1_000_000_000_000L) v.timestampSeconds / 1000L else v.timestampSeconds
+                ts > 0L && (nowSec - ts) in -120L..MAX_VEHICLE_ZOMBIE_AGE_SECONDS
             }
 
             val mergedByVehicleId = LinkedHashMap<String, BusVehicle>()
-            for (v in allRaw) {
-                val vid = v.vehicleId.trim()
+            val keyByLineAndTrip = HashMap<String, String>()
+
+            fun normalizeIncoming(v: BusVehicle): BusVehicle {
+                val canonVid = GtfsRtProtobufParser.canonicalFleetId(v.vehicleId)
+                val canonLabel = GtfsRtProtobufParser.canonicalFleetId(v.label).ifBlank { canonVid }
+                val normTrip = GtfsRtProtobufParser.normalizeTripId(v.tripId)
+                val tsRaw = if (v.timestampSeconds > 1_000_000_000_000L) v.timestampSeconds / 1000L else v.timestampSeconds
+                val clampedTs = if (tsRaw > nowSec + 120L) nowSec else tsRaw
+                return if (canonVid == v.vehicleId &&
+                    canonLabel == v.label &&
+                    normTrip == v.tripId &&
+                    clampedTs == v.timestampSeconds
+                ) {
+                    v
+                } else {
+                    v.copy(
+                        vehicleId = canonVid,
+                        label = canonLabel,
+                        tripId = normTrip,
+                        timestampSeconds = clampedTs,
+                    )
+                }
+            }
+
+            fun lineTripKey(lineCode: String, tripId: String?): String? {
+                val cleanTrip = GtfsRtProtobufParser.normalizeTripId(tripId) ?: return null
+                val cleanLine = lineCode.trim().uppercase()
+                if (cleanLine.isEmpty()) return null
+                return "$cleanLine|${cleanTrip.uppercase()}"
+            }
+
+            for (rawV in allRaw) {
+                val rawVidTrimmed = rawV.vehicleId.trim()
+                val v = normalizeIncoming(rawV)
+                val vid = v.vehicleId
                 if (vid.isEmpty()) continue
 
-                // Drop zombie GTT/BusOne vehicles older than 6 minutes when fresh telemetry is available
-                val isMato = v.sourceName == "MaTO Live"
-                if (!isMato && hasAnyFreshTelemetry && v.timestampSeconds > 0L &&
+                // Drop zombie vehicles older than 6 minutes across ALL sources (including MaTO GraphQL)
+                // whenever fresher telemetry is present
+                if (hasAnyFreshTelemetry && v.timestampSeconds > 0L &&
                     (nowSec - v.timestampSeconds) > MAX_VEHICLE_ZOMBIE_AGE_SECONDS
                 ) {
                     continue
                 }
 
-                val existing = mergedByVehicleId[vid]
-                if (existing == null) {
+                val isMato = v.sourceName == "MaTO Live"
+                var existingKey: String? = if (mergedByVehicleId.containsKey(vid)) vid else null
+                if (existingKey == null) {
+                    val ltKey = lineTripKey(v.lineCode, v.tripId)
+                    val candidateKey = ltKey?.let { keyByLineAndTrip[it] }
+                    if (candidateKey != null && mergedByVehicleId.containsKey(candidateKey)) {
+                        // Only merge by (lineCode, tripId) when at least one record used a non-physical fallback ID
+                        // (never collapse two distinct physical fleet buses like #9320 and #9321!)
+                        val bothPhysical = GtfsRtProtobufParser.isPhysicalFleetId(candidateKey) &&
+                            GtfsRtProtobufParser.isPhysicalFleetId(vid)
+                        if (!bothPhysical) {
+                            existingKey = candidateKey
+                        }
+                    }
+                }
+
+                val existing = existingKey?.let { mergedByVehicleId[it] }
+                if (existing == null || existingKey == null) {
                     mergedByVehicleId[vid] = v
+                    lineTripKey(v.lineCode, v.tripId)?.let { keyByLineAndTrip[it] = vid }
                     continue
                 }
 
@@ -2658,10 +2787,18 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val vFrozen = vReport?.isFrozenForLine(v.lineCode, focusLine) == true
                 val existingFrozen = existingReport?.isFrozenForLine(existing.lineCode, focusLine) == true
 
-                val vMoving = vReport?.confirmedMovingVehicleIds?.contains(vid) == true
-                val existingMoving = existingReport?.confirmedMovingVehicleIds?.contains(vid) == true
-                val vStuck = vReport?.stuckVehicleIds?.contains(vid) == true
-                val existingStuck = existingReport?.stuckVehicleIds?.contains(vid) == true
+                val vMoving = vReport?.confirmedMovingVehicleIds?.let {
+                    vid in it || rawVidTrimmed in it
+                } == true
+                val existingMoving = existingReport?.confirmedMovingVehicleIds?.let {
+                    existingKey in it || existing.vehicleId in it
+                } == true
+                val vStuck = vReport?.stuckVehicleIds?.let {
+                    vid in it || rawVidTrimmed in it
+                } == true
+                val existingStuck = existingReport?.stuckVehicleIds?.let {
+                    existingKey in it || existing.vehicleId in it
+                } == true
 
                 val distMeters = SourceHealthTracker.haversineMeters(
                     v.latitude,
@@ -2702,18 +2839,33 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val loserStuck = if (incomingWins) existingStuck else vStuck
                 val loserStaleDiverged = (loserFrozen || (winnerMoving && loserStuck)) && coordsDiverge
 
-                if (winner.lineCode.equals(loser.lineCode, ignoreCase = true)) {
+                // Prefer the real physical fleet matricola over a tripId fallback whenever both describe one bus
+                val preferredPhysicalId = when {
+                    GtfsRtProtobufParser.isPhysicalFleetId(winner.vehicleId) -> winner.vehicleId
+                    winner.lineCode.equals(loser.lineCode, ignoreCase = true) &&
+                        GtfsRtProtobufParser.isPhysicalFleetId(loser.vehicleId) -> loser.vehicleId
+                    else -> winner.vehicleId
+                }
+                val preferredLabel = if (GtfsRtProtobufParser.isPhysicalFleetId(preferredPhysicalId)) {
+                    preferredPhysicalId
+                } else {
+                    winner.label.ifBlank { preferredPhysicalId }
+                }
+
+                val mergedBus = if (winner.lineCode.equals(loser.lineCode, ignoreCase = true)) {
                     if (loserStaleDiverged) {
-                        // Do NOT copy stale bearing/speed/stopId from a frozen feed whose bus is
-                        // stuck far behind; only borrow tripId/directionId if still reasonably close.
                         val allowTripBorrow = distMeters < 800.0
-                        mergedByVehicleId[vid] = winner.copy(
+                        winner.copy(
+                            vehicleId = preferredPhysicalId,
+                            label = preferredLabel,
                             contributingSources = winner.contributingSources,
                             directionId = winner.directionId ?: if (allowTripBorrow) loser.directionId else null,
                             tripId = winner.tripId ?: if (allowTripBorrow) loser.tripId else null,
                         )
                     } else {
-                        mergedByVehicleId[vid] = winner.copy(
+                        winner.copy(
+                            vehicleId = preferredPhysicalId,
+                            label = preferredLabel,
                             contributingSources = winner.contributingSources + loser.contributingSources,
                             directionId = winner.directionId ?: loser.directionId,
                             bearing = winner.bearing ?: loser.bearing,
@@ -2721,12 +2873,21 @@ class GttRealtimeRepository private constructor(context: Context) {
                             stopId = winner.stopId ?: loser.stopId,
                             nextStopId = winner.nextStopId ?: loser.nextStopId,
                             tripId = winner.tripId ?: loser.tripId,
+                            delaySeconds = winner.delaySeconds ?: loser.delaySeconds,
                         )
                     }
                 } else {
                     // Physical vehicle switched lines: keep ONLY the fresher/moving line record and never
                     // bleed the old line's tripId, stopId, or directionId onto the new line!
-                    mergedByVehicleId[vid] = winner
+                    winner.copy(vehicleId = preferredPhysicalId, label = preferredLabel)
+                }
+
+                if (existingKey != preferredPhysicalId) {
+                    mergedByVehicleId.remove(existingKey)
+                }
+                mergedByVehicleId[preferredPhysicalId] = mergedBus
+                lineTripKey(mergedBus.lineCode, mergedBus.tripId)?.let {
+                    keyByLineAndTrip[it] = preferredPhysicalId
                 }
             }
 
@@ -3050,21 +3211,22 @@ class GttRealtimeRepository private constructor(context: Context) {
                 return true
             }
 
-            // 1. Exact vehicleId match
-            val vid = arrival.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+            // 1. Canonical vehicleId match
+            val vid = GtfsRtProtobufParser.canonicalFleetId(arrival.vehicleId).ifBlank { null }
             if (vid != null) {
                 val exactVeh = allLivePool.firstOrNull {
-                    (it.vehicleId.equals(vid, ignoreCase = true) || it.label.equals(vid, ignoreCase = true)) &&
+                    (GtfsRtProtobufParser.canonicalFleetId(it.vehicleId).equals(vid, ignoreCase = true) ||
+                        GtfsRtProtobufParser.canonicalFleetId(it.label).equals(vid, ignoreCase = true)) &&
                         (it.lineCode.equals(targetLine, ignoreCase = true) || it.rawRouteId.equals(targetLine, ignoreCase = true))
                 }
                 if (exactVeh != null && isValidMatchedBus(exactVeh)) return exactVeh
             }
 
-            // 2. Exact tripId match (normalized after ':')
-            val cleanTrip = arrival.tripId?.trim()?.substringAfterLast(":")?.takeIf { it.isNotEmpty() }
+            // 2. Normalized tripId match
+            val cleanTrip = GtfsRtProtobufParser.normalizeTripId(arrival.tripId)
             if (cleanTrip != null) {
                 val exactTripBus = allLivePool.firstOrNull { bus ->
-                    val busTrip = bus.tripId?.trim()?.substringAfterLast(":")
+                    val busTrip = GtfsRtProtobufParser.normalizeTripId(bus.tripId)
                     busTrip != null && busTrip.equals(cleanTrip, ignoreCase = true) &&
                         (bus.lineCode.equals(targetLine, ignoreCase = true) || bus.rawRouteId.equals(targetLine, ignoreCase = true))
                 }
@@ -3156,13 +3318,16 @@ class GttRealtimeRepository private constructor(context: Context) {
                     routePatterns = routePatterns,
                     nowMillis = nowMillis,
                 ) ?: continue
-                approachByVehicleId[bus.vehicleId] = approach
+                val canonVid = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
+                approachByVehicleId[canonVid] = approach
             }
             val approachingUpstream = approachByVehicleId.values
                 .filter { !it.alreadyPassed && it.remainingMeters <= 10_000.0 }
                 .sortedBy { it.remainingMeters }
 
-            val allLiveById = allLivePool.associateBy { it.vehicleId }
+            val allLiveById = allLivePool.associateBy {
+                GtfsRtProtobufParser.canonicalFleetId(it.vehicleId).ifBlank { it.vehicleId }
+            }
             val reliableLiveByLine = HashMap<String, MutableList<BusVehicle>>()
             for (bus in allLivePool) {
                 val h = com.example.data.model.GttFleetAnalyzer.assess(bus, emptyList(), nowMillis)
@@ -3215,7 +3380,8 @@ class GttRealtimeRepository private constructor(context: Context) {
                         routePatterns = patterns,
                         nowMillis = nowMillis,
                     ) ?: continue
-                    appMap[bus.vehicleId] = app
+                    val canonBusId = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
+                    appMap[canonBusId] = app
                 }
                 val upstream = appMap.values
                     .filter { !it.alreadyPassed && it.remainingMeters <= 10_000.0 }
@@ -3236,7 +3402,7 @@ class GttRealtimeRepository private constructor(context: Context) {
             for (arr in rawArrivals) {
                 val lineKey = arr.lineCode.trim().uppercase()
                 val isPref = lineKey.equals(normPref, ignoreCase = true)
-                val vid = arr.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+                val vid = GtfsRtProtobufParser.canonicalFleetId(arr.vehicleId).ifBlank { null }
                 val feedEtaSec = arr.arrivalEpochSeconds - nowSec
 
                 if (isPref && vid != null) {
@@ -3279,7 +3445,9 @@ class GttRealtimeRepository private constructor(context: Context) {
                             continue
                         }
                     } else {
-                        val knownBus = prefLineVehicles.firstOrNull { it.vehicleId == vid }
+                        val knownBus = prefLineVehicles.firstOrNull {
+                            GtfsRtProtobufParser.canonicalFleetId(it.vehicleId) == vid
+                        }
                         if (knownBus != null) {
                             val resolvedDir = com.example.data.model.GttFleetAnalyzer.resolveDirectionId(knownBus, routePatterns)
                             val health = com.example.data.model.GttFleetAnalyzer.assess(knownBus, routePatterns, nowMillis)
@@ -3551,13 +3719,13 @@ class GttRealtimeRepository private constructor(context: Context) {
                     .thenBy { it.arrivalEpochSeconds },
             )
             for (item in sorted) {
-                val itemTrip = item.tripId?.trim()?.substringAfterLast(":")?.takeIf { it.isNotEmpty() }
-                val itemVeh = item.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+                val itemTrip = GtfsRtProtobufParser.normalizeTripId(item.tripId)
+                val itemVeh = GtfsRtProtobufParser.canonicalFleetId(item.vehicleId).ifBlank { null }
 
                 val existingIdx = out.indexOfFirst { existing ->
                     val sameLine = existing.lineCode.equals(item.lineCode, ignoreCase = true)
-                    val existingTrip = existing.tripId?.trim()?.substringAfterLast(":")?.takeIf { it.isNotEmpty() }
-                    val existingVeh = existing.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+                    val existingTrip = GtfsRtProtobufParser.normalizeTripId(existing.tripId)
+                    val existingVeh = GtfsRtProtobufParser.canonicalFleetId(existing.vehicleId).ifBlank { null }
 
                     val sameTrip = itemTrip != null && existingTrip != null &&
                         itemTrip.equals(existingTrip, ignoreCase = true)

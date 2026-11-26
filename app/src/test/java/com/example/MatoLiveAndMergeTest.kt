@@ -793,6 +793,214 @@ class MatoLiveAndMergeTest {
         }
     }
 
+    @Test
+    fun canonicalFleetIdStripsGttPrefixesAndSuffixesSafely() {
+        assertEquals("9320", GtfsRtProtobufParser.canonicalFleetId("9320U"))
+        assertEquals("9320", GtfsRtProtobufParser.canonicalFleetId("gtt:9320U"))
+        assertEquals("9320", GtfsRtProtobufParser.canonicalFleetId("9320F"))
+        assertEquals("9320", GtfsRtProtobufParser.canonicalFleetId("9320E"))
+        assertEquals("9320", GtfsRtProtobufParser.canonicalFleetId("9320UF"))
+        assertEquals("805", GtfsRtProtobufParser.canonicalFleetId("0805U"))
+        assertEquals("T88421", GtfsRtProtobufParser.canonicalFleetId("gtt:T88421"))
+        assertTrue(GtfsRtProtobufParser.isPhysicalFleetId("9320U"))
+        assertTrue(GtfsRtProtobufParser.isPhysicalFleetId("790"))
+        assertFalse(GtfsRtProtobufParser.isPhysicalFleetId("T88421"))
+        assertFalse(GtfsRtProtobufParser.isPhysicalFleetId("TR1234"))
+    }
+
+    @Test
+    fun mergeMultiSourceVehiclesUnifiesMato9320AndGtt9320UWithTripUpdatesDelay() {
+        // Reproduces exact screenshot bug on Line 5 Via Filadelfia:
+        // MaTO Live emits "9320" while GTT Ufficiale / BusOne Proxy emit "9320U" and TripUpdates reports delay on "9320U".
+        val mato9320 = sampleBus(
+            vehicleId = "9320",
+            lineCode = "5",
+            lat = 45.0398,
+            lon = 7.6412,
+            tsSec = nowSec - 2,
+            source = "MaTO Live",
+            tripId = null,
+            directionId = 0,
+        )
+        val gtt9320U = sampleBus(
+            vehicleId = "9320U",
+            lineCode = "5",
+            lat = 45.0389,
+            lon = 7.6401,
+            tsSec = nowSec - 19,
+            source = "GTT Ufficiale",
+            tripId = "gtt:TRIP_5_9320",
+            stopId = "2514",
+            directionId = 0,
+        )
+        val busOne9320U = sampleBus(
+            vehicleId = "gtt:9320U",
+            lineCode = "5",
+            lat = 45.0390,
+            lon = 7.6402,
+            tsSec = nowSec - 19,
+            source = "BusOne Proxy",
+            tripId = "TRIP_5_9320",
+            directionId = 0,
+        )
+
+        val merged = GttRealtimeRepository.mergeMultiSourceVehicles(
+            matoVehicles = listOf(mato9320),
+            gttVehicles = listOf(gtt9320U),
+            busOneVehicles = listOf(busOne9320U),
+            nowMillis = nowMillis,
+        )
+
+        // Must merge into ONE physical bus #9320 (never duplicate #9320 and #9320U!)
+        assertEquals(1, merged.size)
+        val unified = merged[0]
+        assertEquals("9320", unified.vehicleId)
+        assertEquals("9320", unified.label)
+        assertEquals("MaTO Live", unified.sourceName)
+        assertEquals("TRIP_5_9320", unified.tripId)
+        assertTrue(unified.contributingSources.contains("MaTO Live"))
+        assertTrue(unified.contributingSources.contains("GTT Ufficiale"))
+        assertTrue(unified.contributingSources.contains("BusOne Proxy"))
+
+        // Enrich with TripUpdates keyed by raw GTT matricola "9320U" -> must preserve delay on MaTO #9320!
+        val tripUpdate = com.example.data.model.TripDelayInfo(
+            tripId = "TRIP_5_9320",
+            vehicleId = "9320U",
+            routeId = "5U",
+            delaySeconds = 12,
+            nextStopId = "2515",
+            timestampSeconds = nowSec - 5,
+        )
+        val enriched = GttRealtimeRepository.enrichWithTripUpdates(merged, listOf(tripUpdate))
+        assertEquals(1, enriched.size)
+        assertEquals(12, enriched[0].delaySeconds)
+        assertEquals("2515", enriched[0].nextStopId)
+        assertTrue(enriched[0].contributingSources.contains("TripUpdates"))
+    }
+
+    @Test
+    fun mergeAndMqttUpsertCollapseTripIdFallbackWithPhysicalFleetIdWithoutCollapsingTwoPhysicalBuses() {
+        // Case 1: MQTT packet initially lacks `veh` (stored under tripId "T88421"), then GTT has physical "9320U" on same trip
+        val matoFallback = sampleBus(
+            vehicleId = "T88421",
+            lineCode = "5",
+            lat = 45.0410,
+            lon = 7.6420,
+            tsSec = nowSec - 2,
+            source = "MaTO Live",
+            tripId = "gtt:T88421",
+        )
+        val gttPhysical = sampleBus(
+            vehicleId = "9320U",
+            lineCode = "5",
+            lat = 45.0402,
+            lon = 7.6411,
+            tsSec = nowSec - 15,
+            source = "GTT Ufficiale",
+            tripId = "T88421",
+        )
+        // Two genuinely different physical buses (#9320 and #9321) that must NEVER collapse even if tripId matches
+        val otherPhysical = sampleBus(
+            vehicleId = "9321U",
+            lineCode = "5",
+            lat = 45.0500,
+            lon = 7.6500,
+            tsSec = nowSec - 8,
+            source = "GTT Ufficiale",
+            tripId = "T88421",
+        )
+
+        val merged = GttRealtimeRepository.mergeMultiSourceVehicles(
+            matoVehicles = listOf(matoFallback),
+            gttVehicles = listOf(gttPhysical, otherPhysical),
+            busOneVehicles = emptyList(),
+            nowMillis = nowMillis,
+        )
+        assertEquals(2, merged.size)
+        assertEquals(setOf("9320", "9321"), merged.map { it.vehicleId }.toSet())
+        val bus9320 = merged.first { it.vehicleId == "9320" }
+        assertEquals("MaTO Live", bus9320.sourceName)
+        assertEquals(45.0410, bus9320.latitude, 0.0001)
+
+        // Case 2: Internal MatoMqttLiveClient cache collapses tripId fallback -> physical ID seamlessly
+        val mqttClient = MatoMqttLiveClient { okhttp3.OkHttpClient() }
+        mqttClient.upsertMqttVehicle(matoFallback)
+        assertEquals(1, mqttClient.totalCachedVehicles())
+        mqttClient.upsertMqttVehicle(
+            sampleBus(
+                vehicleId = "9320U",
+                lineCode = "5",
+                lat = 45.0415,
+                lon = 7.6425,
+                tsSec = nowSec - 1,
+                source = "MaTO Live",
+                tripId = "T88421",
+            ),
+        )
+        val fresh = mqttClient.snapshotFreshVehicles(nowMillis)
+        assertEquals(1, fresh.size)
+        assertEquals("9320", fresh[0].vehicleId)
+        assertEquals(45.0415, fresh[0].latitude, 0.0001)
+    }
+
+    @Test
+    fun crossSourceFreezeZombieMatoAndOverlayTtlWorkTogether() {
+        // 1. Cross-source freeze detection must match GTT "9101U" with MaTO "9101"
+        val tracker = SourceHealthTracker()
+        val t0 = nowMillis
+        val t1 = t0 + 50_000L
+        val gttFrozen = listOf(
+            sampleBus("9101U", "5", 45.0400, 7.6400, (t1 / 1000L) - 1, "GTT Ufficiale"),
+            sampleBus("9102U", "5", 45.0450, 7.6450, (t1 / 1000L) - 1, "GTT Ufficiale"),
+        )
+        val matoT0 = listOf(
+            sampleBus("9101", "5", 45.0400, 7.6400, (t0 / 1000L) - 15, "MaTO Live"),
+            sampleBus("9102", "5", 45.0450, 7.6450, (t0 / 1000L) - 15, "MaTO Live"),
+        )
+        val matoT1 = listOf(
+            sampleBus("9101", "5", 45.0430, 7.6430, (t1 / 1000L) - 10, "MaTO Live"),
+            sampleBus("9102", "5", 45.0480, 7.6480, (t1 / 1000L) - 10, "MaTO Live"),
+        )
+        tracker.recordAndEvaluate("GTT Ufficiale", gttFrozen, "5", t0)
+        tracker.recordAndEvaluate("MaTO Live", matoT0, "5", t0)
+        val gttRep = tracker.recordAndEvaluate("GTT Ufficiale", gttFrozen, "5", t1)
+        val matoRep = tracker.recordAndEvaluate("MaTO Live", matoT1, "5", t1)
+        val refined = SourceHealthTracker.refineWithCrossSourceComparison(
+            mapOf("GTT Ufficiale" to gttRep, "MaTO Live" to matoRep),
+        )
+        assertTrue(refined["GTT Ufficiale"]!!.crossSourceFrozen)
+
+        // 2. Zombie MaTO GraphQL record (> 6 min old) must be dropped when fresh telemetry is active,
+        //    and future-skewed timestamps (> +120s) must clamp to nowSec.
+        val freshMato = sampleBus("9320", "5", 45.0400, 7.6400, nowSec - 5, "MaTO Live")
+        val zombieMatoGql = sampleBus("9888", "5", 45.0410, 7.6410, nowSec - 600, "MaTO Live")
+        val futureSkewed = sampleBus("9321", "5", 45.0420, 7.6420, nowSec + 7200, "GTT Ufficiale")
+        val merged = GttRealtimeRepository.mergeMultiSourceVehicles(
+            matoVehicles = listOf(freshMato, zombieMatoGql),
+            gttVehicles = listOf(futureSkewed),
+            busOneVehicles = emptyList(),
+            nowMillis = nowMillis,
+        )
+        assertEquals(2, merged.size)
+        assertNull(merged.firstOrNull { it.vehicleId == "9888" })
+        val clamped9321 = merged.first { it.vehicleId == "9321" }
+        assertTrue(clamped9321.timestampSeconds <= nowSec)
+
+        // 3. Stale GTT/BusOne overlay HTTP cache (> 120s) must NOT resurrect ghost buses during MQTT ticks
+        val staleOverlay = GttRealtimeRepository.filterFreshOverlayVehicles(
+            rawVehicles = listOf(freshMato),
+            fetchedAtMillis = nowMillis - 150_000L,
+            nowMillis = nowMillis,
+        )
+        assertTrue(staleOverlay.isEmpty())
+        val validOverlay = GttRealtimeRepository.filterFreshOverlayVehicles(
+            rawVehicles = listOf(freshMato),
+            fetchedAtMillis = nowMillis - 30_000L,
+            nowMillis = nowMillis,
+        )
+        assertEquals(1, validOverlay.size)
+    }
+
     private fun sampleBus(
         vehicleId: String,
         lineCode: String,

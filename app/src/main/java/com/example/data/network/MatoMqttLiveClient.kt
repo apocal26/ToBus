@@ -300,6 +300,52 @@ class MatoMqttLiveClient(
         return out
     }
 
+    /**
+     * Inserts or updates an incoming MaTO MQTT vehicle in [vehiclesById] using its canonical fleet ID,
+     * automatically collapsing any provisional `tripId`-keyed entry when the real physical matricola
+     * arrives (or refreshing the physical entry if a later frame omits `veh`).
+     */
+    internal fun upsertMqttVehicle(bus: BusVehicle) {
+        val normTrip = GtfsRtProtobufParser.normalizeTripId(bus.tripId)
+        val canonId = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId.trim() }
+        if (canonId.isEmpty()) return
+        val canonLabel = GtfsRtProtobufParser.canonicalFleetId(bus.label).ifBlank { canonId }
+        val normalizedBus = if (canonId == bus.vehicleId && canonLabel == bus.label && normTrip == bus.tripId) {
+            bus
+        } else {
+            bus.copy(vehicleId = canonId, label = canonLabel, tripId = normTrip)
+        }
+
+        if (normTrip != null) {
+            val isIncomingPhysical = GtfsRtProtobufParser.isPhysicalFleetId(canonId)
+            val matching = vehiclesById.entries.filter { (key, existing) ->
+                key != canonId &&
+                    existing.lineCode.equals(normalizedBus.lineCode, ignoreCase = true) &&
+                    GtfsRtProtobufParser.normalizeTripId(existing.tripId)?.equals(normTrip, ignoreCase = true) == true
+            }
+            for ((oldKey, existing) in matching) {
+                val isExistingPhysical = GtfsRtProtobufParser.isPhysicalFleetId(oldKey)
+                if (isIncomingPhysical && !isExistingPhysical) {
+                    vehiclesById.remove(oldKey)
+                } else if (!isIncomingPhysical && isExistingPhysical) {
+                    vehiclesById[oldKey] = existing.copy(
+                        latitude = normalizedBus.latitude,
+                        longitude = normalizedBus.longitude,
+                        bearing = normalizedBus.bearing ?: existing.bearing,
+                        speedKmh = normalizedBus.speedKmh ?: existing.speedKmh,
+                        timestampSeconds = maxOf(existing.timestampSeconds, normalizedBus.timestampSeconds),
+                        stopId = normalizedBus.stopId ?: existing.stopId,
+                        nextStopId = normalizedBus.nextStopId ?: existing.nextStopId,
+                        directionId = normalizedBus.directionId ?: existing.directionId,
+                        fetchedAtMillis = maxOf(existing.fetchedAtMillis, normalizedBus.fetchedAtMillis),
+                    )
+                    return
+                }
+            }
+        }
+        vehiclesById[canonId] = normalizedBus
+    }
+
     private fun openSocket() {
         if (!isActiveDesired.get()) return
         reconnectJob?.cancel()
@@ -415,7 +461,7 @@ class MatoMqttLiveClient(
                                     parsedVehicleCount.addAndGet(parsed.size.toLong())
                                     parsedAnyNow = true
                                     for (bus in parsed) {
-                                        vehiclesById[bus.vehicleId] = bus
+                                        upsertMqttVehicle(bus)
                                         if (bus.lineCode.equals(focusedLine, ignoreCase = true) ||
                                             bus.rawRouteId.equals(focusedLine, ignoreCase = true)
                                         ) {
@@ -467,7 +513,7 @@ class MatoMqttLiveClient(
                         parsedVehicleCount.addAndGet(parsed.size.toLong())
                         var touched = false
                         for (bus in parsed) {
-                            vehiclesById[bus.vehicleId] = bus
+                            upsertMqttVehicle(bus)
                             if (bus.lineCode.equals(focusedLine, ignoreCase = true)) touched = true
                         }
                         if (touched && nowMillis - lastNotifyMillis >= NOTIFY_DEBOUNCE_MS) {
@@ -1051,9 +1097,12 @@ class MatoMqttLiveClient(
                     ?: continue
                 val normRoute = GtfsRtProtobufParser.normalizeGttLineCode(route)
                 if (normRoute == "?" || normRoute.isBlank()) continue
-                val vehId = topicMeta.vehicleId
+                val rawVehId = topicMeta.vehicleId
                     ?: nonCoord.firstOrNull { !it.equals(route, ignoreCase = true) && it.any(Char::isDigit) }
                     ?: continue
+                val vehId = GtfsRtProtobufParser.canonicalFleetId(rawVehId)
+                if (vehId.isEmpty()) continue
+                val normTripId = GtfsRtProtobufParser.normalizeTripId(topicMeta.tripId)
                 val heading = nonCoord
                     .mapNotNull { it.toFloatOrNull() }
                     .firstOrNull { it in 0f..360f && it.toString() != vehId }
@@ -1064,7 +1113,7 @@ class MatoMqttLiveClient(
                         label = vehId,
                         rawRouteId = route.trim().uppercase(),
                         lineCode = normRoute,
-                        tripId = topicMeta.tripId,
+                        tripId = normTripId,
                         directionId = topicMeta.directionId,
                         latitude = fLat,
                         longitude = fLon,
@@ -1213,8 +1262,8 @@ class MatoMqttLiveClient(
 
             val heading = doubleAt(2)?.toFloat()?.takeIf { it in 0f..360f }
             val speedKmh = doubleAt(3)?.toFloat()?.takeIf { it in 0f..150f }
-            val tripId = cleanStrAt(4)?.substringAfterLast(":")?.takeIf { it.isNotBlank() }
-                ?: topicMeta.tripId
+            val tripId = GtfsRtProtobufParser.normalizeTripId(cleanStrAt(4))
+                ?: GtfsRtProtobufParser.normalizeTripId(topicMeta.tripId)
 
             val directRaw = list.getOrNull(coordStart + 5)
             val dirId = when (directRaw) {
@@ -1246,7 +1295,7 @@ class MatoMqttLiveClient(
                 ?: leadingVeh?.substringAfterLast(":")
                 ?: tripId?.takeIf { it.isNotBlank() }
                 ?: return null
-            val cleanVehId = rawVehId.trim()
+            val cleanVehId = GtfsRtProtobufParser.canonicalFleetId(rawVehId)
             if (cleanVehId.isEmpty()) return null
 
             val nowSec = nowMillis / 1000L
@@ -1418,10 +1467,11 @@ class MatoMqttLiveClient(
             val lon = readDouble(fields, "longitude", "lon", "long", "lng", "longitudine", "x") ?: geoLon ?: return null
             if (!lat.isFinite() || !lon.isFinite() || lat !in 44.0..46.5 || lon !in 6.5..9.0) return null
 
-            val tripId = readString(fields, "tripid", "trip_id", "trip", "corsa", "journeyid")
-                ?.substringAfterLast(":")
-                ?: nestedTripId?.substringAfterLast(":")?.takeIf { it.isNotBlank() }
-                ?: topicMeta.tripId
+            val tripId = GtfsRtProtobufParser.normalizeTripId(
+                readString(fields, "tripid", "trip_id", "trip", "corsa", "journeyid")
+                    ?: nestedTripId
+                    ?: topicMeta.tripId,
+            )
 
             val rawRoute = readString(
                 fields,
@@ -1477,7 +1527,7 @@ class MatoMqttLiveClient(
                 ?: topicMeta.vehicleId
                 ?: tripId?.takeIf { it.isNotBlank() }
                 ?: return null
-            val cleanVehId = rawVehId.trim()
+            val cleanVehId = GtfsRtProtobufParser.canonicalFleetId(rawVehId)
             if (cleanVehId.isEmpty()) return null
 
             val bearing = readDouble(fields, "heading", "bearing", "hdg", "dir_deg", "angle", "course", "orientamento")

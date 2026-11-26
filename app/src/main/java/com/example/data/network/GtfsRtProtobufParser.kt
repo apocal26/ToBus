@@ -117,6 +117,48 @@ object GtfsRtProtobufParser {
         }
     }
 
+    /**
+     * Canonicalizes a Turin/GTT vehicle identifier across all feeds (MaTO MQTT, MaTO GraphQL,
+     * GTT Official GTFS-RT, BusOne Proxy, and TripUpdates):
+     * - Strips operator prefixes (`gtt:9320U` -> `9320U`)
+     * - Strips GTT urban/festivo/night service suffixes attached to numeric fleet matricole
+     *   (`9320U` -> `9320`, `9320UF` -> `9320`, `9320F` -> `9320`, `9320E` -> `9320`)
+     * - Trims redundant leading zeros on purely numeric fleet numbers (`0805` -> `805`)
+     * - Preserves fallback trip IDs or special alphanumeric IDs (`T88421`, `TR1234`) intact.
+     */
+    fun canonicalFleetId(rawId: String?): String {
+        var s = rawId?.trim()?.substringAfterLast(":")?.trim().orEmpty()
+        if (s.isEmpty() || s.equals("null", ignoreCase = true)) return ""
+        val upper = s.uppercase()
+        s = when {
+            upper.length >= 4 && upper.endsWith("UF") && upper.dropLast(2).all { it.isDigit() } ->
+                upper.dropLast(2)
+            upper.length >= 3 &&
+                (upper.endsWith("U") || upper.endsWith("F") || upper.endsWith("E")) &&
+                upper.dropLast(1).all { it.isDigit() } ->
+                upper.dropLast(1)
+            else -> s
+        }
+        if (s.length > 1 && s.all { it.isDigit() } && s.startsWith('0')) {
+            s = s.trimStart('0').ifEmpty { "0" }
+        }
+        return s
+    }
+
+    fun normalizeTripId(rawTripId: String?): String? {
+        val clean = rawTripId?.trim()?.substringAfterLast(":")?.trim()
+        return clean?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+    }
+
+    /**
+     * Returns true when [rawId] resolves to a real physical GTT fleet number (2..6 digits, e.g. 790,
+     * 9320, 11200) rather than a fallback tripId (`T88421`, `TR1234`, `12U_991`).
+     */
+    fun isPhysicalFleetId(rawId: String?): Boolean {
+        val c = canonicalFleetId(rawId)
+        return c.length in 2..6 && c.all { it.isDigit() }
+    }
+
     val lineCodeComparator: Comparator<LineSummary> = Comparator { a, b ->
         compareLineCodes(a.lineCode, b.lineCode)
     }
@@ -342,14 +384,25 @@ object GtfsRtProtobufParser {
 
         val effectiveRoute = routeId.ifBlank { fallbackRouteId?.trim().orEmpty() }.ifBlank { return null }
         val normalizedLine = normalizeGttLineCode(effectiveRoute)
-        val effectiveVehicleId = vehicleId.ifBlank {
+        val normTripId = normalizeTripId(tripId)
+        val rawVehicleId = vehicleId.ifBlank {
             vehicleLabel.ifBlank {
                 fallbackVehicleId?.trim().orEmpty().ifBlank {
-                    entityId.ifBlank { tripId?.trim().orEmpty().ifBlank { "?" } }
+                    entityId.ifBlank { normTripId.orEmpty().ifBlank { "?" } }
                 }
             }
         }
-        val effectiveLabel = vehicleLabel.ifBlank { effectiveVehicleId }
+        val effectiveVehicleId = canonicalFleetId(rawVehicleId).ifBlank { "?" }
+        val cleanedLabel = canonicalFleetId(vehicleLabel)
+        val effectiveLabel = cleanedLabel.ifBlank { effectiveVehicleId }
+
+        val nowSec = fetchedAtMillis / 1000L
+        val normalizedTs = if (timestamp > 1_000_000_000_000L) timestamp / 1000L else timestamp
+        val clampedTimestamp = when {
+            normalizedTs <= 0L -> nowSec
+            normalizedTs > nowSec + 120L -> nowSec
+            else -> normalizedTs
+        }
 
         return BusVehicle(
             entityId = entityId.ifBlank { "${effectiveVehicleId}_${effectiveRoute}" },
@@ -357,13 +410,13 @@ object GtfsRtProtobufParser {
             label = effectiveLabel,
             rawRouteId = effectiveRoute,
             lineCode = normalizedLine,
-            tripId = tripId,
+            tripId = normTripId,
             directionId = directionId,
             latitude = lat,
             longitude = lon,
             bearing = bearing?.takeIf { !it.isNaN() && it >= 0f },
             speedKmh = speedMs?.takeIf { !it.isNaN() && it >= 0f }?.let { it * 3.6f },
-            timestampSeconds = if (timestamp > 0L) timestamp else fetchedAtMillis / 1000L,
+            timestampSeconds = clampedTimestamp,
             stopId = stopId,
             status = status,
             sourceName = sourceName,
@@ -503,11 +556,13 @@ object GtfsRtProtobufParser {
 
         // Ignore CANCELED (3) trips completely
         if (tripScheduleRel == 3) return null
-        val effectiveVehicleId = vehicleId?.takeIf { it.isNotBlank() } ?: vehicleLabel?.takeIf { it.isNotBlank() }
-        if (tripId == null && effectiveVehicleId == null) return null
+        val rawEffectiveVehicleId = vehicleId?.takeIf { it.isNotBlank() } ?: vehicleLabel?.takeIf { it.isNotBlank() }
+        val cleanVehicleId = rawEffectiveVehicleId?.let { canonicalFleetId(it).ifBlank { null } }
+        val cleanTripId = normalizeTripId(tripId)
+        if (cleanTripId == null && cleanVehicleId == null) return null
         return TripDelayInfo(
-            tripId = tripId,
-            vehicleId = effectiveVehicleId,
+            tripId = cleanTripId,
+            vehicleId = cleanVehicleId,
             routeId = routeId,
             delaySeconds = delay,
             nextStopId = nextStopId,

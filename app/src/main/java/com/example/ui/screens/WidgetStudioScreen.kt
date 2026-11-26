@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -1553,11 +1554,14 @@ private fun WidgetControlsColumn(
             val checkInt = remember { MutableInteractionSource() }
             Box(
                 modifier = Modifier
+                    .widthIn(min = 48.dp)
+                    .heightIn(min = 48.dp)
                     .glassInteractive(checkInt, enableHoverScale = false, onClick = onCheckUpdates)
                     .background(GlassPillFill, RoundedCornerShape(999.dp))
                     .border(1.dp, GlassPillBorder, RoundedCornerShape(999.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
                     .testTag("check_updates_button"),
+                contentAlignment = Alignment.Center,
             ) {
                 Text(
                     text = when {
@@ -1571,17 +1575,22 @@ private fun WidgetControlsColumn(
             }
         }
         if (uiState.githubRepoSlug.isNotBlank()) {
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             val editInt = remember { MutableInteractionSource() }
-            Text(
-                text = "Cambia repository GitHub",
-                style = MaterialTheme.typography.labelSmall,
-                color = AccentCyan,
+            Box(
                 modifier = Modifier
+                    .heightIn(min = 48.dp)
                     .glassInteractive(editInt, enableHoverScale = false, onClick = onEditGithubRepo)
-                    .padding(vertical = 4.dp)
+                    .padding(vertical = 8.dp, horizontal = 4.dp)
                     .testTag("edit_github_repo_button"),
-            )
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                Text(
+                    text = "Cambia repository GitHub",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AccentCyan,
+                )
+            }
         }
         Spacer(modifier = Modifier.height(10.dp))
         HorizontalDivider(color = GlassBandBorder)
@@ -1612,11 +1621,14 @@ private fun WidgetControlsColumn(
             val clearInt = remember { MutableInteractionSource() }
             Box(
                 modifier = Modifier
+                    .widthIn(min = 48.dp)
+                    .heightIn(min = 48.dp)
                     .glassInteractive(clearInt, enableHoverScale = false, onClick = onClearAppCaches)
                     .background(GlassPillFill, RoundedCornerShape(999.dp))
                     .border(1.dp, GlassPillBorder, RoundedCornerShape(999.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
                     .testTag("clear_cache_button"),
+                contentAlignment = Alignment.Center,
             ) {
                 Text(
                     text = "Svuota",

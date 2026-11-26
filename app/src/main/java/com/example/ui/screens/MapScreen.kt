@@ -918,7 +918,7 @@ fun MapScreen(
                     contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    items(sortedVehicles, key = { it.entityId }) { bus ->
+                    items(sortedVehicles, key = { "${it.vehicleId}_${it.lineCode}" }) { bus ->
                         val isSelected = bus.vehicleId == uiState.selectedVehicleId
                         val health = healthByVehicleId[bus.vehicleId]
                             ?: GttFleetAnalyzer.assess(bus, uiState.routePatterns, uiState.nowMillis)

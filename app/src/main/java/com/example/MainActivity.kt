@@ -60,6 +60,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -471,12 +472,17 @@ fun ToBusApp(
                 viewModel.onInstallPermissionReturned()
             }
 
+            var lastLaunchedInstallSeq by rememberSaveable { mutableLongStateOf(0L) }
+
             // Automatically trigger Android's system package installer confirmation dialog
-            // as soon as the in-app APK download completes (or permission is granted).
+            // once per downloaded/retriggered launchSeq (never re-triggering on rotation).
             LaunchedEffect(installState) {
-                if (installState is UpdateInstallState.ReadyToInstall) {
+                if (installState is UpdateInstallState.ReadyToInstall &&
+                    installState.launchSeq != lastLaunchedInstallSeq
+                ) {
                     val apkFile = File(installState.apkFilePath)
                     if (apkFile.exists()) {
+                        lastLaunchedInstallSeq = installState.launchSeq
                         runCatching {
                             ctx.startActivity(AppUpdateDownloader.buildInstallApkIntent(ctx, apkFile))
                         }
