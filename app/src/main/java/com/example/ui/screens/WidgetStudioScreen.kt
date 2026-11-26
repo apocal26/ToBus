@@ -41,6 +41,7 @@ import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.SystemUpdate
 import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -67,6 +68,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.FavoriteStop
 import com.example.data.model.GttFleetAnalyzer
@@ -75,6 +77,7 @@ import com.example.data.model.RefreshInterval
 import com.example.data.model.StopArrival
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.shortTurinPlaceName
+import com.example.ui.components.ConfigureGithubRepoDialog
 import com.example.ui.glass.AccentIconBadge
 import com.example.ui.glass.DirectionColorBadge
 import com.example.ui.glass.GlassBand
@@ -131,10 +134,24 @@ fun WidgetStudioScreen(
     onEnsurePreviewRendered: () -> Unit,
     onOpenFavoriteStop: (FavoriteStop) -> Unit,
     onRemoveFavoriteStop: (String) -> Unit,
+    onCheckUpdates: () -> Unit = {},
+    onSaveGithubRepo: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     var showManualGuideDialog by remember { mutableStateOf(false) }
+    var showGithubRepoDialog by remember { mutableStateOf(false) }
+
+    if (showGithubRepoDialog) {
+        ConfigureGithubRepoDialog(
+            initialRepo = uiState.githubRepoSlug,
+            onSave = { slug ->
+                showGithubRepoDialog = false
+                onSaveGithubRepo(slug)
+            },
+            onDismiss = { showGithubRepoDialog = false },
+        )
+    }
 
     LaunchedEffect(Unit) {
         if (uiState.widgetPreviewBitmap == null) {
@@ -251,6 +268,14 @@ fun WidgetStudioScreen(
                         onSelectRefreshInterval = onSelectRefreshInterval,
                         onOpenFavoriteStop = onOpenFavoriteStop,
                         onRemoveFavoriteStop = onRemoveFavoriteStop,
+                        onCheckUpdates = {
+                            if (uiState.githubRepoSlug.isBlank()) {
+                                showGithubRepoDialog = true
+                            } else {
+                                onCheckUpdates()
+                            }
+                        },
+                        onEditGithubRepo = { showGithubRepoDialog = true },
                     )
                     Spacer(modifier = Modifier.height(20.dp))
                 }
@@ -297,6 +322,14 @@ fun WidgetStudioScreen(
                         onSelectRefreshInterval = onSelectRefreshInterval,
                         onOpenFavoriteStop = onOpenFavoriteStop,
                         onRemoveFavoriteStop = onRemoveFavoriteStop,
+                        onCheckUpdates = {
+                            if (uiState.githubRepoSlug.isBlank()) {
+                                showGithubRepoDialog = true
+                            } else {
+                                onCheckUpdates()
+                            }
+                        },
+                        onEditGithubRepo = { showGithubRepoDialog = true },
                     )
                     Spacer(modifier = Modifier.height(bottomNavClearance + 16.dp))
                 }
@@ -951,6 +984,8 @@ private fun WidgetControlsColumn(
     onSelectRefreshInterval: (RefreshInterval) -> Unit,
     onOpenFavoriteStop: (FavoriteStop) -> Unit,
     onRemoveFavoriteStop: (String) -> Unit,
+    onCheckUpdates: () -> Unit,
+    onEditGithubRepo: () -> Unit,
 ) {
     val settings = uiState.settings
 
@@ -1302,6 +1337,72 @@ private fun WidgetControlsColumn(
             onSelect = { _, item -> onSelectRefreshInterval(item) },
             tagPrefix = "refresh_interval",
         )
+    }
+
+    // 6. Lightweight Daily GitHub Updates (zero background services)
+    GlassBand {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AccentIconBadge(
+                icon = Icons.Rounded.SystemUpdate,
+                accent = AccentCyan,
+                size = 40.dp,
+                iconSize = 20.dp,
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Aggiornamenti app",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TextHero,
+                )
+                Text(
+                    text = if (uiState.githubRepoSlug.isNotBlank()) {
+                        "v${BuildConfig.VERSION_NAME} · ${uiState.githubRepoSlug}"
+                    } else {
+                        "v${BuildConfig.VERSION_NAME} · Controllo quotidiano su GitHub"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSubtitle,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            val checkInt = remember { MutableInteractionSource() }
+            Box(
+                modifier = Modifier
+                    .glassInteractive(checkInt, enableHoverScale = false, onClick = onCheckUpdates)
+                    .background(GlassPillFill, RoundedCornerShape(999.dp))
+                    .border(1.dp, GlassPillBorder, RoundedCornerShape(999.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                    .testTag("check_updates_button"),
+            ) {
+                Text(
+                    text = when {
+                        uiState.isCheckingUpdate -> "Controllo…"
+                        uiState.githubRepoSlug.isBlank() -> "Configura"
+                        else -> "Controlla"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextPrimary,
+                )
+            }
+        }
+        if (uiState.githubRepoSlug.isNotBlank()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            val editInt = remember { MutableInteractionSource() }
+            Text(
+                text = "Cambia repository GitHub",
+                style = MaterialTheme.typography.labelSmall,
+                color = AccentCyan,
+                modifier = Modifier
+                    .glassInteractive(editInt, enableHoverScale = false, onClick = onEditGithubRepo)
+                    .padding(vertical = 4.dp)
+                    .testTag("edit_github_repo_button"),
+            )
+        }
     }
 }
 

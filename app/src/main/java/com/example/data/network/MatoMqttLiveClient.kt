@@ -114,6 +114,9 @@ class MatoMqttLiveClient(
         }
     }
 
+    @Volatile
+    private var lastNudgeMillis: Long = 0L
+
     /**
      * Self-healing liveness check called during periodic foreground polls:
      * if the MQTT WebSocket silently stalled after a Wi-Fi/5G switch or screen sleep,
@@ -131,6 +134,37 @@ class MatoMqttLiveClient(
         if (ws == null || stalled) {
             scope.launch {
                 if (!isActiveDesired.get()) return@launch
+                reconnectAttempt = 0
+                openSocket()
+            }
+        }
+    }
+
+    /**
+     * Lightweight fallback kick triggered ONLY when GTFS-RT/BusOne feeds are detected as frozen
+     * while MaTO MQTT has not yet delivered moving vehicles for the active line (throttled to 30s).
+     */
+    fun nudgeFocusedLineSubscription(
+        lineCode: String?,
+        nowMillis: Long = System.currentTimeMillis(),
+    ) {
+        if (!isActiveDesired.get()) return
+        if (nowMillis - lastNudgeMillis < 30_000L) return
+        lastNudgeMillis = nowMillis
+
+        val targetLine = lineCode?.let { GtfsRtProtobufParser.normalizeGttLineCode(it) }
+            ?.takeIf { it.isNotEmpty() && it != "?" }
+            ?: focusedLine
+        focusedLine = targetLine
+
+        val ws = activeWebSocket
+        val lastMsg = lastMessageReceivedAtMillis.get()
+        val silentTooLong = lastMsg == 0L || (nowMillis - lastMsg) > 35_000L
+        scope.launch {
+            if (!isActiveDesired.get()) return@launch
+            if (ws != null && isMqttConnected.get() && !silentTooLong) {
+                subscribeForLine(ws, targetLine)
+            } else {
                 reconnectAttempt = 0
                 openSocket()
             }

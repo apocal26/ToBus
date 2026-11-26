@@ -2,6 +2,7 @@ package com.example.data.preferences
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.example.BuildConfig
 import com.example.data.model.CameraState
 import com.example.data.model.FavoriteStop
 import com.example.data.model.MapStyle
@@ -131,6 +132,27 @@ class ToBusPreferences private constructor(context: Context) {
         prefs.edit().remove("${KEY_STOP_WIDGET_IDX}_$appWidgetId").apply()
     }
 
+    fun getGithubRepo(): String {
+        val saved = prefs.getString(KEY_GITHUB_REPO, null)?.trim().orEmpty()
+        return if (saved.isNotEmpty()) saved else BuildConfig.GITHUB_REPO
+    }
+
+    fun setGithubRepo(repoSlug: String) {
+        prefs.edit().putString(KEY_GITHUB_REPO, repoSlug.trim()).apply()
+    }
+
+    fun getLastUpdateCheckMillis(): Long = prefs.getLong(KEY_LAST_UPDATE_CHECK_MS, 0L)
+
+    fun setLastUpdateCheckMillis(millis: Long) {
+        prefs.edit().putLong(KEY_LAST_UPDATE_CHECK_MS, millis).apply()
+    }
+
+    fun getDismissedUpdateTag(): String? = prefs.getString(KEY_DISMISSED_UPDATE_TAG, null)
+
+    fun setDismissedUpdateTag(tag: String?) {
+        prefs.edit().putString(KEY_DISMISSED_UPDATE_TAG, tag?.trim()).apply()
+    }
+
     private fun readSettings(): UserWidgetSettings {
         return UserWidgetSettings(
             selectedLine = prefs.getString(KEY_LINE, "12")?.ifBlank { "12" } ?: "12",
@@ -254,6 +276,9 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_FAVORITE_STOPS = "favorite_stops_v1"
         private const val KEY_FAVORITE_LINES = "favorite_lines_v1"
         private const val KEY_STOP_WIDGET_IDX = "stop_widget_fav_idx"
+        private const val KEY_GITHUB_REPO = "github_update_repo"
+        private const val KEY_LAST_UPDATE_CHECK_MS = "github_last_update_check_ms"
+        private const val KEY_DISMISSED_UPDATE_TAG = "github_dismissed_update_tag"
         private const val MAX_FAVORITES = 6
         private const val MAX_FAVORITE_LINES = 12
 

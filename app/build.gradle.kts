@@ -12,12 +12,30 @@ android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
+  val ciVersionName = (project.findProperty("tobusVersionName") as? String)
+    ?.trim()
+    ?.removePrefix("v")
+    ?.removePrefix("V")
+    ?.ifBlank { null }
+    ?: "1.0"
+  val ciVersionCode = (project.findProperty("tobusVersionCode") as? String)
+    ?.trim()
+    ?.toIntOrNull()
+    ?.takeIf { it > 0 }
+    ?: 1
+  val ciGithubRepo = (project.findProperty("tobusGithubRepo") as? String)
+    ?.trim()
+    ?.replace("\"", "")
+    ?.replace("\\", "")
+    ?: ""
+
   defaultConfig {
     applicationId = "com.aistudio.tobus.trnxqv"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = ciVersionCode
+    versionName = ciVersionName
+    buildConfigField("String", "GITHUB_REPO", "\"$ciGithubRepo\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

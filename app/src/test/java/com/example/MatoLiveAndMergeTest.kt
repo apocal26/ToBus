@@ -5,10 +5,13 @@ import com.example.data.model.GeoPoint
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.RoutePattern
 import com.example.data.model.VehicleStopStatus
+import com.example.data.network.AppUpdateChecker
 import com.example.data.network.GtfsRtProtobufParser
 import com.example.data.network.GttRealtimeRepository
 import com.example.data.network.GttStaticRouteStore
 import com.example.data.network.MatoMqttLiveClient
+import com.example.data.network.SourceHealthTracker
+import com.example.data.network.SourceMotionStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -447,6 +450,138 @@ class MatoLiveAndMergeTest {
         } finally {
             tempZip.delete()
         }
+    }
+
+    @Test
+    fun frozenGtfsFeedWithFakeFreshTimestampsLosesToMovingMatoWithoutDroppingUniqueBuses() {
+        val tracker = SourceHealthTracker()
+        val t0 = nowMillis
+        val t1 = t0 + 40_000L
+        val t2 = t0 + 80_000L
+        val t3 = t0 + 120_000L
+
+        // 4 non-depot buses frozen at identical coordinates in GTT Ufficiale even though timestamps keep advancing!
+        fun frozenGttBatch(atMillis: Long): List<BusVehicle> {
+            val sec = atMillis / 1000L
+            return listOf(
+                sampleBus("9001", "12", 45.0500, 7.6600, sec - 1, "GTT Ufficiale", stopId = "OLD_STOP_1"),
+                sampleBus("9002", "12", 45.0550, 7.6650, sec - 1, "GTT Ufficiale", stopId = "OLD_STOP_2"),
+                sampleBus("9003", "4", 45.0650, 7.6750, sec - 1, "GTT Ufficiale"),
+                sampleBus("9004", "15", 45.0700, 7.6800, sec - 1, "GTT Ufficiale"),
+                sampleBus("9005", "12", 45.0480, 7.6580, sec - 1, "GTT Ufficiale"), // Only in GTT (must NOT disappear!)
+            )
+        }
+
+        // MaTO Live reports #9001 and #9002 genuinely moving along Line 12, even with 45s older real GPS timestamps!
+        val matoT0 = listOf(
+            sampleBus("9001", "12", 45.0500, 7.6600, (t0 / 1000L) - 35, "MaTO Live", stopId = null),
+            sampleBus("9002", "12", 45.0550, 7.6650, (t0 / 1000L) - 35, "MaTO Live", stopId = null),
+        )
+        val matoT3 = listOf(
+            sampleBus("9001", "12", 45.0545, 7.6645, (t3 / 1000L) - 45, "MaTO Live", stopId = null),
+            sampleBus("9002", "12", 45.0595, 7.6695, (t3 / 1000L) - 45, "MaTO Live", stopId = null),
+        )
+
+        tracker.recordAndEvaluate("GTT Ufficiale", frozenGttBatch(t0), "12", t0)
+        tracker.recordAndEvaluate("MaTO Live", matoT0, "12", t0)
+        tracker.recordAndEvaluate("GTT Ufficiale", frozenGttBatch(t1), "12", t1)
+        tracker.recordAndEvaluate("GTT Ufficiale", frozenGttBatch(t2), "12", t2)
+
+        val gttReport = tracker.recordAndEvaluate("GTT Ufficiale", frozenGttBatch(t3), "12", t3)
+        val matoReport = tracker.recordAndEvaluate("MaTO Live", matoT3, "12", t3)
+
+        assertTrue("GTT fleet must be flagged frozen after 120s without movement", gttReport.fleetFrozen)
+        assertEquals(SourceMotionStatus.FROZEN, gttReport.status)
+        assertFalse("Moving MaTO must NOT be flagged frozen", matoReport.isFrozenOverall)
+        assertEquals(SourceMotionStatus.MOVING, matoReport.status)
+
+        val reports = SourceHealthTracker.refineWithCrossSourceComparison(
+            mapOf("GTT Ufficiale" to gttReport, "MaTO Live" to matoReport),
+        )
+        val merged = GttRealtimeRepository.mergeMultiSourceVehicles(
+            matoVehicles = matoT3,
+            gttVehicles = frozenGttBatch(t3),
+            busOneVehicles = emptyList(),
+            nowMillis = t3,
+            focusLine = "12",
+            sourceReports = reports,
+        )
+
+        // All 5 unique vehicles must still be present (zero bus loss!)
+        assertEquals(5, merged.size)
+
+        // #9001 & #9002 must use MaTO's moving coordinates even though GTT's fake timestamp was 44s newer!
+        val bus9001 = merged.first { it.vehicleId == "9001" }
+        assertEquals("MaTO Live", bus9001.sourceName)
+        assertEquals(45.0545, bus9001.latitude, 0.0001)
+        // Must NOT copy stale stopId from frozen GTT ~600m behind
+        assertNull(bus9001.stopId)
+
+        // #9005 (only in GTT) must STILL be preserved so buses never vanish
+        assertNotNull(merged.firstOrNull { it.vehicleId == "9005" })
+
+        // Instant auto-recovery as soon as GTT vehicles move again
+        val t4 = t3 + 25_000L
+        val recoveredGtt = listOf(
+            sampleBus("9001", "12", 45.0560, 7.6660, (t4 / 1000L) - 2, "GTT Ufficiale"),
+            sampleBus("9002", "12", 45.0610, 7.6710, (t4 / 1000L) - 2, "GTT Ufficiale"),
+            sampleBus("9003", "4", 45.0680, 7.6780, (t4 / 1000L) - 2, "GTT Ufficiale"),
+            sampleBus("9004", "15", 45.0730, 7.6830, (t4 / 1000L) - 2, "GTT Ufficiale"),
+        )
+        val recoveredReport = tracker.recordAndEvaluate("GTT Ufficiale", recoveredGtt, "12", t4)
+        assertFalse("GTT must immediately unfreeze once buses move again", recoveredReport.fleetFrozen)
+        assertEquals(SourceMotionStatus.MOVING, recoveredReport.status)
+    }
+
+    @Test
+    fun crossSourceDivergenceDetectsFrozenFeedWithin50Seconds() {
+        val tracker = SourceHealthTracker()
+        val t0 = nowMillis
+        val t1 = t0 + 50_000L
+
+        val gttFrozen = listOf(
+            sampleBus("9101", "12", 45.0400, 7.6400, (t1 / 1000L) - 1, "GTT Ufficiale"),
+            sampleBus("9102", "12", 45.0450, 7.6450, (t1 / 1000L) - 1, "GTT Ufficiale"),
+        )
+        val matoT0 = listOf(
+            sampleBus("9101", "12", 45.0400, 7.6400, (t0 / 1000L) - 15, "MaTO Live"),
+            sampleBus("9102", "12", 45.0450, 7.6450, (t0 / 1000L) - 15, "MaTO Live"),
+        )
+        val matoT1 = listOf(
+            sampleBus("9101", "12", 45.0425, 7.6425, (t1 / 1000L) - 35, "MaTO Live"),
+            sampleBus("9102", "12", 45.0475, 7.6475, (t1 / 1000L) - 35, "MaTO Live"),
+        )
+
+        tracker.recordAndEvaluate("GTT Ufficiale", gttFrozen, "12", t0)
+        tracker.recordAndEvaluate("MaTO Live", matoT0, "12", t0)
+
+        val gttRep = tracker.recordAndEvaluate("GTT Ufficiale", gttFrozen, "12", t1)
+        val matoRep = tracker.recordAndEvaluate("MaTO Live", matoT1, "12", t1)
+        val refined = SourceHealthTracker.refineWithCrossSourceComparison(
+            mapOf("GTT Ufficiale" to gttRep, "MaTO Live" to matoRep),
+        )
+
+        assertTrue(refined["GTT Ufficiale"]!!.crossSourceFrozen)
+        assertFalse(refined["MaTO Live"]!!.isFrozenOverall)
+    }
+
+    @Test
+    fun appUpdateCheckerNormalizesReposComparesSemverAndValidatesGithubUrls() {
+        assertEquals("mario/ToBus", AppUpdateChecker.normalizeRepoSlug("mario/ToBus"))
+        assertEquals("mario/ToBus", AppUpdateChecker.normalizeRepoSlug("https://github.com/mario/ToBus/"))
+        assertEquals("mario/ToBus", AppUpdateChecker.normalizeRepoSlug("github.com/mario/ToBus.git"))
+        assertNull(AppUpdateChecker.normalizeRepoSlug("not-a-repo"))
+        assertNull(AppUpdateChecker.normalizeRepoSlug("https://github.com/bad repo/name"))
+
+        assertTrue(AppUpdateChecker.isRemoteNewer("1.0", "v1.0.1"))
+        assertTrue(AppUpdateChecker.isRemoteNewer("1.9.0", "v1.10.0"))
+        assertFalse(AppUpdateChecker.isRemoteNewer("1.2.0", "v1.2.0"))
+        assertFalse(AppUpdateChecker.isRemoteNewer("1.2.0", "v1.1.9"))
+        assertFalse(AppUpdateChecker.isRemoteNewer("1.0", "v1.0.0"))
+
+        assertTrue(AppUpdateChecker.isTrustedGithubUrl("https://github.com/mario/ToBus/releases/download/v1.1.0/ToBus-v1.1.0.apk"))
+        assertFalse(AppUpdateChecker.isTrustedGithubUrl("http://github.com/mario/ToBus/releases"))
+        assertFalse(AppUpdateChecker.isTrustedGithubUrl("https://evil.example.com/ToBus.apk"))
     }
 
     private fun sampleBus(

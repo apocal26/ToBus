@@ -31,8 +31,11 @@ import com.example.data.model.UserWidgetSettings
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.formatTurinLabel
 import com.example.data.model.shortTurinPlaceName
+import com.example.data.network.AppUpdateChecker
+import com.example.data.network.AppUpdateInfo
 import com.example.data.network.GttRealtimeRepository
 import com.example.data.network.GttStaticRouteStore
+import com.example.data.network.UpdateCheckResult
 import com.example.data.preferences.ToBusPreferences
 import com.example.map.TransitMapBitmapRenderer
 import com.example.map.WebMercator
@@ -118,6 +121,9 @@ data class ToBusUiState(
     val widgetPreviewBitmap: Bitmap? = null,
     val isRenderingPreview: Boolean = false,
     val statusToast: String? = null,
+    val availableUpdate: AppUpdateInfo? = null,
+    val isCheckingUpdate: Boolean = false,
+    val githubRepoSlug: String = "",
 ) {
     val selectedVehicle: BusVehicle?
         get() = lineVehicles.firstOrNull { it.vehicleId == selectedVehicleId }
@@ -165,6 +171,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             favoriteStops = initialFavoriteStops,
             favoriteStopIds = initialFavoriteStops.map { it.stopId }.toSet(),
             favoriteLines = preferences.currentFavoriteLines(),
+            githubRepoSlug = preferences.getGithubRepo(),
         ),
     )
     val uiState: StateFlow<ToBusUiState> = _uiState.asStateFlow()
@@ -210,6 +217,14 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.prefetchStaticGtfsInBackground()
             runCatching { repository.getStopSearchIndex() }
+        }
+        // Lightweight once-per-24h GitHub Releases check, delayed after startup so cold boot stays instant.
+        viewModelScope.launch(Dispatchers.IO) {
+            delay(4_500L)
+            val result = AppUpdateChecker.checkForUpdate(preferences = preferences, force = false)
+            if (result is UpdateCheckResult.Available) {
+                _uiState.update { it.copy(availableUpdate = result.info) }
+            }
         }
     }
 
@@ -1410,6 +1425,61 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     isRenderingPreview = false,
                 )
             }
+        }
+    }
+
+    fun checkForUpdatesManually() {
+        if (_uiState.value.isCheckingUpdate) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isCheckingUpdate = true) }
+            val result = AppUpdateChecker.checkForUpdate(preferences = preferences, force = true)
+            _uiState.update { state ->
+                when (result) {
+                    is UpdateCheckResult.Available -> state.copy(
+                        isCheckingUpdate = false,
+                        availableUpdate = result.info,
+                    )
+                    UpdateCheckResult.UpToDate -> state.copy(
+                        isCheckingUpdate = false,
+                        statusToast = "ToBus è già aggiornata all'ultima versione",
+                    )
+                    UpdateCheckResult.RepoNotConfigured -> state.copy(
+                        isCheckingUpdate = false,
+                        statusToast = "Imposta prima il repository GitHub",
+                    )
+                    UpdateCheckResult.Throttled -> state.copy(isCheckingUpdate = false)
+                    is UpdateCheckResult.Error -> state.copy(
+                        isCheckingUpdate = false,
+                        statusToast = "Controllo aggiornamenti non riuscito (${result.message})",
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissUpdateDialog() {
+        _uiState.update { it.copy(availableUpdate = null) }
+    }
+
+    fun ignoreCurrentUpdateVersion() {
+        val tag = _uiState.value.availableUpdate?.tagName
+        if (!tag.isNullOrBlank()) {
+            preferences.setDismissedUpdateTag(tag)
+        }
+        _uiState.update { it.copy(availableUpdate = null) }
+    }
+
+    fun saveGithubRepoSlug(slug: String) {
+        preferences.setGithubRepo(slug)
+        preferences.setLastUpdateCheckMillis(0L)
+        _uiState.update {
+            it.copy(
+                githubRepoSlug = preferences.getGithubRepo(),
+                statusToast = if (slug.isBlank()) "Repository GitHub rimosso" else "Repository salvato: $slug",
+            )
+        }
+        if (slug.isNotBlank()) {
+            checkForUpdatesManually()
         }
     }
 

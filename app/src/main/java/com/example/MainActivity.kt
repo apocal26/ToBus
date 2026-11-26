@@ -2,6 +2,7 @@ package com.example
 
 import android.content.Intent
 import android.graphics.Color as AndroidColor
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -76,7 +77,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.model.MapStyle
 import com.example.data.model.VehicleFreshness
+import com.example.data.network.AppUpdateChecker
 import com.example.ui.components.LinePickerSheet
+import com.example.ui.components.UpdateAvailableDialog
 import com.example.ui.glass.AmbientGlowBackground
 import com.example.ui.glass.glassSpring
 import com.example.ui.screens.MapScreen
@@ -353,6 +356,8 @@ fun ToBusApp(
                                 viewModel.openFavoriteStop(fav)
                             },
                             onRemoveFavoriteStop = viewModel::removeFavoriteStop,
+                            onCheckUpdates = viewModel::checkForUpdatesManually,
+                            onSaveGithubRepo = viewModel::saveGithubRepoSlug,
                         )
                     }
                 }
@@ -426,6 +431,29 @@ fun ToBusApp(
                 onSearchStops = viewModel::searchStops,
                 onSelectStop = selectSearchedStop,
                 onDismiss = closeLinePicker,
+            )
+        }
+
+        val pendingUpdate = uiState.availableUpdate
+        if (pendingUpdate != null) {
+            val ctx = LocalContext.current
+            UpdateAvailableDialog(
+                update = pendingUpdate,
+                onDownloadClick = {
+                    val url = pendingUpdate.preferredOpenUrl
+                    if (AppUpdateChecker.isTrustedGithubUrl(url)) {
+                        runCatching {
+                            ctx.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                },
+                            )
+                        }
+                    }
+                    viewModel.dismissUpdateDialog()
+                },
+                onDismissLater = viewModel::dismissUpdateDialog,
+                onIgnoreVersion = viewModel::ignoreCurrentUpdateVersion,
             )
         }
     }

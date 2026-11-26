@@ -69,12 +69,18 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          GITHUB_REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
+          VERSION_CLEAN="${RELEASE_TAG#v}"
+          VERSION_CLEAN="${VERSION_CLEAN#V}"
+          GRADLE_PROPS="-PtobusGithubRepo=${GITHUB_REPO} -PtobusVersionName=${VERSION_CLEAN} -PtobusVersionCode=${RUN_NUMBER}"
+
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
             echo "Compiling signed release APK using repository secrets..."
             printf '%s' "$KEYSTORE_BASE64" | base64 -d > "${GITHUB_WORKSPACE}/my-upload-key.jks"
             export KEYSTORE_PATH="${GITHUB_WORKSPACE}/my-upload-key.jks"
-            gradle :app:assembleRelease --no-daemon --stacktrace
+            gradle :app:assembleRelease $GRADLE_PROPS --no-daemon --stacktrace
             APK_SOURCE="app/build/outputs/apk/release/app-release.apk"
           else
             echo "Compiling installable APK signed with project debug.keystore..."
@@ -85,7 +91,7 @@ jobs:
                 -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
                 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
             fi
-            gradle :app:assembleDebug --no-daemon --stacktrace
+            gradle :app:assembleDebug $GRADLE_PROPS --no-daemon --stacktrace
             APK_SOURCE="app/build/outputs/apk/debug/app-debug.apk"
           fi
 
