@@ -7,7 +7,6 @@
 App Android per seguire in tempo reale autobus e tram **GTT a Torino**, con mappa live e widget per la schermata Home.
 
 [![Ultima Release](https://img.shields.io/github/v/release/apocal26/ToBus?label=Release&color=FBBF24&style=flat-square)](https://github.com/apocal26/ToBus/releases/latest)
-[![Build APK](https://img.shields.io/github/actions/workflow/status/apocal26/ToBus/release-apk.yml?label=CI%20Build&style=flat-square)](https://github.com/apocal26/ToBus/actions/workflows/release-apk.yml)
 [![Android](https://img.shields.io/badge/Android-7.0%2B%20(API%2024--36)-10B981?style=flat-square)](https://github.com/apocal26/ToBus/releases)
 
 </div>
