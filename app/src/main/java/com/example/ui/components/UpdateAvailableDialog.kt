@@ -18,8 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.SystemUpdate
+import com.example.ui.icons.ToBusIcons
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -85,7 +84,7 @@ fun UpdateAvailableDialog(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     AccentIconBadge(
-                        icon = Icons.Rounded.SystemUpdate,
+                        icon = ToBusIcons.SystemUpdate,
                         accent = AccentCyan,
                         size = 42.dp,
                         iconSize = 21.dp,

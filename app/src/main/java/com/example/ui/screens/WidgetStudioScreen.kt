@@ -29,20 +29,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.AddToHomeScreen
-import androidx.compose.material.icons.rounded.AutoAwesome
-import androidx.compose.material.icons.rounded.BatterySaver
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.CropFree
-import androidx.compose.material.icons.rounded.DirectionsBus
-import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.MyLocation
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Star
-import androidx.compose.material.icons.rounded.SystemUpdate
-import androidx.compose.material.icons.rounded.Widgets
+import com.example.ui.icons.ToBusIcons
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -170,7 +162,7 @@ fun WidgetStudioScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 AccentIconBadge(
-                    icon = Icons.Rounded.AddToHomeScreen,
+                    icon = ToBusIcons.AddToHomeScreen,
                     accent = AccentCyan,
                 )
                 Text(
@@ -952,8 +944,8 @@ private fun PinWidgetActionButton(
             Icon(
                 imageVector = when {
                     isStops -> Icons.Rounded.Star
-                    isSquare -> Icons.Rounded.GridView
-                    else -> Icons.Rounded.Widgets
+                    isSquare -> ToBusIcons.GridView
+                    else -> ToBusIcons.Widgets
                 },
                 contentDescription = stringResource(R.string.cd_pin_widget),
                 tint = DarkInkOnAccent,
@@ -1011,7 +1003,7 @@ private fun WidgetControlsColumn(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 AccentIconBadge(
-                    icon = Icons.Rounded.DirectionsBus,
+                    icon = ToBusIcons.DirectionsBus,
                     accent = AccentGold,
                     size = 44.dp,
                     iconSize = 22.dp,
@@ -1203,9 +1195,9 @@ private fun WidgetControlsColumn(
                 ) {
                     AccentIconBadge(
                         icon = if (mode == WidgetCameraMode.AUTO_FIT_BUSES) {
-                            Icons.Rounded.AutoAwesome
+                            ToBusIcons.AutoAwesome
                         } else {
-                            Icons.Rounded.MyLocation
+                            ToBusIcons.MyLocation
                         },
                         accent = if (isSelected) AccentCyan else TextSubtitle,
                         size = 38.dp,
@@ -1244,7 +1236,7 @@ private fun WidgetControlsColumn(
                         horizontalArrangement = Arrangement.Center,
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.CropFree,
+                            imageVector = ToBusIcons.CropFree,
                             contentDescription = null,
                             tint = AccentGold,
                             modifier = Modifier.size(18.dp),
@@ -1310,7 +1302,7 @@ private fun WidgetControlsColumn(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             AccentIconBadge(
-                icon = Icons.Rounded.BatterySaver,
+                icon = ToBusIcons.BatterySaver,
                 accent = AccentEmerald,
                 size = 40.dp,
                 iconSize = 20.dp,
@@ -1347,7 +1339,7 @@ private fun WidgetControlsColumn(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             AccentIconBadge(
-                icon = Icons.Rounded.SystemUpdate,
+                icon = ToBusIcons.SystemUpdate,
                 accent = AccentCyan,
                 size = 40.dp,
                 iconSize = 20.dp,

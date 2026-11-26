@@ -106,10 +106,15 @@ internal object MapLibreTransitIds {
  * stations, hospitals, universities, stadiums, major parks, museums, castles, theatres, monuments.
  * Explicitly excludes retail shops, bakeries, bars, parking lots, and duplicate bus stops.
  */
-internal fun installMajorLandmarksLayer(style: Style, mapStyle: MapStyle, density: Float) {
+internal fun installMajorLandmarksLayer(
+    style: Style,
+    mapStyle: MapStyle,
+    density: Float,
+    preRenderedLandmarks: Map<String, Bitmap>? = null,
+) {
     val isDark = mapStyle.isDark
 
-    registerLandmarkDotSprites(style, isDark = isDark, density = density)
+    registerLandmarkDotSprites(style, isDark = isDark, density = density, preRendered = preRenderedLandmarks)
 
     val haloColor = if (isDark) "rgba(10, 14, 22, 0.94)" else "rgba(248, 250, 253, 0.96)"
 
@@ -654,9 +659,20 @@ internal fun buildCuratedTurinLandmarksFeatureCollection(): FeatureCollection {
     return FeatureCollection.fromFeatures(features)
 }
 
-private fun registerLandmarkDotSprites(style: Style, isDark: Boolean, density: Float) {
-    val rim = if (isDark) AndroidColor.parseColor("#111722") else AndroidColor.WHITE
+private val landmarkSpriteCache = java.util.concurrent.ConcurrentHashMap<String, Map<String, Bitmap>>()
+private val transitSpriteCache = java.util.concurrent.ConcurrentHashMap<Int, Map<String, Bitmap>>()
+
+/**
+ * Generates and caches landmark dot bitmaps off the main thread so MapLibre style setup
+ * never stalls UI frames on low-end devices.
+ */
+internal fun getOrCreateLandmarkDotSprites(isDark: Boolean, density: Float): Map<String, Bitmap> {
     val dpi = (density * 160f).roundToInt().coerceAtLeast(160)
+    val cacheKey = "${dpi}_${if (isDark) 1 else 0}"
+    landmarkSpriteCache[cacheKey]?.let { return it }
+
+    val rim = if (isDark) AndroidColor.parseColor("#111722") else AndroidColor.WHITE
+    val out = LinkedHashMap<String, Bitmap>(7)
 
     fun addDot(id: String, hex: String, diamond: Boolean = false) {
         val fill = AndroidColor.parseColor(hex)
@@ -708,7 +724,7 @@ private fun registerLandmarkDotSprites(style: Style, isDark: Boolean, density: F
             canvas.drawCircle(cx, cy, 2.9f * density, paint)
         }
 
-        style.addImage(id, bmp, false)
+        out[id] = bmp
     }
 
     addDot(MapLibreTransitIds.LM_PARK, if (isDark) "#6CD6A2" else "#2B7A4F")
@@ -718,23 +734,44 @@ private fun registerLandmarkDotSprites(style: Style, isDark: Boolean, density: F
     addDot(MapLibreTransitIds.LM_HOSPITAL, if (isDark) "#F0828C" else "#C23242")
     addDot(MapLibreTransitIds.LM_STADIUM, if (isDark) "#9AAEF8" else "#5056B8")
     addDot(MapLibreTransitIds.LM_DEFAULT, if (isDark) "#BFD0E4" else "#475569")
+
+    landmarkSpriteCache[cacheKey] = out
+    return out
 }
 
-internal fun registerTransitSprites(style: Style, density: Float) {
+private fun registerLandmarkDotSprites(
+    style: Style,
+    isDark: Boolean,
+    density: Float,
+    preRendered: Map<String, Bitmap>? = null,
+) {
+    val sprites = preRendered ?: getOrCreateLandmarkDotSprites(isDark, density)
+    for ((id, bmp) in sprites) {
+        style.addImage(id, bmp, false)
+    }
+}
+
+/**
+ * Generates and caches all bus/status/chevron/star marker bitmaps off the main thread.
+ */
+internal fun getOrCreateTransitSprites(density: Float): Map<String, Bitmap> {
+    val dpi = (density * 160f).roundToInt().coerceAtLeast(160)
+    transitSpriteCache[dpi]?.let { return it }
+
     val gold = AndroidColor.parseColor("#FFB300")
     val cyan = AndroidColor.parseColor("#38BDF8")
     val emerald = AndroidColor.parseColor("#10B981")
     val darkInk = AndroidColor.parseColor("#0B0F17")
+    val out = LinkedHashMap<String, Bitmap>(20)
 
     fun add(id: String, fill: Int, hasArrow: Boolean, selected: Boolean) {
-        val bmp = createBusMarkerBitmap(
+        out[id] = createBusMarkerBitmap(
             fillArgb = fill,
             inkArgb = darkInk,
             hasArrow = hasArrow,
             selected = selected,
             density = density,
         )
-        style.addImage(id, bmp, false)
     }
 
     add(MapLibreTransitIds.ICON_GOLD, gold, hasArrow = true, selected = false)
@@ -751,28 +788,33 @@ internal fun registerTransitSprites(style: Style, density: Float) {
     add(MapLibreTransitIds.ICON_EXT_NODIR, emerald, hasArrow = false, selected = true)
 
     // Always-upright status badges: Terminus (pause bars in line-colored ring), Depot/Off-Route (garage roof + D), Stale/Stuck (alert !)
-    style.addImage(MapLibreTransitIds.ICON_TERMINUS_GOLD, createTerminusMarkerBitmap(gold, selected = false, density = density), false)
-    style.addImage(MapLibreTransitIds.ICON_TERMINUS_GOLD_SEL, createTerminusMarkerBitmap(gold, selected = true, density = density), false)
-    style.addImage(MapLibreTransitIds.ICON_TERMINUS_CYAN, createTerminusMarkerBitmap(cyan, selected = false, density = density), false)
-    style.addImage(MapLibreTransitIds.ICON_TERMINUS_CYAN_SEL, createTerminusMarkerBitmap(cyan, selected = true, density = density), false)
+    out[MapLibreTransitIds.ICON_TERMINUS_GOLD] = createTerminusMarkerBitmap(gold, selected = false, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_GOLD_SEL] = createTerminusMarkerBitmap(gold, selected = true, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_CYAN] = createTerminusMarkerBitmap(cyan, selected = false, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_CYAN_SEL] = createTerminusMarkerBitmap(cyan, selected = true, density = density)
 
-    style.addImage(MapLibreTransitIds.ICON_DEPOT, createDepotMarkerBitmap(selected = false, density = density), false)
-    style.addImage(MapLibreTransitIds.ICON_DEPOT_SEL, createDepotMarkerBitmap(selected = true, density = density), false)
+    out[MapLibreTransitIds.ICON_DEPOT] = createDepotMarkerBitmap(selected = false, density = density)
+    out[MapLibreTransitIds.ICON_DEPOT_SEL] = createDepotMarkerBitmap(selected = true, density = density)
 
-    style.addImage(MapLibreTransitIds.ICON_STALE, createStaleAlertMarkerBitmap(selected = false, density = density), false)
-    style.addImage(MapLibreTransitIds.ICON_STALE_SEL, createStaleAlertMarkerBitmap(selected = true, density = density), false)
+    out[MapLibreTransitIds.ICON_STALE] = createStaleAlertMarkerBitmap(selected = false, density = density)
+    out[MapLibreTransitIds.ICON_STALE_SEL] = createStaleAlertMarkerBitmap(selected = true, density = density)
 
-    style.addImage(
-        MapLibreTransitIds.ICON_ROUTE_CHEVRON,
-        createRouteChevronBitmap(density = density),
-        false,
-    )
+    out[MapLibreTransitIds.ICON_ROUTE_CHEVRON] = createRouteChevronBitmap(density = density)
+    out[MapLibreTransitIds.ICON_FAV_STOP_STAR] = createFavoriteStarBitmap(density = density)
 
-    style.addImage(
-        MapLibreTransitIds.ICON_FAV_STOP_STAR,
-        createFavoriteStarBitmap(density = density),
-        false,
-    )
+    transitSpriteCache[dpi] = out
+    return out
+}
+
+internal fun registerTransitSprites(
+    style: Style,
+    density: Float,
+    preRendered: Map<String, Bitmap>? = null,
+) {
+    val sprites = preRendered ?: getOrCreateTransitSprites(density)
+    for ((id, bmp) in sprites) {
+        style.addImage(id, bmp, false)
+    }
 }
 
 private fun createFavoriteStarBitmap(density: Float): Bitmap {

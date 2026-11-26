@@ -153,7 +153,7 @@ data class ServiceAlertInfo(
             val calYear = java.util.Calendar.getInstance().apply {
                 timeInMillis = nowEpochSeconds * 1000L
             }.get(java.util.Calendar.YEAR)
-            val years = Regex("\\b(20\\d{2})\\b")
+            val years = FOUR_DIGIT_YEAR_REGEX
                 .findAll(fullText)
                 .mapNotNull { it.groupValues[1].toIntOrNull() }
                 .toList()
@@ -211,8 +211,20 @@ data class ServiceAlertInfo(
     }
 }
 
+private val FOUR_DIGIT_YEAR_REGEX = Regex("\\b(20\\d{2})\\b")
+private val ITALIAN_NUMERIC_DATE_REGEX = Regex("\\b([0-3]?\\d)[/\\-.]([01]?\\d)[/\\-.](20\\d{2})\\b")
+private val ITALIAN_MONTH_DATE_REGEX = Regex(
+    "\\b([0-3]?\\d)(?:°|º)?\\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\\s+(20\\d{2}))?\\b",
+    RegexOption.IGNORE_CASE,
+)
+private val WHITESPACE_COLLAPSE_REGEX = Regex("\\s+")
+private val TAIL_TO_PARENS_REGEX = Regex("\\s*\\(TO\\)\\s*$", RegexOption.IGNORE_CASE)
+private val FERMATA_PREFIX_REGEX = Regex("^Fermata\\s+\\d+\\s*[-–:]\\s*", RegexOption.IGNORE_CASE)
+private val NUMERIC_PREFIX_REGEX = Regex("^#?\\d{2,5}\\s*[-–:]\\s*")
+private val LINEA_ARROW_PREFIX_REGEX = Regex("^Linea\\s+[A-Za-z0-9/]+\\s*(?:->|→)\\s*", RegexOption.IGNORE_CASE)
+
 private fun extractItalianDatesEpochSeconds(text: String): List<Long> {
-    val matches = Regex("\\b([0-3]?\\d)[/\\-.]([01]?\\d)[/\\-.](20\\d{2})\\b").findAll(text)
+    val matches = ITALIAN_NUMERIC_DATE_REGEX.findAll(text)
     val cal = java.util.Calendar.getInstance()
     val out = mutableListOf<Long>()
     for (m in matches) {
@@ -248,17 +260,13 @@ private val ITALIAN_MONTHS = mapOf(
  * (preferring the past year if the month is >3 months ahead of now, or next year for Dec -> Jan rollover).
  */
 private fun extractItalianMonthDatesEpochSeconds(text: String, nowEpochSeconds: Long): List<Long> {
-    val pattern = Regex(
-        "\\b([0-3]?\\d)(?:°|º)?\\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\\s+(20\\d{2}))?\\b",
-        RegexOption.IGNORE_CASE,
-    )
     val nowCal = java.util.Calendar.getInstance().apply { timeInMillis = nowEpochSeconds * 1000L }
     val nowYear = nowCal.get(java.util.Calendar.YEAR)
     val nowMonth = nowCal.get(java.util.Calendar.MONTH) + 1
     val cal = java.util.Calendar.getInstance()
     val out = mutableListOf<Long>()
 
-    for (m in pattern.findAll(text)) {
+    for (m in ITALIAN_MONTH_DATE_REGEX.findAll(text)) {
         val day = m.groupValues[1].toIntOrNull() ?: continue
         val month = ITALIAN_MONTHS[m.groupValues[2].lowercase(java.util.Locale.ITALY)] ?: continue
         if (day !in 1..31) continue
@@ -417,7 +425,7 @@ data class RoutePattern(
         val cleanedHeadsign = rawName
             .substringAfter(" to ", rawName)
             .substringAfter(" -> ", rawName)
-            .replace(Regex("\\s*\\(TO\\)\\s*$", RegexOption.IGNORE_CASE), "")
+            .replace(TAIL_TO_PARENS_REGEX, "")
             .trim()
         val isGeneric = cleanedHeadsign.isBlank() ||
             cleanedHeadsign.startsWith("Linea ", ignoreCase = true) ||
@@ -436,44 +444,55 @@ data class RoutePattern(
  * Returns true when a direction/headsign label is too generic (e.g. "Centro", "Torino", "Linea 5")
  * to tell a commuter the actual terminus stop name (such as "Siccardi Cap").
  */
+private val GENERIC_DIRECTION_ZONES = setOf(
+    "centro",
+    "torino",
+    "torino centro",
+    "nord",
+    "sud",
+    "est",
+    "ovest",
+    "andata",
+    "ritorno",
+    "circolare",
+    "mirafiori",
+    "mirafiori nord",
+    "mirafiori sud",
+    "grugliasco",
+    "collegno",
+    "orbassano",
+    "moncalieri",
+    "nichelino",
+    "venaria",
+    "settimo",
+    "rivoli",
+    "beinasco",
+    "san mauro",
+)
+
 fun isGenericDirectionLabel(raw: String?): Boolean {
-    val cleaned = raw?.trim()?.replace(Regex("\\s+"), " ")?.lowercase(java.util.Locale.ITALY)
+    val cleaned = raw?.trim()?.replace(WHITESPACE_COLLAPSE_REGEX, " ")?.lowercase(java.util.Locale.ITALY)
         ?: return true
     if (cleaned.isEmpty() || cleaned == "?" || cleaned.startsWith("linea ")) return true
-    val genericZones = setOf(
-        "centro",
-        "torino",
-        "torino centro",
-        "nord",
-        "sud",
-        "est",
-        "ovest",
-        "andata",
-        "ritorno",
-        "circolare",
-        "mirafiori",
-        "mirafiori nord",
-        "mirafiori sud",
-        "grugliasco",
-        "collegno",
-        "orbassano",
-        "moncalieri",
-        "nichelino",
-        "venaria",
-        "settimo",
-        "rivoli",
-        "beinasco",
-        "san mauro",
-    )
-    return cleaned in genericZones
+    return cleaned in GENERIC_DIRECTION_ZONES
 }
 
 /**
  * Formats ALL-CAPS Turin GTT stop/terminus labels into clean readable Title Case
  * while preserving abbreviations like FS, GTT, M1 and already mixed-case names.
  */
+private val TURIN_KEEP_UPPER = setOf("FS", "GTT", "M1", "TO", "II", "III", "IV", "VI", "XX", "XXI")
+private val TURIN_SMALL_WORDS = setOf("di", "da", "del", "della", "delle", "dei", "degli", "dello", "in", "su", "per", "a", "e", "al", "alla", "alle", "ai")
+private val TURIN_ITALIAN_ABBR = mapOf(
+    "p.za" to "P.za",
+    "c.so" to "C.so",
+    "l.go" to "L.go",
+    "v.le" to "V.le",
+    "s.ta" to "S.ta",
+)
+
 fun formatTurinLabel(raw: String): String {
-    val trimmed = raw.trim().replace(Regex("\\s+"), " ")
+    val trimmed = raw.trim().replace(WHITESPACE_COLLAPSE_REGEX, " ")
     if (trimmed.isEmpty()) return trimmed
     if (trimmed.contains(',')) {
         val formattedParts = trimmed.split(",")
@@ -486,22 +505,12 @@ fun formatTurinLabel(raw: String): String {
     val hasLower = trimmed.any { it.isLowerCase() }
     if (hasLower) return trimmed
 
-    val keepUpper = setOf("FS", "GTT", "M1", "TO", "II", "III", "IV", "VI", "XX", "XXI")
-    val smallWords = setOf("di", "da", "del", "della", "delle", "dei", "degli", "dello", "in", "su", "per", "a", "e", "al", "alla", "alle", "ai")
-    val italianAbbr = mapOf(
-        "p.za" to "P.za",
-        "c.so" to "C.so",
-        "l.go" to "L.go",
-        "v.le" to "V.le",
-        "s.ta" to "S.ta",
-    )
-
     return trimmed.split(" ").mapIndexed { idx, token ->
         val lower = token.lowercase()
         when {
-            lower in italianAbbr -> italianAbbr.getValue(lower)
-            token in keepUpper -> token
-            idx > 0 && lower in smallWords -> lower
+            lower in TURIN_ITALIAN_ABBR -> TURIN_ITALIAN_ABBR.getValue(lower)
+            token in TURIN_KEEP_UPPER -> token
+            idx > 0 && lower in TURIN_SMALL_WORDS -> lower
             else -> {
                 // Handle apostrophes (e.g., D'AZEGLIO -> D'Azeglio, L'UNIONE -> L'Unione) and slashes/hyphens
                 val sb = StringBuilder(lower.length)
@@ -534,10 +543,10 @@ fun formatTurinLabel(raw: String): String {
  */
 fun shortTurinPlaceName(raw: String): String {
     val stripped = raw.trim()
-        .replace(Regex("^Fermata\\s+\\d+\\s*[-–:]\\s*", RegexOption.IGNORE_CASE), "")
-        .replace(Regex("^#?\\d{2,5}\\s*[-–:]\\s*"), "")
-        .replace(Regex("^Linea\\s+[A-Za-z0-9/]+\\s*(?:->|→)\\s*", RegexOption.IGNORE_CASE), "")
-        .replace(Regex("\\s*\\(TO\\)\\s*$", RegexOption.IGNORE_CASE), "")
+        .replace(FERMATA_PREFIX_REGEX, "")
+        .replace(NUMERIC_PREFIX_REGEX, "")
+        .replace(LINEA_ARROW_PREFIX_REGEX, "")
+        .replace(TAIL_TO_PARENS_REGEX, "")
         .trim()
     val formatted = formatTurinLabel(stripped)
     val commaIdx = formatted.indexOf(',')
@@ -569,6 +578,17 @@ data class StopSearchEntry(
     val lines: List<String> = emptyList(),
     val headsigns: List<String> = emptyList(),
 ) {
+    // Pre-computed display & lowercase search fields (allocated once on background thread
+    // when the stop index loads -> zero regexes & zero string allocations during scroll/search).
+    val displayName: String = shortTurinPlaceName(name)
+    val headsignSummary: String? = headsigns.take(2).joinToString(" · ").takeIf { it.isNotBlank() }
+    internal val searchCodeLower: String = stopCode.lowercase(java.util.Locale.ITALY)
+    internal val searchIdLower: String = stopId.lowercase(java.util.Locale.ITALY)
+    internal val searchNameLower: String = name.lowercase(java.util.Locale.ITALY)
+    internal val searchHeadLower: String = headsigns.joinToString(" ").lowercase(java.util.Locale.ITALY)
+    internal val searchLinesLower: List<String> = lines.map { it.lowercase(java.util.Locale.ITALY) }
+    internal val searchLinesUpper: List<String> = lines.map { it.trim().uppercase().replace(" ", "") }
+
     fun toTransitStop(directionId: Int = 0): TransitStop = TransitStop(
         stopId = stopId,
         stopCode = stopCode.ifBlank { stopId },

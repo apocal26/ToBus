@@ -36,10 +36,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.DirectionsBus
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Star
+import com.example.ui.icons.ToBusIcons
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -80,7 +80,6 @@ import com.example.R
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LineSummary
 import com.example.data.model.StopSearchEntry
-import com.example.data.model.shortTurinPlaceName
 import com.example.ui.glass.GlassCircleIconButton
 import com.example.ui.glass.glassInteractive
 import com.example.ui.glass.glassSpring
@@ -139,6 +138,37 @@ private val PickerSliderRimBrush = liquidGlassRimBrush(
 private enum class PickerTab(val label: String) {
     LINES("Linee"),
     STOPS("Fermate"),
+}
+
+@androidx.compose.runtime.Immutable
+private data class LineRowItems(
+    val key: String,
+    val items: List<LineSummary>,
+)
+
+@androidx.compose.runtime.Immutable
+private data class StopRowUiData(
+    val entry: StopSearchEntry,
+    val hasSelectedLine: Boolean,
+    val visibleLines: List<String>,
+    val overflowCount: Int,
+    val distLabel: String?,
+)
+
+private fun buildSharedStarPath(boxSizePx: Float, outerR: Float): Path {
+    val cx = boxSizePx * 0.5f
+    val cy = boxSizePx * 0.5f
+    val innerR = outerR * 0.44f
+    val path = Path()
+    for (i in 0 until 10) {
+        val r = if (i % 2 == 0) outerR else innerR
+        val angleRad = Math.toRadians(-90.0 + i * 36.0)
+        val x = cx + (r * kotlin.math.cos(angleRad)).toFloat()
+        val y = cy + (r * kotlin.math.sin(angleRad)).toFloat()
+        if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+    }
+    path.close()
+    return path
 }
 
 /**
@@ -225,7 +255,14 @@ fun LinePickerSheet(
 
     val sheetScope = rememberCoroutineScope()
     val headerDragOffsetY = remember { Animatable(0f) }
-    val dismissThresholdPx = with(LocalDensity.current) { 72.dp.toPx() }
+    val density = LocalDensity.current
+    val dismissThresholdPx = with(density) { 72.dp.toPx() }
+    val sharedStarPath = remember(density) {
+        with(density) { buildSharedStarPath(32.dp.toPx(), 6.8.dp.toPx()) }
+    }
+    val sharedStarOutlineStroke = remember(density) {
+        with(density) { Stroke(width = 1.25.dp.toPx()) }
+    }
     val linesListState = rememberLazyListState()
     val stopListState = rememberLazyListState()
 
@@ -437,7 +474,7 @@ fun LinePickerSheet(
                                 horizontalArrangement = Arrangement.Center,
                             ) {
                                 Icon(
-                                    imageVector = Icons.Rounded.DirectionsBus,
+                                    imageVector = ToBusIcons.DirectionsBus,
                                     contentDescription = null,
                                     tint = DarkInkOnAccent,
                                     modifier = Modifier.size(18.dp),
@@ -537,10 +574,23 @@ fun LinePickerSheet(
                             ((maxWidth - 40.dp + 10.dp) / 104.dp).toInt().coerceIn(3, 5)
                         }
                         val favoriteRows = remember(favoriteSummaries, columnCount) {
-                            favoriteSummaries.chunked(columnCount)
+                            favoriteSummaries.chunked(columnCount).map { row ->
+                                LineRowItems(key = "fav_row_${row.first().lineCode}", items = row)
+                            }
                         }
                         val regularRows = remember(regularLines, columnCount) {
-                            regularLines.chunked(columnCount)
+                            regularLines.chunked(columnCount).map { row ->
+                                LineRowItems(key = "reg_row_${row.first().lineCode}", items = row)
+                            }
+                        }
+                        val selectAndDismiss = remember {
+                            { code: String ->
+                                latestOnSelectLine(code)
+                                latestOnDismiss()
+                            }
+                        }
+                        val toggleFavoriteStable = remember {
+                            { code: String -> latestOnToggleFavoriteLine(code) }
                         }
 
                         // Pre-chunked LazyColumn cuts lazy subcomposition slots by 3x-5x during flings
@@ -567,19 +617,18 @@ fun LinePickerSheet(
                                 }
                                 items(
                                     items = favoriteRows,
-                                    key = { row -> "fav_row_${row.first().lineCode}" },
+                                    key = { it.key },
                                     contentType = { "fav_line_row" },
-                                ) { rowItems ->
+                                ) { rowData ->
                                     LineTileRow(
-                                        items = rowItems,
+                                        row = rowData,
                                         columnCount = columnCount,
                                         selectedLine = selectedLine,
                                         isFavoriteRow = true,
-                                        onSelectLine = { code ->
-                                            latestOnSelectLine(code)
-                                            latestOnDismiss()
-                                        },
-                                        onToggleFavorite = latestOnToggleFavoriteLine,
+                                        starPath = sharedStarPath,
+                                        starOutlineStroke = sharedStarOutlineStroke,
+                                        onSelectLine = selectAndDismiss,
+                                        onToggleFavorite = toggleFavoriteStable,
                                     )
                                 }
                                 if (regularRows.isNotEmpty()) {
@@ -599,19 +648,18 @@ fun LinePickerSheet(
 
                             items(
                                 items = regularRows,
-                                key = { row -> "reg_row_${row.first().lineCode}" },
+                                key = { it.key },
                                 contentType = { "line_row" },
-                            ) { rowItems ->
+                            ) { rowData ->
                                 LineTileRow(
-                                    items = rowItems,
+                                    row = rowData,
                                     columnCount = columnCount,
                                     selectedLine = selectedLine,
                                     isFavoriteRow = false,
-                                    onSelectLine = { code ->
-                                        latestOnSelectLine(code)
-                                        latestOnDismiss()
-                                    },
-                                    onToggleFavorite = latestOnToggleFavoriteLine,
+                                    starPath = sharedStarPath,
+                                    starOutlineStroke = sharedStarOutlineStroke,
+                                    onSelectLine = selectAndDismiss,
+                                    onToggleFavorite = toggleFavoriteStable,
                                 )
                             }
                         }
@@ -663,6 +711,51 @@ fun LinePickerSheet(
                     else -> {
                         val userLat = userLocation?.lat
                         val userLon = userLocation?.lon
+                        val preparedStopRows = remember(stopSearchResults, selectedLine, userLat, userLon) {
+                            val selectedUpper = selectedLine.trim().uppercase()
+                            stopSearchResults.map { entry ->
+                                val hasSelected = selectedUpper.isNotEmpty() && entry.searchLinesUpper.contains(selectedUpper)
+                                val visibleLines = if (entry.lines.isEmpty()) {
+                                    emptyList()
+                                } else if (!hasSelected) {
+                                    if (entry.lines.size <= 8) entry.lines else entry.lines.subList(0, 8)
+                                } else {
+                                    val ordered = ArrayList<String>(minOf(8, entry.lines.size))
+                                    for (code in entry.lines) {
+                                        if (code.equals(selectedUpper, ignoreCase = true)) {
+                                            ordered.add(code)
+                                            break
+                                        }
+                                    }
+                                    for (code in entry.lines) {
+                                        if (ordered.size >= 8) break
+                                        if (!code.equals(selectedUpper, ignoreCase = true)) {
+                                            ordered.add(code)
+                                        }
+                                    }
+                                    ordered
+                                }
+                                val distLabel = if (userLat != null && userLon != null) {
+                                    val m = GttFleetAnalyzer.haversineMeters(userLat, userLon, entry.lat, entry.lon).roundToInt()
+                                    if (m < 1000) "$m m" else "${(m / 100) / 10.0} km".replace('.', ',')
+                                } else {
+                                    null
+                                }
+                                StopRowUiData(
+                                    entry = entry,
+                                    hasSelectedLine = hasSelected,
+                                    visibleLines = visibleLines,
+                                    overflowCount = (entry.lines.size - visibleLines.size).coerceAtLeast(0),
+                                    distLabel = distLabel,
+                                )
+                            }
+                        }
+                        val selectStopAndDismiss = remember {
+                            { entry: StopSearchEntry ->
+                                latestOnSelectStop(entry)
+                                latestOnDismiss()
+                            }
+                        }
                         LazyColumn(
                             state = stopListState,
                             modifier = Modifier
@@ -673,28 +766,14 @@ fun LinePickerSheet(
                             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 2.dp, bottom = 20.dp),
                         ) {
                             items(
-                                items = stopSearchResults,
-                                key = { it.stopId },
+                                items = preparedStopRows,
+                                key = { it.entry.stopId },
                                 contentType = { "stop_row" },
-                            ) { entry ->
-                                val distMeters = remember(entry.stopId, userLat, userLon) {
-                                    if (userLat != null && userLon != null) {
-                                        GttFleetAnalyzer.haversineMeters(userLat, userLon, entry.lat, entry.lon).roundToInt()
-                                    } else {
-                                        null
-                                    }
-                                }
-                                val onStopClick = remember(entry.stopId) {
-                                    {
-                                        latestOnSelectStop(entry)
-                                        latestOnDismiss()
-                                    }
-                                }
+                            ) { rowData ->
                                 GlassStopSearchRow(
-                                    entry = entry,
+                                    row = rowData,
                                     selectedLine = selectedLine,
-                                    distanceMeters = distMeters,
-                                    onClick = onStopClick,
+                                    onSelect = selectStopAndDismiss,
                                 )
                             }
                         }
@@ -760,7 +839,7 @@ private fun PickerSegmentedToggle(
                     ) {
                         Icon(
                             imageVector = if (tab == PickerTab.LINES) {
-                                Icons.Rounded.DirectionsBus
+                                ToBusIcons.DirectionsBus
                             } else {
                                 Icons.Rounded.Place
                             },
@@ -787,35 +866,29 @@ private fun PickerSegmentedToggle(
 
 @Composable
 private fun GlassStopSearchRow(
-    entry: StopSearchEntry,
+    row: StopRowUiData,
     selectedLine: String,
-    distanceMeters: Int?,
-    onClick: () -> Unit,
+    onSelect: (StopSearchEntry) -> Unit,
 ) {
-    val hasSelectedLine = remember(entry.lines, selectedLine) {
-        entry.lines.any { it.equals(selectedLine, ignoreCase = true) }
-    }
-    val displayName = remember(entry.name) { shortTurinPlaceName(entry.name) }
-    val headsignSummary = remember(entry.headsigns) {
-        entry.headsigns.take(2).joinToString(" · ").takeIf { it.isNotBlank() }
-    }
-    val distLabel = remember(distanceMeters) {
-        distanceMeters?.let { m ->
-            if (m < 1000) "$m m" else "${(m / 100) / 10.0} km".replace('.', ',')
-        }
-    }
+    val entry = row.entry
+    val hasSelectedLine = row.hasSelectedLine
+    val fillColor = if (hasSelectedLine) RegularTileSelectedFill else RegularTileFill
     val borderColor = if (hasSelectedLine) AccentGold.copy(alpha = 0.45f) else RegularTileBorder
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 56.dp)
-            .background(if (hasSelectedLine) RegularTileSelectedFill else RegularTileFill, StopRowShape)
-            .border(1.dp, borderColor, StopRowShape)
+            .drawBehind {
+                val radius = 16.dp.toPx()
+                val cr = CornerRadius(radius, radius)
+                drawRoundRect(color = fillColor, cornerRadius = cr)
+                drawRoundRect(color = borderColor, cornerRadius = cr, style = Stroke(width = 1.dp.toPx()))
+            }
             .clickable(
-                interactionSource = remember { MutableInteractionSource() },
+                interactionSource = null,
                 indication = null,
-                onClick = onClick,
+                onClick = { onSelect(entry) },
             )
             .padding(horizontal = 13.dp, vertical = 10.dp)
             .testTag("stop_search_item_${entry.stopId}"),
@@ -827,37 +900,37 @@ private fun GlassStopSearchRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = displayName,
+                text = entry.displayName,
                 style = MaterialTheme.typography.titleMedium,
                 color = TextPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            Box(
+            Text(
+                text = "#${entry.stopCode}",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextBody,
                 modifier = Modifier
-                    .background(Color(0x22FFFFFF), PillShape)
-                    .border(1.dp, RegularTileBorder, PillShape)
+                    .drawBehind {
+                        val cr = CornerRadius(size.height * 0.5f, size.height * 0.5f)
+                        drawRoundRect(color = Color(0x22FFFFFF), cornerRadius = cr)
+                        drawRoundRect(color = RegularTileBorder, cornerRadius = cr, style = Stroke(width = 1.dp.toPx()))
+                    }
                     .padding(horizontal = 7.dp, vertical = 2.dp),
-            ) {
+            )
+            if (row.distLabel != null) {
                 Text(
-                    text = "#${entry.stopCode}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextBody,
-                )
-            }
-            if (distLabel != null) {
-                Text(
-                    text = distLabel,
+                    text = row.distLabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = AccentCyan,
                 )
             }
         }
 
-        if (headsignSummary != null) {
+        if (entry.headsignSummary != null) {
             Text(
-                text = "→ $headsignSummary",
+                text = "→ ${entry.headsignSummary}",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSubtitle,
                 maxLines = 1,
@@ -865,41 +938,32 @@ private fun GlassStopSearchRow(
             )
         }
 
-        if (entry.lines.isNotEmpty()) {
-            val visibleLines = remember(entry.lines, selectedLine) {
-                val sorted = entry.lines.sortedByDescending { it.equals(selectedLine, ignoreCase = true) }
-                sorted.take(8)
-            }
-            val overflowCount = (entry.lines.size - visibleLines.size).coerceAtLeast(0)
+        if (row.visibleLines.isNotEmpty()) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                visibleLines.forEach { lineCode ->
+                for (lineCode in row.visibleLines) {
                     val isActiveLine = lineCode.equals(selectedLine, ignoreCase = true)
-                    Box(
-                        modifier = Modifier
-                            .background(
-                                color = if (isActiveLine) AccentGold else Color(0x1EFFFFFF),
-                                shape = LineBadgeShape,
-                            )
-                            .border(
-                                width = 1.dp,
-                                color = if (isActiveLine) AccentGold else RegularTileBorder,
-                                shape = LineBadgeShape,
-                            )
-                            .padding(horizontal = 7.dp, vertical = 2.dp),
-                    ) {
-                        Text(
-                            text = lineCode,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (isActiveLine) DarkInkOnAccent else TextPrimary,
-                        )
-                    }
-                }
-                if (overflowCount > 0) {
+                    val badgeFill = if (isActiveLine) AccentGold else Color(0x1EFFFFFF)
+                    val badgeBorder = if (isActiveLine) AccentGold else RegularTileBorder
                     Text(
-                        text = "+$overflowCount",
+                        text = lineCode,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isActiveLine) DarkInkOnAccent else TextPrimary,
+                        modifier = Modifier
+                            .drawBehind {
+                                val r = 8.dp.toPx()
+                                val cr = CornerRadius(r, r)
+                                drawRoundRect(color = badgeFill, cornerRadius = cr)
+                                drawRoundRect(color = badgeBorder, cornerRadius = cr, style = Stroke(width = 1.dp.toPx()))
+                            }
+                            .padding(horizontal = 7.dp, vertical = 2.dp),
+                    )
+                }
+                if (row.overflowCount > 0) {
+                    Text(
+                        text = "+${row.overflowCount}",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSubtitle,
                     )
@@ -957,10 +1021,12 @@ private fun LineSectionHeader(
 
 @Composable
 private fun LineTileRow(
-    items: List<LineSummary>,
+    row: LineRowItems,
     columnCount: Int,
     selectedLine: String,
     isFavoriteRow: Boolean,
+    starPath: Path,
+    starOutlineStroke: Stroke,
     onSelectLine: (String) -> Unit,
     onToggleFavorite: (String) -> Unit,
 ) {
@@ -968,6 +1034,7 @@ private fun LineTileRow(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        val items = row.items
         for (idx in 0 until columnCount) {
             val item = items.getOrNull(idx)
             if (item != null) {
@@ -977,8 +1044,10 @@ private fun LineTileRow(
                     isSelected = isSelected,
                     isFavorite = isFavoriteRow,
                     highlightedFavorite = isFavoriteRow,
-                    onToggleFavorite = { onToggleFavorite(item.lineCode) },
-                    onClick = { onSelectLine(item.lineCode) },
+                    starPath = starPath,
+                    starOutlineStroke = starOutlineStroke,
+                    onToggleFavorite = onToggleFavorite,
+                    onSelectLine = onSelectLine,
                     modifier = Modifier.weight(1f),
                 )
             } else {
@@ -991,8 +1060,8 @@ private fun LineTileRow(
 /**
  * Ultra-lightweight line tile engineered for locked 90/120fps first-pass scrolling:
  * - Zero `.clip()` hardware outline masks.
- * - Zero `Icon` / `VectorPainter` allocations (star & live status dot rendered directly via Canvas).
- * - Zero Material Ripple indication nodes during flings.
+ * - Zero `Icon` / `VectorPainter` allocations (shared pre-built star Path & live status dot rendered directly via Canvas).
+ * - Zero `MutableInteractionSource` or Material Ripple allocations during flings.
  */
 @Composable
 private fun GlassLineTile(
@@ -1000,8 +1069,10 @@ private fun GlassLineTile(
     isSelected: Boolean,
     isFavorite: Boolean,
     highlightedFavorite: Boolean,
-    onToggleFavorite: () -> Unit,
-    onClick: () -> Unit,
+    starPath: Path,
+    starOutlineStroke: Stroke,
+    onToggleFavorite: (String) -> Unit,
+    onSelectLine: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val countLabel = when (summary.activeVehicleCount) {
@@ -1042,10 +1113,10 @@ private fun GlassLineTile(
                 }
             }
             .clickable(
-                interactionSource = remember { MutableInteractionSource() },
+                interactionSource = null,
                 indication = null,
                 role = Role.Button,
-                onClick = onClick,
+                onClick = { onSelectLine(summary.lineCode) },
             )
             .testTag("line_tile_${summary.lineCode}"),
     ) {
@@ -1082,40 +1153,24 @@ private fun GlassLineTile(
             )
         }
 
-        // Top-right favorite star toggle — cached Canvas Path (zero per-frame allocations)
+        // Top-right favorite star toggle — shares a single pre-built Path across all tiles (zero per-tile allocations)
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .size(32.dp)
                 .semantics { contentDescription = starContentDesc }
-                .drawWithCache {
-                    val cx = size.width * 0.5f
-                    val cy = size.height * 0.5f
-                    val outerR = 6.8.dp.toPx()
-                    val innerR = outerR * 0.44f
-                    val starPath = Path()
-                    for (i in 0 until 10) {
-                        val r = if (i % 2 == 0) outerR else innerR
-                        val angleRad = Math.toRadians(-90.0 + i * 36.0)
-                        val x = cx + (r * kotlin.math.cos(angleRad)).toFloat()
-                        val y = cy + (r * kotlin.math.sin(angleRad)).toFloat()
-                        if (i == 0) starPath.moveTo(x, y) else starPath.lineTo(x, y)
-                    }
-                    starPath.close()
-                    val outlineStroke = Stroke(width = 1.25.dp.toPx())
-                    onDrawBehind {
-                        if (isFavorite) {
-                            drawPath(path = starPath, color = AccentGold)
-                        } else {
-                            drawPath(path = starPath, color = TextTertiary, style = outlineStroke)
-                        }
+                .drawBehind {
+                    if (isFavorite) {
+                        drawPath(path = starPath, color = AccentGold)
+                    } else {
+                        drawPath(path = starPath, color = TextTertiary, style = starOutlineStroke)
                     }
                 }
                 .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
+                    interactionSource = null,
                     indication = null,
                     role = Role.Button,
-                    onClick = onToggleFavorite,
+                    onClick = { onToggleFavorite(summary.lineCode) },
                 )
                 .testTag("favorite_line_toggle_${summary.lineCode}"),
         )

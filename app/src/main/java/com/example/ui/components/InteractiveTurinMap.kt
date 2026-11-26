@@ -37,8 +37,11 @@ import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.MapStyle
 import com.example.data.model.RoutePattern
 import com.example.data.model.TransitStop
+import com.example.data.model.VehicleHealthAssessment
 import com.example.ui.viewmodel.CameraFlyRequest
 import com.example.ui.viewmodel.UserLocationState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -111,6 +114,8 @@ fun InteractiveTurinMap(
     colorByDirection: Boolean,
     focusedDirectionFilter: Int? = null,
     shiftCameraForBottomSheet: Boolean = true,
+    precomputedHealthById: Map<String, VehicleHealthAssessment>? = null,
+    precomputedDirectionById: Map<String, Int?>? = null,
     onCameraChange: (CameraState) -> Unit,
     onViewportSizeChange: (Int, Int) -> Unit,
     onVehicleTap: (BusVehicle?) -> Unit,
@@ -150,14 +155,18 @@ fun InteractiveTurinMap(
         }
     }
 
-    val spatialById = remember(vehicles, routePatterns) {
-        vehicles.associate { bus ->
-            bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, routePatterns)
+    val spatialById = remember(vehicles, routePatterns, precomputedHealthById) {
+        if (precomputedHealthById != null) {
+            emptyMap()
+        } else {
+            vehicles.associate { bus ->
+                bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, routePatterns)
+            }
         }
     }
 
-    val busHealthById = remember(vehicles, spatialById, nowMillis) {
-        vehicles.associate { bus ->
+    val busHealthById = remember(vehicles, spatialById, nowMillis, precomputedHealthById) {
+        precomputedHealthById ?: vehicles.associate { bus ->
             val spatial = spatialById[bus.vehicleId] ?: GttFleetAnalyzer.assessSpatial(bus, routePatterns)
             bus.vehicleId to GttFleetAnalyzer.assessWithSpatial(
                 bus = bus,
@@ -179,8 +188,8 @@ fun InteractiveTurinMap(
         }
     }
 
-    val resolvedDirectionById = remember(vehicles, routePatterns) {
-        vehicles.associate { bus ->
+    val resolvedDirectionById = remember(vehicles, routePatterns, precomputedDirectionById) {
+        precomputedDirectionById ?: vehicles.associate { bus ->
             bus.vehicleId to GttFleetAnalyzer.resolveDirectionId(bus, routePatterns)
         }
     }
@@ -488,15 +497,21 @@ fun InteractiveTurinMap(
         }
     }
 
-    // Load our deterministic, rich Turin vector style instantaneously whenever MapStyle changes
+    // Load our deterministic, rich Turin vector style with sprites pre-rendered off the main thread
     LaunchedEffect(mapLibreMap, mapStyle) {
         val map = mapLibreMap ?: return@LaunchedEffect
         activeStyle = null
-        val styleJson = TurinVectorStyleBuilder.buildStyleJson(mapStyle)
+        val (styleJson, preRenderedLandmarks, preRenderedTransit) = withContext(Dispatchers.Default) {
+            Triple(
+                TurinVectorStyleBuilder.buildStyleJson(mapStyle),
+                getOrCreateLandmarkDotSprites(isDark = mapStyle.isDark, density = density),
+                getOrCreateTransitSprites(density = density),
+            )
+        }
         map.setStyle(Style.Builder().fromJson(styleJson)) { style ->
             runCatching {
-                installMajorLandmarksLayer(style, mapStyle, density)
-                registerTransitSprites(style, density)
+                installMajorLandmarksLayer(style, mapStyle, density, preRenderedLandmarks = preRenderedLandmarks)
+                registerTransitSprites(style, density, preRendered = preRenderedTransit)
                 installTransitLayers(style, isDarkBasemap = mapStyle.isDark)
                 pushLineBusesToStyle(style, busMotionProgress.value)
                 pushExternalBusToStyle(style, busMotionProgress.value)

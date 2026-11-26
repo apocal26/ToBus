@@ -6,6 +6,7 @@ import android.util.Log
 import com.example.data.model.BusVehicle
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.GeoPoint
+import com.example.data.model.LineSummary
 import com.example.data.model.LiveFeedSnapshot
 import com.example.data.model.RoutePattern
 import com.example.data.model.ServiceAlertInfo
@@ -86,6 +87,9 @@ class GttRealtimeRepository private constructor(context: Context) {
     }
     private val widgetVehiclesCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         File(appContext.cacheDir, "widget_line_vehicles_v1.json")
+    }
+    private val activeLinesCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(appContext.cacheDir, "active_lines_v1.tsv")
     }
 
     private data class MovementRecord(
@@ -248,11 +252,17 @@ class GttRealtimeRepository private constructor(context: Context) {
         val matoMaxTs = matoCombined.maxOfOrNull { it.timestampSeconds } ?: 0L
         val feedTs = maxOf(base?.feedTimestampSeconds ?: 0L, matoMaxTs)
 
+        val nextSummaries = if (base != null && base.availableLines.isNotEmpty() && !activeFocus.isNullOrBlank()) {
+            updateLineSummariesForFocusLine(base.availableLines, enriched, activeFocus)
+        } else {
+            GtfsRtProtobufParser.buildLineSummaries(enriched)
+        }
+
         val updated = LiveFeedSnapshot(
             feedTimestampSeconds = feedTs,
             fetchedAtMillis = nowMillis,
             allVehicles = enriched,
-            availableLines = GtfsRtProtobufParser.buildLineSummaries(enriched),
+            availableLines = nextSummaries,
             sourceStatuses = updatedStatuses,
             alerts = base?.alerts ?: cachedAlerts,
         )
@@ -568,6 +578,9 @@ class GttRealtimeRepository private constructor(context: Context) {
                     alerts = cachedAlerts,
                 )
                 lastSnapshot = finalSnapshot
+                if (finalSnapshot.availableLines.isNotEmpty()) {
+                    saveActiveLinesCache(finalSnapshot.availableLines)
+                }
                 if (!focusLine.isNullOrBlank()) {
                     val normFocus = focusLine.trim().uppercase()
                     val lineBuses = enriched.filter {
@@ -938,6 +951,48 @@ class GttRealtimeRepository private constructor(context: Context) {
 
     fun getLastCachedSnapshot(): LiveFeedSnapshot? = lastSnapshot
 
+    /**
+     * Ultra-fast startup hydration of active GTT lines from a tiny TSV cache (~1.5 KB)
+     * so opening the Line Picker right after cold launch is instant even before the first HTTP poll finishes.
+     */
+    fun getCachedActiveLinesFast(maxAgeMillis: Long = ACTIVE_LINES_CACHE_TTL_MS): List<LineSummary> {
+        return runCatching {
+            val file = activeLinesCacheFile
+            if (!file.exists()) return emptyList()
+            if (System.currentTimeMillis() - file.lastModified() > maxAgeMillis) return emptyList()
+            val out = ArrayList<LineSummary>(120)
+            file.bufferedReader().use { reader ->
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    val tab = line.indexOf('\t')
+                    if (tab <= 0) continue
+                    val code = line.substring(0, tab).trim()
+                    val count = line.substring(tab + 1).trim().toIntOrNull() ?: continue
+                    if (code.isNotEmpty() && count >= 0) {
+                        out.add(
+                            LineSummary(
+                                lineCode = code,
+                                rawRouteIds = setOf(code),
+                                activeVehicleCount = count,
+                            ),
+                        )
+                    }
+                }
+            }
+            out
+        }.getOrDefault(emptyList())
+    }
+
+    private fun saveActiveLinesCache(lines: List<LineSummary>) {
+        runCatching {
+            val sb = StringBuilder(lines.size * 10)
+            for (item in lines) {
+                sb.append(item.lineCode).append('\t').append(item.activeVehicleCount).append('\n')
+            }
+            activeLinesCacheFile.writeText(sb.toString())
+        }
+    }
+
     suspend fun resolveStopNames(stopIds: Set<String>): Map<String, String> = withContext(Dispatchers.IO) {
         val cleaned = stopIds.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
         if (cleaned.isEmpty()) return@withContext emptyMap()
@@ -1162,7 +1217,7 @@ class GttRealtimeRepository private constructor(context: Context) {
             routeMemoryCache[memKey]?.let { return@withContext it }
         }
 
-        val safeKey = normalized.replace(Regex("[^A-Z0-9_]"), "_")
+        val safeKey = normalized.replace(SAFE_ROUTE_KEY_REGEX, "_")
         val diskFile = File(routeCacheDir, "route_v5_${safeKey}_$todayYyyyMmDd.json")
         if (!forceRefresh && diskFile.exists() && nowMillis - diskFile.lastModified() < ROUTE_CACHE_TTL_MS) {
             runCatching { parseCachedPatterns(diskFile.readText()) }
@@ -1216,7 +1271,7 @@ class GttRealtimeRepository private constructor(context: Context) {
 
         routeMemoryCache[memKey]?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
 
-        val safeKey = normalized.replace(Regex("[^A-Z0-9_]"), "_")
+        val safeKey = normalized.replace(SAFE_ROUTE_KEY_REGEX, "_")
         val diskFile = File(routeCacheDir, "route_v5_${safeKey}_$todayYyyyMmDd.json")
         if (diskFile.exists() && nowMillis - diskFile.lastModified() < ROUTE_CACHE_TTL_MS) {
             runCatching { parseCachedPatterns(diskFile.readText()) }
@@ -1991,7 +2046,7 @@ class GttRealtimeRepository private constructor(context: Context) {
     }
 
     private fun queryOverpassTurinRoute(lineCode: String): List<RoutePattern> {
-        val safeRef = lineCode.replace(Regex("[^A-Za-z0-9/\\- ]"), "")
+        val safeRef = lineCode.replace(OVERPASS_SAFE_REF_REGEX, "")
         if (safeRef.isBlank()) return emptyList()
 
         // Exact ref match uses Overpass tag index (10x faster than regex)
@@ -2301,10 +2356,13 @@ class GttRealtimeRepository private constructor(context: Context) {
             "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
         )
         private const val ROUTE_CACHE_TTL_MS = 6L * 60L * 60L * 1000L
+        private const val ACTIVE_LINES_CACHE_TTL_MS = 24L * 60L * 60L * 1000L
         private const val ALERTS_TTL_MS = 3L * 60L * 1000L
         private const val STOP_ARRIVAL_HORIZON_SEC = 50L * 60L
         private const val MAX_VEHICLE_ZOMBIE_AGE_SECONDS = 360L
         private const val MATO_PRECEDENCE_WINDOW_SECONDS = 25L
+        private val SAFE_ROUTE_KEY_REGEX = Regex("[^A-Z0-9_]")
+        private val OVERPASS_SAFE_REF_REGEX = Regex("[^A-Za-z0-9/\\- ]")
 
         @Volatile
         private var instance: GttRealtimeRepository? = null
@@ -2313,6 +2371,59 @@ class GttRealtimeRepository private constructor(context: Context) {
             return instance ?: synchronized(this) {
                 instance ?: GttRealtimeRepository(context).also { instance = it }
             }
+        }
+
+        /**
+         * Incrementally updates ONLY the focused line's summary entry during high-frequency MaTO MQTT frames,
+         * avoiding a full O(N log N) regrouping + sort over all ~400 citywide vehicles every ~2 seconds.
+         */
+        internal fun updateLineSummariesForFocusLine(
+            baseSummaries: List<LineSummary>,
+            vehicles: List<BusVehicle>,
+            focusLine: String?,
+        ): List<LineSummary> {
+            val target = focusLine?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+                ?: return GtfsRtProtobufParser.buildLineSummaries(vehicles)
+            var count = 0
+            val rawIds = HashSet<String>(4)
+            for (v in vehicles) {
+                if (v.lineCode.equals(target, ignoreCase = true) || v.rawRouteId.equals(target, ignoreCase = true)) {
+                    count++
+                    if (v.rawRouteId.isNotEmpty()) rawIds.add(v.rawRouteId)
+                }
+            }
+            val existingIdx = baseSummaries.indexOfFirst { it.lineCode.equals(target, ignoreCase = true) }
+            if (count == 0) {
+                return if (existingIdx < 0) baseSummaries else baseSummaries.filterIndexed { i, _ -> i != existingIdx }
+            }
+            if (existingIdx >= 0) {
+                val existing = baseSummaries[existingIdx]
+                if (existing.activeVehicleCount == count && (rawIds.isEmpty() || existing.rawRouteIds.containsAll(rawIds))) {
+                    return baseSummaries
+                }
+                val copy = ArrayList<LineSummary>(baseSummaries.size)
+                copy.addAll(baseSummaries)
+                copy[existingIdx] = existing.copy(
+                    rawRouteIds = if (rawIds.isNotEmpty()) existing.rawRouteIds + rawIds else existing.rawRouteIds,
+                    activeVehicleCount = count,
+                )
+                return copy
+            }
+            val added = LineSummary(
+                lineCode = target,
+                rawRouteIds = rawIds.ifEmpty { setOf(target) },
+                activeVehicleCount = count,
+            )
+            val merged = ArrayList<LineSummary>(baseSummaries.size + 1)
+            merged.addAll(baseSummaries)
+            merged.add(added)
+            merged.sortWith(
+                compareBy<LineSummary>(
+                    { it.lineCode.filter { ch -> ch.isDigit() }.toIntOrNull() ?: Int.MAX_VALUE },
+                    { it.lineCode },
+                ),
+            )
+            return merged
         }
 
         /**

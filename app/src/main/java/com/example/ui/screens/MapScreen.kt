@@ -60,16 +60,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.DirectionsBus
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
-import androidx.compose.material.icons.rounded.MyLocation
-import androidx.compose.material.icons.rounded.NotificationsActive
-import androidx.compose.material.icons.rounded.NotificationsNone
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Star
-import androidx.compose.material.icons.rounded.StarOutline
-import androidx.compose.material.icons.rounded.WarningAmber
+import com.example.ui.icons.ToBusIcons
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -345,6 +340,8 @@ fun MapScreen(
             colorByDirection = uiState.settings.colorByDirection,
             focusedDirectionFilter = focusedDirectionFilter,
             shiftCameraForBottomSheet = !isWideScreen,
+            precomputedHealthById = healthByVehicleId,
+            precomputedDirectionById = resolvedDirectionById,
             onCameraChange = onCameraChange,
             onViewportSizeChange = onViewportSizeChange,
             onVehicleTap = handleSelectVehicle,
@@ -736,7 +733,7 @@ fun MapScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.WarningAmber,
+                            imageVector = ToBusIcons.WarningAmber,
                             contentDescription = null,
                             tint = AccentRed,
                         )
@@ -926,7 +923,7 @@ fun MapScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.DirectionsBus,
+                            imageVector = ToBusIcons.DirectionsBus,
                             contentDescription = null,
                             tint = AccentGold,
                             modifier = Modifier.size(18.dp),
@@ -1210,9 +1207,9 @@ private fun GttAlertsGlassButton(
         ) {
             Icon(
                 imageVector = if (hasLineAlert || hasGeneralAlerts) {
-                    Icons.Rounded.NotificationsActive
+                    ToBusIcons.NotificationsActive
                 } else {
-                    Icons.Rounded.NotificationsNone
+                    ToBusIcons.NotificationsNone
                 },
                 contentDescription = stringResource(R.string.cd_gtt_alerts),
                 tint = iconTint,
@@ -1311,7 +1308,7 @@ private fun UserLocationGlassButton(
             contentAlignment = Alignment.Center,
         ) {
             Icon(
-                imageVector = Icons.Rounded.MyLocation,
+                imageVector = ToBusIcons.MyLocation,
                 contentDescription = stringResource(R.string.cd_user_location),
                 tint = iconTint,
                 modifier = Modifier
@@ -1488,9 +1485,9 @@ private fun GttAlertsDialog(
         ) {
             AccentIconBadge(
                 icon = if (allAlerts.isNotEmpty()) {
-                    Icons.Rounded.NotificationsActive
+                    ToBusIcons.NotificationsActive
                 } else {
-                    Icons.Rounded.NotificationsNone
+                    ToBusIcons.NotificationsNone
                 },
                 accent = headerAccent,
                 size = 42.dp,
@@ -1746,7 +1743,7 @@ private fun SelectedBusInspectorCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 AccentIconBadge(
-                    icon = Icons.Rounded.DirectionsBus,
+                    icon = ToBusIcons.DirectionsBus,
                     accent = badgeAccent,
                     size = 44.dp,
                     iconSize = 22.dp,
@@ -1850,7 +1847,7 @@ private fun SelectedBusInspectorCard(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.WarningAmber,
+                        imageVector = ToBusIcons.WarningAmber,
                         contentDescription = null,
                         tint = warnColor,
                         modifier = Modifier.size(18.dp),
@@ -2133,7 +2130,7 @@ private fun SelectedStopArrivalsCard(
                 Spacer(modifier = Modifier.width(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     GlassCircleIconButton(
-                        icon = if (isFavorite) Icons.Rounded.Star else Icons.Rounded.StarOutline,
+                        icon = if (isFavorite) Icons.Rounded.Star else ToBusIcons.StarOutline,
                         contentDescription = stringResource(R.string.cd_favorite_stop),
                         onClick = onToggleFavorite,
                         tint = if (isFavorite) AccentGold else TextSubtitle,
@@ -2348,7 +2345,7 @@ private fun SelectedStopArrivalsCard(
                                                 )
                                                 if (canLocateLive) {
                                                     Icon(
-                                                        imageVector = Icons.Rounded.MyLocation,
+                                                        imageVector = ToBusIcons.MyLocation,
                                                         contentDescription = "Mostra pullman sulla mappa",
                                                         tint = AccentEmerald.copy(alpha = 0.85f),
                                                         modifier = Modifier.size(11.dp),

@@ -38,6 +38,9 @@ class GttStaticRouteStore(context: Context) {
     private val gtfsZipFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         File(gtfsDir, "gtt_gtfs.zip")
     }
+    private val gtfsMetaFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        File(gtfsDir, "gtt_gtfs.meta")
+    }
     private val stopIndexCacheFile: File by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         File(gtfsDir, "stop_search_index_v1.tsv")
     }
@@ -165,29 +168,34 @@ class GttStaticRouteStore(context: Context) {
         val file = stopIndexCacheFile
         if (!file.exists() || file.length() < 64L) return null
         return try {
-            file.bufferedReader(StandardCharsets.UTF_8).use { reader ->
+            BufferedReader(InputStreamReader(file.inputStream(), StandardCharsets.UTF_8), 64 * 1024).use { reader ->
                 val header = reader.readLine() ?: return null
                 if (header != "#V1|$expectedStamp") return null
                 val out = ArrayList<StopSearchEntry>(4096)
                 var line = reader.readLine()
                 while (line != null) {
                     if (line.isNotEmpty()) {
-                        val parts = line.split('\t')
-                        if (parts.size >= 7) {
-                            val lat = parts[3].toDoubleOrNull()
-                            val lon = parts[4].toDoubleOrNull()
+                        val t0 = line.indexOf('\t')
+                        val t1 = if (t0 >= 0) line.indexOf('\t', t0 + 1) else -1
+                        val t2 = if (t1 >= 0) line.indexOf('\t', t1 + 1) else -1
+                        val t3 = if (t2 >= 0) line.indexOf('\t', t2 + 1) else -1
+                        val t4 = if (t3 >= 0) line.indexOf('\t', t3 + 1) else -1
+                        val t5 = if (t4 >= 0) line.indexOf('\t', t4 + 1) else -1
+                        if (t5 >= 0) {
+                            val lat = line.substring(t2 + 1, t3).toDoubleOrNull()
+                            val lon = line.substring(t3 + 1, t4).toDoubleOrNull()
                             if (lat != null && lon != null) {
-                                val lines = if (parts[5].isEmpty()) emptyList() else parts[5].split('|')
-                                val headsigns = if (parts[6].isEmpty()) emptyList() else parts[6].split('|')
+                                val linesField = line.substring(t4 + 1, t5)
+                                val headsField = line.substring(t5 + 1)
                                 out.add(
                                     StopSearchEntry(
-                                        stopId = parts[0],
-                                        stopCode = parts[1],
-                                        name = parts[2],
+                                        stopId = line.substring(0, t0),
+                                        stopCode = line.substring(t0 + 1, t1),
+                                        name = line.substring(t1 + 1, t2),
                                         lat = lat,
                                         lon = lon,
-                                        lines = lines,
-                                        headsigns = headsigns,
+                                        lines = splitPipeFast(linesField),
+                                        headsigns = splitPipeFast(headsField),
                                     ),
                                 )
                             }
@@ -201,6 +209,22 @@ class GttStaticRouteStore(context: Context) {
             Log.d(TAG, "Cache disco indice fermate non leggibile: ${e.message}")
             null
         }
+    }
+
+    private fun splitPipeFast(raw: String): List<String> {
+        if (raw.isEmpty()) return emptyList()
+        val firstPipe = raw.indexOf('|')
+        if (firstPipe < 0) return listOf(raw)
+        val out = ArrayList<String>(4)
+        var start = 0
+        var idx = firstPipe
+        while (idx >= 0) {
+            out.add(raw.substring(start, idx))
+            start = idx + 1
+            idx = raw.indexOf('|', start)
+        }
+        out.add(raw.substring(start))
+        return out
     }
 
     private fun writeStopSearchIndexCache(stamp: String, entries: List<StopSearchEntry>) {
@@ -242,14 +266,32 @@ class GttStaticRouteStore(context: Context) {
     private fun sanitizePipeField(value: String): String =
         sanitizeTsvField(value).replace('|', '/')
 
+    private fun readGtfsConditionalHeaders(): Pair<String?, String?> {
+        if (!gtfsMetaFile.exists()) return null to null
+        return runCatching {
+            val lines = gtfsMetaFile.readLines(StandardCharsets.UTF_8)
+            val etag = lines.getOrNull(0)?.trim()?.takeIf { it.isNotEmpty() }
+            val lastMod = lines.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
+            etag to lastMod
+        }.getOrDefault(null to null)
+    }
+
+    private fun saveGtfsConditionalHeaders(etag: String?, lastModified: String?) {
+        runCatching {
+            gtfsMetaFile.writeText("${etag.orEmpty()}\n${lastModified.orEmpty()}", StandardCharsets.UTF_8)
+        }
+    }
+
     private suspend fun ensureGtfsZipReady(): File? = downloadMutex.withLock {
-        if (gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES) {
+        val hasExistingValidZip = gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES
+        if (hasExistingValidZip) {
             val ageMs = System.currentTimeMillis() - gtfsZipFile.lastModified()
             if (ageMs < GTFS_TTL_MS) {
                 return@withLock gtfsZipFile
             }
         }
 
+        val (savedEtag, savedLastMod) = if (hasExistingValidZip) readGtfsConditionalHeaders() else (null to null)
         val tmpFile = File(gtfsDir, "gtt_gtfs.zip.tmp")
         for (url in GTFS_ZIP_URLS) {
             try {
@@ -257,6 +299,12 @@ class GttStaticRouteStore(context: Context) {
                     .url(url)
                     .header("User-Agent", USER_AGENT)
                     .header("Accept", "application/zip, application/octet-stream, */*")
+                if (!savedEtag.isNullOrBlank()) {
+                    reqBuilder.header("If-None-Match", savedEtag)
+                }
+                if (!savedLastMod.isNullOrBlank()) {
+                    reqBuilder.header("If-Modified-Since", savedLastMod)
+                }
                 if (url.contains("busone.app")) {
                     reqBuilder
                         .header("X-BusOne-Client", "ToBusTorino; android")
@@ -264,6 +312,11 @@ class GttStaticRouteStore(context: Context) {
                 }
 
                 downloadClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (resp.code == 304 && hasExistingValidZip) {
+                        // Upstream GTFS zip is unchanged -> keep cached file & stop search index intact!
+                        gtfsZipFile.setLastModified(System.currentTimeMillis())
+                        return@withLock gtfsZipFile
+                    }
                     if (!resp.isSuccessful) {
                         Log.d(TAG, "GTFS zip HTTP ${resp.code} da $url")
                         continue
@@ -280,6 +333,10 @@ class GttStaticRouteStore(context: Context) {
                     if (tmpFile.length() > MIN_VALID_ZIP_BYTES && isValidGtfsZip(tmpFile)) {
                         if (gtfsZipFile.exists()) gtfsZipFile.delete()
                         if (tmpFile.renameTo(gtfsZipFile)) {
+                            saveGtfsConditionalHeaders(
+                                etag = resp.header("ETag"),
+                                lastModified = resp.header("Last-Modified"),
+                            )
                             Log.i(TAG, "GTFS statico GTT scaricato (${gtfsZipFile.length() / 1024} KB) da $url")
                             return@withLock gtfsZipFile
                         }
@@ -316,7 +373,7 @@ class GttStaticRouteStore(context: Context) {
         private const val TAG = "GttStaticRouteStore"
         private const val USER_AGENT = "ToBusTorino/2.0 (Android Transit Widget)"
         private const val MIN_VALID_ZIP_BYTES = 10_000L
-        private const val GTFS_TTL_MS = 24L * 60L * 60L * 1000L
+        private const val GTFS_TTL_MS = 7L * 24L * 60L * 60L * 1000L
 
         private val GTFS_ZIP_URLS = listOf(
             "https://proxy.busone.app/gtt/gtfs.zip",
@@ -1382,7 +1439,8 @@ class GttStaticRouteStore(context: Context) {
     /**
      * Multi-token stop search supporting stop names, palina numbers, and line numbers together
      * (e.g. `"317"`, `"porta nuova"`, or `"porta nuova 12"`).
-     * When [query] is blank and user GPS is available, returns the closest physical poles nearby.
+     * Uses pre-normalized lowercase fields on [StopSearchEntry] and bounding-box pre-filtering
+     * for near-zero GC churn on low-end devices.
      */
     internal fun searchStops(
         index: List<StopSearchEntry>,
@@ -1396,49 +1454,89 @@ class GttStaticRouteStore(context: Context) {
         val normPref = normalizeLineKey(preferredLine)
         val trimmed = query.trim().lowercase(java.util.Locale.ITALY)
 
-        fun distMeters(e: StopSearchEntry): Double {
-            if (userLat == null || userLon == null) return 100_000.0
-            return com.example.data.model.GttFleetAnalyzer.haversineMeters(userLat, userLon, e.lat, e.lon)
-        }
-
         if (trimmed.isEmpty()) {
             return if (userLat != null && userLon != null) {
-                index.asSequence()
-                    .map { it to distMeters(it) }
-                    .filter { it.second <= 2_500.0 }
-                    .sortedBy { it.second }
-                    .take(14)
-                    .map { it.first }
-                    .toList()
+                // Fast bounding-box pre-filter (~2.5 km in Turin ≈ 0.023° lat, 0.033° lon) avoids trig on 90%+ of stops
+                val maxLatDelta = 0.024
+                val maxLonDelta = 0.034
+                val nearby = ArrayList<Pair<StopSearchEntry, Double>>(32)
+                for (entry in index) {
+                    if (kotlin.math.abs(entry.lat - userLat) > maxLatDelta) continue
+                    if (kotlin.math.abs(entry.lon - userLon) > maxLonDelta) continue
+                    val dist = com.example.data.model.GttFleetAnalyzer.haversineMeters(
+                        userLat,
+                        userLon,
+                        entry.lat,
+                        entry.lon,
+                    )
+                    if (dist <= 2_500.0) {
+                        nearby.add(entry to dist)
+                    }
+                }
+                nearby.sortBy { it.second }
+                val takeCount = minOf(14, nearby.size)
+                val res = ArrayList<StopSearchEntry>(takeCount)
+                for (i in 0 until takeCount) {
+                    res.add(nearby[i].first)
+                }
+                res
             } else {
-                index.asSequence()
-                    .filter { e -> e.lines.any { normalizeLineKey(it) == normPref } }
-                    .sortedBy { it.name }
-                    .take(14)
-                    .toList()
+                val matching = ArrayList<StopSearchEntry>(64)
+                for (entry in index) {
+                    if (normPref in entry.searchLinesUpper) {
+                        matching.add(entry)
+                    }
+                }
+                matching.sortBy { it.name }
+                if (matching.size > 14) matching.subList(0, 14).toList() else matching
             }
         }
 
-        val tokens = trimmed
-            .replace("#", " ")
-            .split(Regex("\\s+"))
-            .filter { it.isNotEmpty() }
+        // Manual zero-regex whitespace/hash tokenization
+        val tokens = ArrayList<String>(4)
+        var tokStart = -1
+        for (i in trimmed.indices) {
+            val ch = trimmed[i]
+            val isSep = ch == '#' || ch.isWhitespace()
+            if (isSep) {
+                if (tokStart >= 0) {
+                    tokens.add(trimmed.substring(tokStart, i))
+                    tokStart = -1
+                }
+            } else if (tokStart < 0) {
+                tokStart = i
+            }
+        }
+        if (tokStart >= 0) {
+            tokens.add(trimmed.substring(tokStart))
+        }
         if (tokens.isEmpty()) return emptyList()
 
-        val scored = ArrayList<Pair<StopSearchEntry, Double>>(64)
+        data class ScoredStop(val entry: StopSearchEntry, val score: Double, val distMeters: Double)
+        val scored = ArrayList<ScoredStop>(64)
+        val hasUserLoc = userLat != null && userLon != null
+
         for (entry in index) {
-            val codeLower = entry.stopCode.lowercase(java.util.Locale.ITALY)
-            val idLower = entry.stopId.lowercase(java.util.Locale.ITALY)
-            val nameLower = entry.name.lowercase(java.util.Locale.ITALY)
-            val headLower = entry.headsigns.joinToString(" ").lowercase(java.util.Locale.ITALY)
-            val linesLower = entry.lines.map { it.lowercase(java.util.Locale.ITALY) }
+            val codeLower = entry.searchCodeLower
+            val idLower = entry.searchIdLower
+            val nameLower = entry.searchNameLower
+            val headLower = entry.searchHeadLower
+            val linesLower = entry.searchLinesLower
 
             var allMatch = true
             var score = 0.0
-            for (tok in tokens) {
+            for (ti in tokens.indices) {
+                val tok = tokens[ti]
+                var lineExact = false
+                for (li in linesLower.indices) {
+                    if (linesLower[li] == tok) {
+                        lineExact = true
+                        break
+                    }
+                }
                 when {
                     codeLower == tok || idLower == tok -> score += 120.0
-                    linesLower.any { it == tok } -> score += 55.0
+                    lineExact -> score += 55.0
                     nameLower.startsWith(tok) -> score += 70.0
                     codeLower.startsWith(tok) -> score += 65.0
                     nameLower.contains(tok) -> score += 45.0
@@ -1451,25 +1549,36 @@ class GttStaticRouteStore(context: Context) {
             }
             if (!allMatch) continue
 
-            if (entry.lines.any { normalizeLineKey(it) == normPref }) {
+            if (normPref.isNotEmpty() && normPref in entry.searchLinesUpper) {
                 score += 18.0
             }
-            if (userLat != null && userLon != null) {
-                val d = distMeters(entry)
+            val dist = if (hasUserLoc) {
+                val d = com.example.data.model.GttFleetAnalyzer.haversineMeters(
+                    userLat!!,
+                    userLon!!,
+                    entry.lat,
+                    entry.lon,
+                )
                 // Gentle proximity bonus (up to +20 pts for stops right next to the user)
                 score += (20.0 * (1.0 - (d / 4_000.0).coerceIn(0.0, 1.0)))
+                d
+            } else {
+                100_000.0
             }
-            scored.add(entry to score)
+            scored.add(ScoredStop(entry, score, dist))
         }
 
-        return scored
-            .sortedWith(
-                compareByDescending<Pair<StopSearchEntry, Double>> { it.second }
-                    .thenBy { distMeters(it.first) }
-                    .thenBy { it.first.stopCode },
-            )
-            .take(limit)
-            .map { it.first }
+        scored.sortWith(
+            compareByDescending<ScoredStop> { it.score }
+                .thenBy { it.distMeters }
+                .thenBy { it.entry.stopCode },
+        )
+        val takeCount = minOf(limit, scored.size)
+        val out = ArrayList<StopSearchEntry>(takeCount)
+        for (i in 0 until takeCount) {
+            out.add(scored[i].entry)
+        }
+        return out
     }
     }
 }

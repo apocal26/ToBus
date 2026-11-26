@@ -64,7 +64,7 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Build APK
+      - name: Build & Verify Release APK
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
@@ -72,32 +72,60 @@ jobs:
           GITHUB_REPO: ${{ github.repository }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
+          set -euo pipefail
           VERSION_CLEAN="${RELEASE_TAG#v}"
           VERSION_CLEAN="${VERSION_CLEAN#V}"
           GRADLE_PROPS="-PtobusGithubRepo=${GITHUB_REPO} -PtobusVersionName=${VERSION_CLEAN} -PtobusVersionCode=${RUN_NUMBER}"
 
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
             echo "Compiling signed release APK using repository secrets..."
-            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "${GITHUB_WORKSPACE}/my-upload-key.jks"
-            export KEYSTORE_PATH="${GITHUB_WORKSPACE}/my-upload-key.jks"
-            gradle :app:assembleRelease $GRADLE_PROPS --no-daemon --stacktrace
-            APK_SOURCE="app/build/outputs/apk/release/app-release.apk"
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "${RUNNER_TEMP}/release-upload-key.jks"
+            export KEYSTORE_PATH="${RUNNER_TEMP}/release-upload-key.jks"
+            SIGN_PASS="$STORE_PASSWORD"
+            SIGN_KEY_PASS="$KEY_PASSWORD"
           else
-            echo "Compiling installable APK signed with project debug.keystore..."
+            echo "Compiling R8-optimized release APK signed with consistent project certificate..."
             if [ -f "debug.keystore.base64" ]; then
-              base64 -d debug.keystore.base64 > debug.keystore
+              base64 -d debug.keystore.base64 > "${RUNNER_TEMP}/ci-release.keystore"
             else
-              keytool -genkeypair -v -keystore debug.keystore -storepass android \
+              keytool -genkeypair -v -keystore "${RUNNER_TEMP}/ci-release.keystore" -storepass android \
                 -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
-                -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+                -validity 10000 -dname "CN=ToBus Release,O=ToBus,C=IT"
             fi
-            gradle :app:assembleDebug $GRADLE_PROPS --no-daemon --stacktrace
-            APK_SOURCE="app/build/outputs/apk/debug/app-debug.apk"
+            # Rename alias inside the temporary CI copy so Gradle's release signingConfig matches
+            # while keeping the exact same private key & certificate fingerprint across updates.
+            keytool -changealias -keystore "${RUNNER_TEMP}/ci-release.keystore" \
+              -storepass android -alias androiddebugkey -destalias upload
+            export KEYSTORE_PATH="${RUNNER_TEMP}/ci-release.keystore"
+            export STORE_PASSWORD="android"
+            export KEY_PASSWORD="android"
+            SIGN_PASS="android"
+            SIGN_KEY_PASS="android"
+          fi
+
+          gradle :app:assembleRelease $GRADLE_PROPS --no-daemon --stacktrace
+          APK_SOURCE="app/build/outputs/apk/release/app-release.apk"
+
+          BUILD_TOOLS_DIR="$(ls -d "${ANDROID_HOME}/build-tools/"* 2>/dev/null | sort -V | tail -n 1)"
+          if [ -n "$BUILD_TOOLS_DIR" ] && [ -x "${BUILD_TOOLS_DIR}/apksigner" ]; then
+            # Re-sign explicitly with v1+v2+v3 schemes after zipalign verification for maximum Android 7-16 compatibility
+            "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$APK_SOURCE"
+            "${BUILD_TOOLS_DIR}/apksigner" sign \
+              --ks "$KEYSTORE_PATH" \
+              --ks-key-alias upload \
+              --ks-pass "pass:${SIGN_PASS}" \
+              --key-pass "pass:${SIGN_KEY_PASS}" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              "$APK_SOURCE"
+            "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK_SOURCE"
           fi
 
           mkdir -p release-artifacts
           APK_NAME="ToBus-${RELEASE_TAG}.apk"
           cp "$APK_SOURCE" "release-artifacts/${APK_NAME}"
+          ls -lh "release-artifacts/${APK_NAME}"
           echo "APK_FILE=release-artifacts/${APK_NAME}" >> "$GITHUB_ENV"
 
       - name: Publish GitHub Release

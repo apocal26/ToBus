@@ -43,10 +43,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Map
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material.icons.rounded.Map
 import androidx.compose.material.icons.rounded.Settings
+import com.example.ui.icons.ToBusIcons
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Snackbar
@@ -107,7 +106,7 @@ private enum class AppDestination(
     val selectedIcon: ImageVector,
     val unselectedIcon: ImageVector,
 ) {
-    MAP("map_screen", R.string.tab_map, Icons.Rounded.Map, Icons.Outlined.Map),
+    MAP("map_screen", R.string.tab_map, ToBusIcons.MapRounded, ToBusIcons.MapOutlined),
     WIDGET("widget_studio_screen", R.string.tab_widget, Icons.Rounded.Settings, Icons.Outlined.Settings),
 }
 
@@ -249,8 +248,18 @@ fun ToBusApp(
         )
     }
 
-    val openLinePicker = remember { { showLinePicker = true } }
-    val closeLinePicker = remember { { showLinePicker = false } }
+    val openLinePicker = remember(viewModel) {
+        {
+            viewModel.setLinePickerOpen(true)
+            showLinePicker = true
+        }
+    }
+    val closeLinePicker = remember(viewModel) {
+        {
+            showLinePicker = false
+            viewModel.setLinePickerOpen(false)
+        }
+    }
     val refreshLive = remember(viewModel) { { viewModel.refreshLiveData() } }
     val refreshStopArrivals = remember(viewModel) { { viewModel.refreshSelectedStopArrivals(silent = false) } }
     val ensureWidgetPreviewRendered = remember(viewModel) { { viewModel.regenerateWidgetPreview(force = true) } }
@@ -419,16 +428,8 @@ fun ToBusApp(
                 slideOutVertically(animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing)) { it / 4 },
             modifier = Modifier.fillMaxSize(),
         ) {
-            LinePickerSheet(
-                selectedLine = uiState.settings.selectedLine,
-                activeLines = uiState.allActiveLines,
-                favoriteLines = uiState.favoriteLines,
-                stopSearchResults = uiState.stopSearchResults,
-                isLoadingStopIndex = uiState.isLoadingStopIndex,
-                userLocation = uiState.userLocation,
-                onSelectLine = viewModel::selectLine,
-                onToggleFavoriteLine = viewModel::toggleFavoriteLine,
-                onSearchStops = viewModel::searchStops,
+            LinePickerHost(
+                viewModel = viewModel,
                 onSelectStop = selectSearchedStop,
                 onDismiss = closeLinePicker,
             )
@@ -457,6 +458,28 @@ fun ToBusApp(
             )
         }
     }
+}
+
+@Composable
+private fun LinePickerHost(
+    viewModel: ToBusViewModel,
+    onSelectStop: (com.example.data.model.StopSearchEntry) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val pickerState by viewModel.linePickerState.collectAsStateWithLifecycle()
+    LinePickerSheet(
+        selectedLine = pickerState.selectedLine,
+        activeLines = pickerState.activeLines,
+        favoriteLines = pickerState.favoriteLines,
+        stopSearchResults = pickerState.stopSearchResults,
+        isLoadingStopIndex = pickerState.isLoadingStopIndex,
+        userLocation = pickerState.userLocation,
+        onSelectLine = viewModel::selectLine,
+        onToggleFavoriteLine = viewModel::toggleFavoriteLine,
+        onSearchStops = viewModel::searchStops,
+        onSelectStop = onSelectStop,
+        onDismiss = onDismiss,
+    )
 }
 
 private val NavSliderShape = RoundedCornerShape(999.dp)

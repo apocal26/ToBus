@@ -54,6 +54,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
 enum class WidgetPreviewSize(
     val labelIt: String,
@@ -79,6 +80,16 @@ data class UserLocationState(
 data class CameraFlyRequest(
     val target: CameraState,
     val id: Long,
+)
+
+@androidx.compose.runtime.Immutable
+data class LinePickerUiState(
+    val selectedLine: String = "4",
+    val activeLines: List<LineSummary> = emptyList(),
+    val favoriteLines: List<String> = emptyList(),
+    val stopSearchResults: List<StopSearchEntry> = emptyList(),
+    val isLoadingStopIndex: Boolean = false,
+    val userLocation: UserLocationState? = null,
 )
 
 @androidx.compose.runtime.Immutable
@@ -176,6 +187,22 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<ToBusUiState> = _uiState.asStateFlow()
 
+    // Dedicated slice for LinePickerSheet so background map/clock/telemetry updates never trigger
+    // sheet recompositions during list flings on low-end devices.
+    private val _linePickerState = MutableStateFlow(
+        LinePickerUiState(
+            selectedLine = initialSettings.selectedLine,
+            activeLines = emptyList(),
+            favoriteLines = _uiState.value.favoriteLines,
+            stopSearchResults = emptyList(),
+            isLoadingStopIndex = false,
+            userLocation = null,
+        ),
+    )
+    val linePickerState: StateFlow<LinePickerUiState> = _linePickerState.asStateFlow()
+
+    private val alertMentionRegexCache = ConcurrentHashMap<String, Regex>()
+
     // Isolated 1Hz poll countdown flow so RefreshProgressGlassButton animates independently
     // without forcing full-screen recompositions on MapScreen / LinePickerSheet every second.
     private val _pollProgress = MutableStateFlow(0f)
@@ -212,9 +239,21 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadRouteGeometry(_uiState.value.settings.selectedLine)
-        // Warm static GTFS zip & compact stop index silently in background so line switches
-        // and the Fermate search tab open instantaneously (~0ms wait).
+        // Hydrate active line list immediately from tiny disk cache (~1.5 KB) for instant Line Picker
+        // before the first live HTTP poll completes.
         viewModelScope.launch(Dispatchers.IO) {
+            val cachedLines = repository.getCachedActiveLinesFast()
+            if (cachedLines.isNotEmpty() && _uiState.value.allActiveLines.isEmpty()) {
+                _uiState.update { state ->
+                    if (state.allActiveLines.isEmpty()) state.copy(allActiveLines = cachedLines) else state
+                }
+                syncLinePickerState()
+            }
+        }
+        // Stagger static GTFS zip & stop index warmup after the initial 2.5s cold-start burst
+        // so MapLibre, route polyline, and the first live feed get 100% of CPU & I/O headroom.
+        viewModelScope.launch(Dispatchers.IO) {
+            delay(2_500L)
             repository.prefetchStaticGtfsInBackground()
             runCatching { repository.getStopSearchIndex() }
         }
@@ -225,6 +264,21 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             if (result is UpdateCheckResult.Available) {
                 _uiState.update { it.copy(availableUpdate = result.info) }
             }
+        }
+    }
+
+    private fun syncLinePickerState() {
+        val s = _uiState.value
+        val next = LinePickerUiState(
+            selectedLine = s.settings.selectedLine,
+            activeLines = s.allActiveLines,
+            favoriteLines = s.favoriteLines,
+            stopSearchResults = s.stopSearchResults,
+            isLoadingStopIndex = s.isLoadingStopIndex,
+            userLocation = s.userLocation,
+        )
+        if (_linePickerState.value != next) {
+            _linePickerState.value = next
         }
     }
 
@@ -304,6 +358,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     statusToast = "Permesso posizione non concesso",
                 )
             }
+            syncLinePickerState()
         }
     }
 
@@ -345,6 +400,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     statusToast = "Posizione GPS disattivata",
                 )
             }
+            syncLinePickerState()
         }
     }
 
@@ -456,6 +512,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 isLocatingUser = if (fromFreshFix) false else it.isLocatingUser && pendingCenterOnNextFix,
             )
         }
+        syncLinePickerState()
         if (pendingCenterOnNextFix) {
             pendingCenterOnNextFix = false
             flyCameraToUser(stateLoc, announceNearestStop = true)
@@ -609,6 +666,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             errorMessage = null,
                         )
                     }
+                    syncLinePickerState()
                     resolveMissingVehicleStopNames(filtered)
                     // Once live vehicles with tripIds arrive on this line, verify route geometry against
                     // the live tripIds so active Sunday/holiday detours match the street immediately!
@@ -695,6 +753,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     errorMessage = if (snapshot.allVehicles.isNotEmpty()) null else state.errorMessage,
                 )
             }
+            syncLinePickerState()
             resolveMissingVehicleStopNames(filtered)
         }
     }
@@ -749,6 +808,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 statusToast = "Linea $cleaned attiva",
             )
         }
+        syncLinePickerState()
 
         loadRouteGeometry(cleaned)
         resolveMissingVehicleStopNames(filtered)
@@ -762,10 +822,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     ): List<ServiceAlertInfo> {
         val target = lineCode.trim().uppercase()
         if (target.isEmpty()) return emptyList()
-        val mentionRegex = Regex(
-            pattern = "\\b(?:linea|linee)\\b[^.\\n]{0,45}\\b${Regex.escape(target)}\\b",
-            option = RegexOption.IGNORE_CASE,
-        )
+        val mentionRegex = alertMentionRegexCache.getOrPut(target) {
+            Regex(
+                pattern = "\\b(?:linea|linee)\\b[^.\\n]{0,45}\\b${Regex.escape(target)}\\b",
+                option = RegexOption.IGNORE_CASE,
+            )
+        }
         return alerts.filter { alert ->
             if (alert.affectedLines.isNotEmpty()) {
                 alert.affectedLines.any { it.equals(target, ignoreCase = true) }
@@ -1079,9 +1141,13 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     fun searchStops(query: String) {
         stopSearchJob?.cancel()
         stopSearchJob = viewModelScope.launch {
+            if (query.isNotBlank()) {
+                delay(90L)
+            }
             val state = _uiState.value
             if (state.stopSearchResults.isEmpty()) {
                 _uiState.update { it.copy(isLoadingStopIndex = true) }
+                syncLinePickerState()
             }
             val index = withContext(Dispatchers.IO) {
                 repository.getStopSearchIndex()
@@ -1102,6 +1168,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     isLoadingStopIndex = false,
                 )
             }
+            syncLinePickerState()
         }
     }
 
@@ -1230,6 +1297,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 },
             )
         }
+        syncLinePickerState()
     }
 
     fun openFavoriteStop(fav: FavoriteStop) {

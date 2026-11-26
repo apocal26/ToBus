@@ -29,16 +29,16 @@ class ToBusPreferences private constructor(context: Context) {
     private val _favoriteLines = MutableStateFlow(readFavoriteLines())
     val favoriteLines: StateFlow<List<String>> = _favoriteLines.asStateFlow()
 
-    fun currentSettings(): UserWidgetSettings = readSettings().also { _settings.value = it }
+    fun currentSettings(): UserWidgetSettings = _settings.value
 
-    fun currentFavoriteStops(): List<FavoriteStop> = readFavoriteStops().also { _favoriteStops.value = it }
+    fun currentFavoriteStops(): List<FavoriteStop> = _favoriteStops.value
 
-    fun currentFavoriteLines(): List<String> = readFavoriteLines().also { _favoriteLines.value = it }
+    fun currentFavoriteLines(): List<String> = _favoriteLines.value
 
     fun toggleFavoriteLine(lineCode: String): Pair<List<String>, Boolean> {
         val cleaned = lineCode.trim().uppercase()
         if (cleaned.isEmpty()) return _favoriteLines.value to false
-        val current = readFavoriteLines().toMutableList()
+        val current = _favoriteLines.value.toMutableList()
         val idx = current.indexOfFirst { it.equals(cleaned, ignoreCase = true) }
         val added: Boolean
         if (idx >= 0) {
@@ -57,7 +57,7 @@ class ToBusPreferences private constructor(context: Context) {
     }
 
     fun updateSettings(transform: (UserWidgetSettings) -> UserWidgetSettings): UserWidgetSettings {
-        val updated = transform(readSettings())
+        val updated = transform(_settings.value)
         saveSettings(updated)
         _settings.value = updated
         return updated
