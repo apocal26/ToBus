@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <include domain="sharedpref" path="tobus_torino_prefs.xml" />
-    <exclude domain="sharedpref" path="tobus_stop_widget_rows_v1.xml" />
 </full-backup-content>
