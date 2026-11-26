@@ -102,9 +102,13 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             -> {
                 val interval = ToBusPreferences.getInstance(appContext).currentSettings().refreshInterval
                 schedulePeriodicUpdates(appContext, interval)
+                val isPackageReplaced = intent.action == Intent.ACTION_MY_PACKAGE_REPLACED
                 val pendingResult = goAsync()
                 widgetScope.launch {
                     try {
+                        if (isPackageReplaced) {
+                            com.example.data.network.AppUpdateDownloader.cleanupOldUpdates(appContext)
+                        }
                         refreshAllInstalledWidgets(appContext, showLoadingFeedback = false, useCachedOnly = false)
                     } finally {
                         pendingResult.finish()

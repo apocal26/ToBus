@@ -7,8 +7,10 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -78,8 +80,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.model.MapStyle
 import com.example.data.model.VehicleFreshness
 import com.example.data.network.AppUpdateChecker
+import com.example.data.network.AppUpdateDownloader
+import com.example.data.network.UpdateInstallState
 import com.example.ui.components.LinePickerSheet
 import com.example.ui.components.UpdateAvailableDialog
+import java.io.File
 import com.example.ui.glass.AmbientGlowBackground
 import com.example.ui.glass.glassSpring
 import com.example.ui.screens.MapScreen
@@ -459,9 +464,54 @@ fun ToBusApp(
         val pendingUpdate = uiState.availableUpdate
         if (pendingUpdate != null) {
             val ctx = LocalContext.current
+            val installState = uiState.updateInstallState
+            val installPermLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.StartActivityForResult(),
+            ) {
+                viewModel.onInstallPermissionReturned()
+            }
+
+            // Automatically trigger Android's system package installer confirmation dialog
+            // as soon as the in-app APK download completes (or permission is granted).
+            LaunchedEffect(installState) {
+                if (installState is UpdateInstallState.ReadyToInstall) {
+                    val apkFile = File(installState.apkFilePath)
+                    if (apkFile.exists()) {
+                        runCatching {
+                            ctx.startActivity(AppUpdateDownloader.buildInstallApkIntent(ctx, apkFile))
+                        }
+                    }
+                }
+            }
+
             UpdateAvailableDialog(
                 update = pendingUpdate,
+                installState = installState,
                 onDownloadClick = {
+                    if (pendingUpdate.apkDownloadUrl != null) {
+                        viewModel.startInAppUpdateDownload()
+                    } else {
+                        val url = pendingUpdate.preferredOpenUrl
+                        if (AppUpdateChecker.isTrustedGithubUrl(url)) {
+                            runCatching {
+                                ctx.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    },
+                                )
+                            }
+                        }
+                        viewModel.dismissUpdateDialog()
+                    }
+                },
+                onCancelDownload = viewModel::cancelUpdateDownload,
+                onOpenInstallPermission = {
+                    runCatching {
+                        installPermLauncher.launch(AppUpdateDownloader.buildUnknownSourcesSettingsIntent(ctx))
+                    }
+                },
+                onInstallNow = viewModel::retriggerReadyApkInstall,
+                onOpenBrowserFallback = {
                     val url = pendingUpdate.preferredOpenUrl
                     if (AppUpdateChecker.isTrustedGithubUrl(url)) {
                         runCatching {

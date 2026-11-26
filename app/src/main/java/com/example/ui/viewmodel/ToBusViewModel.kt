@@ -34,10 +34,12 @@ import com.example.data.model.WidgetCameraMode
 import com.example.data.model.formatTurinLabel
 import com.example.data.model.shortTurinPlaceName
 import com.example.data.network.AppUpdateChecker
+import com.example.data.network.AppUpdateDownloader
 import com.example.data.network.AppUpdateInfo
 import com.example.data.network.GttRealtimeRepository
 import com.example.data.network.GttStaticRouteStore
 import com.example.data.network.UpdateCheckResult
+import com.example.data.network.UpdateInstallState
 import com.example.data.preferences.ToBusPreferences
 import com.example.map.TransitMapBitmapRenderer
 import com.example.map.WebMercator
@@ -135,6 +137,7 @@ data class ToBusUiState(
     val isRenderingPreview: Boolean = false,
     val statusToast: String? = null,
     val availableUpdate: AppUpdateInfo? = null,
+    val updateInstallState: UpdateInstallState = UpdateInstallState.Idle,
     val isCheckingUpdate: Boolean = false,
     val githubRepoSlug: String = "",
 ) {
@@ -229,6 +232,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var stopSearchJob: Job? = null
     private var foregroundPollingJob: Job? = null
     private var clockTickerJob: Job? = null
+    private var updateDownloadJob: Job? = null
+    private var installLaunchSeq: Long = 0L
     private var lastPollElapsedMs: Long = 0L
     private var lastWidgetSyncMillis: Long = 0L
     private var cameraFlySeq: Long = 0L
@@ -261,8 +266,10 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             repository.prefetchStaticGtfsInBackground()
             runCatching { repository.getStopSearchIndex() }
         }
-        // Lightweight once-per-24h GitHub Releases check, delayed after startup so cold boot stays instant.
+        // Clean up any previously downloaded update APKs automatically on startup, then run the
+        // lightweight once-per-24h GitHub Releases check after cold boot settles.
         viewModelScope.launch(Dispatchers.IO) {
+            AppUpdateDownloader.cleanupOldUpdates(appContext)
             delay(4_500L)
             val result = AppUpdateChecker.checkForUpdate(preferences = preferences, force = false)
             if (result is UpdateCheckResult.Available) {
@@ -1658,16 +1665,158 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun startInAppUpdateDownload() {
+        val update = _uiState.value.availableUpdate ?: return
+        if (update.apkDownloadUrl.isNullOrBlank()) return
+        if (_uiState.value.updateInstallState is UpdateInstallState.Downloading) return
+
+        updateDownloadJob?.cancel()
+        _uiState.update {
+            it.copy(updateInstallState = UpdateInstallState.Downloading(bytesDownloaded = 0L, totalBytes = -1L))
+        }
+        updateDownloadJob = viewModelScope.launch {
+            val result = AppUpdateDownloader.downloadApk(
+                context = appContext,
+                update = update,
+                onProgress = { downloaded, total ->
+                    _uiState.update { state ->
+                        if (state.updateInstallState is UpdateInstallState.Downloading) {
+                            state.copy(
+                                updateInstallState = UpdateInstallState.Downloading(
+                                    bytesDownloaded = downloaded,
+                                    totalBytes = total,
+                                ),
+                            )
+                        } else {
+                            state
+                        }
+                    }
+                },
+            )
+            result.fold(
+                onSuccess = { apkFile ->
+                    val nextState = if (AppUpdateDownloader.canInstallPackages(appContext)) {
+                        installLaunchSeq++
+                        UpdateInstallState.ReadyToInstall(
+                            apkFilePath = apkFile.absolutePath,
+                            launchSeq = installLaunchSeq,
+                        )
+                    } else {
+                        UpdateInstallState.NeedsInstallPermission(apkFilePath = apkFile.absolutePath)
+                    }
+                    _uiState.update { it.copy(updateInstallState = nextState) }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            updateInstallState = UpdateInstallState.Error(
+                                err.message ?: "Download non riuscito",
+                            ),
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    fun cancelUpdateDownload() {
+        updateDownloadJob?.cancel()
+        updateDownloadJob = null
+        viewModelScope.launch(Dispatchers.IO) {
+            AppUpdateDownloader.cleanupOldUpdates(appContext)
+        }
+        _uiState.update { it.copy(updateInstallState = UpdateInstallState.Idle) }
+    }
+
+    fun onInstallPermissionReturned() {
+        val current = _uiState.value.updateInstallState
+        val path = when (current) {
+            is UpdateInstallState.NeedsInstallPermission -> current.apkFilePath
+            is UpdateInstallState.ReadyToInstall -> current.apkFilePath
+            else -> return
+        }
+        val file = java.io.File(path)
+        if (!file.exists()) {
+            _uiState.update {
+                it.copy(updateInstallState = UpdateInstallState.Error("File APK non trovato, riprova il download"))
+            }
+            return
+        }
+        if (AppUpdateDownloader.canInstallPackages(appContext)) {
+            installLaunchSeq++
+            _uiState.update {
+                it.copy(
+                    updateInstallState = UpdateInstallState.ReadyToInstall(
+                        apkFilePath = path,
+                        launchSeq = installLaunchSeq,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun retriggerReadyApkInstall() {
+        val current = _uiState.value.updateInstallState
+        val path = when (current) {
+            is UpdateInstallState.ReadyToInstall -> current.apkFilePath
+            is UpdateInstallState.NeedsInstallPermission -> current.apkFilePath
+            else -> return
+        }
+        val file = java.io.File(path)
+        if (!file.exists()) {
+            startInAppUpdateDownload()
+            return
+        }
+        if (AppUpdateDownloader.canInstallPackages(appContext)) {
+            installLaunchSeq++
+            _uiState.update {
+                it.copy(
+                    updateInstallState = UpdateInstallState.ReadyToInstall(
+                        apkFilePath = path,
+                        launchSeq = installLaunchSeq,
+                    ),
+                )
+            }
+        } else {
+            _uiState.update {
+                it.copy(updateInstallState = UpdateInstallState.NeedsInstallPermission(apkFilePath = path))
+            }
+        }
+    }
+
     fun dismissUpdateDialog() {
-        _uiState.update { it.copy(availableUpdate = null) }
+        updateDownloadJob?.cancel()
+        updateDownloadJob = null
+        val wasInstalling = _uiState.value.updateInstallState is UpdateInstallState.ReadyToInstall
+        if (!wasInstalling) {
+            viewModelScope.launch(Dispatchers.IO) {
+                AppUpdateDownloader.cleanupOldUpdates(appContext)
+            }
+        }
+        _uiState.update {
+            it.copy(
+                availableUpdate = null,
+                updateInstallState = UpdateInstallState.Idle,
+            )
+        }
     }
 
     fun ignoreCurrentUpdateVersion() {
+        updateDownloadJob?.cancel()
+        updateDownloadJob = null
+        viewModelScope.launch(Dispatchers.IO) {
+            AppUpdateDownloader.cleanupOldUpdates(appContext)
+        }
         val tag = _uiState.value.availableUpdate?.tagName
         if (!tag.isNullOrBlank()) {
             preferences.setDismissedUpdateTag(tag)
         }
-        _uiState.update { it.copy(availableUpdate = null) }
+        _uiState.update {
+            it.copy(
+                availableUpdate = null,
+                updateInstallState = UpdateInstallState.Idle,
+            )
+        }
     }
 
     fun saveGithubRepoSlug(slug: String) {

@@ -772,6 +772,25 @@ class MatoLiveAndMergeTest {
         assertTrue(AppUpdateChecker.isTrustedGithubUrl("https://github.com/mario/ToBus/releases/download/v1.1.0/ToBus-v1.1.0.apk"))
         assertFalse(AppUpdateChecker.isTrustedGithubUrl("http://github.com/mario/ToBus/releases"))
         assertFalse(AppUpdateChecker.isTrustedGithubUrl("https://evil.example.com/ToBus.apk"))
+
+        assertTrue(com.example.data.network.AppUpdateDownloader.isAllowedDownloadHost("github.com"))
+        assertTrue(com.example.data.network.AppUpdateDownloader.isAllowedDownloadHost("objects.githubusercontent.com"))
+        assertTrue(com.example.data.network.AppUpdateDownloader.isAllowedDownloadHost("release-assets.githubusercontent.com"))
+        assertFalse(com.example.data.network.AppUpdateDownloader.isAllowedDownloadHost("evil-github.com"))
+        assertEquals("ToBus-v1.2.0.apk", com.example.data.network.AppUpdateDownloader.sanitizeApkFileName("v1.2.0"))
+        assertEquals("ToBus-v1.2_beta.apk", com.example.data.network.AppUpdateDownloader.sanitizeApkFileName("v1.2/beta"))
+
+        val validApk = File.createTempFile("valid_apk_", ".apk")
+        val badApk = File.createTempFile("bad_apk_", ".apk")
+        try {
+            validApk.writeBytes(byteArrayOf(0x50, 0x4B, 0x03, 0x04, 0x14, 0x00))
+            badApk.writeBytes("<html>not an apk</html>".toByteArray(StandardCharsets.UTF_8))
+            assertTrue(com.example.data.network.AppUpdateDownloader.hasValidApkHeader(validApk))
+            assertFalse(com.example.data.network.AppUpdateDownloader.hasValidApkHeader(badApk))
+        } finally {
+            validApk.delete()
+            badApk.delete()
+        }
     }
 
     private fun sampleBus(

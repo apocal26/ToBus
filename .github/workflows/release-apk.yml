@@ -116,9 +116,18 @@ jobs:
             export KEYSTORE_PATH="${RUNNER_TEMP}/release-upload-key.jks"
             SIGN_PASS="$STORE_PASSWORD"
             SIGN_KEY_PASS="$KEY_PASSWORD"
+          elif [ -f ".github/signing/tobus-ci-release.b64" ]; then
+            SIGN_SOURCE="Repository persistent CI keystore (.github/signing/tobus-ci-release.b64)"
+            echo "Compiling signed release APK using repository persistent CI keystore (no GitHub Secrets required)..."
+            tr -d '[:space:]' < .github/signing/tobus-ci-release.b64 | base64 -d > "${RUNNER_TEMP}/ci-release.keystore"
+            export KEYSTORE_PATH="${RUNNER_TEMP}/ci-release.keystore"
+            export STORE_PASSWORD="android"
+            export KEY_PASSWORD="android"
+            SIGN_PASS="android"
+            SIGN_KEY_PASS="android"
           elif [ -f "debug.keystore.base64" ]; then
             SIGN_SOURCE="Repository debug.keystore.base64 (fallback)"
-            echo "::warning::GitHub Secrets non configurati: firma con certificato fallback debug.keystore.base64. Configura KEYSTORE_BASE64, STORE_PASSWORD e KEY_PASSWORD per una firma release definitiva."
+            echo "Compiling signed release APK using debug.keystore.base64..."
             tr -d '[:space:]' < debug.keystore.base64 | base64 -d > "${RUNNER_TEMP}/ci-release.keystore"
             DETECTED_ALIAS="$(keytool -list -keystore "${RUNNER_TEMP}/ci-release.keystore" -storepass android \
               | awk -F',' '/PrivateKeyEntry|KeyEntry/ {print $1; exit}')"
@@ -132,7 +141,7 @@ jobs:
             SIGN_PASS="android"
             SIGN_KEY_PASS="android"
           else
-            echo "::error::Nessun keystore persistente trovato! Senza un certificato fisso Android rifiuta gli aggiornamenti con 'App non installata'. Configura i 3 GitHub Secrets del repository (KEYSTORE_BASE64, STORE_PASSWORD, KEY_PASSWORD)."
+            echo "::error::Nessun keystore persistente trovato nel repository o nei GitHub Secrets."
             exit 1
           fi
 
