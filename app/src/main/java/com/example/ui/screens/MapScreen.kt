@@ -92,12 +92,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.BusVehicle
 import com.example.data.model.CameraState
+import com.example.data.model.DataSourceMode
 import com.example.data.model.FavoriteStop
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.ServiceAlertInfo
@@ -174,6 +176,7 @@ fun MapScreen(
     onOpenFavoriteStop: (FavoriteStop) -> Unit,
     onFocusArrivalBus: (StopArrival, Int) -> Unit,
     onSelectLine: (String) -> Unit,
+    onSelectDataSourceMode: (DataSourceMode) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -937,6 +940,12 @@ fun MapScreen(
                     }
                 }
             } else if (uiState.settings.hasSelectedLine && !uiState.isLoadingFeed && uiState.errorMessage == null) {
+                val isFixedMato = uiState.settings.dataSourceMode == DataSourceMode.MATO_LIVE
+                val matoStatusDetail = if (isFixedMato) {
+                    uiState.sourceStatuses.firstOrNull { it.id == "mato_live" }?.detail
+                } else {
+                    null
+                }
                 MapOverlayGlassPill(
                     isLightBasemap = isLightBasemap,
                     modifier = Modifier.padding(horizontal = 16.dp),
@@ -952,15 +961,46 @@ fun MapScreen(
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (uiState.settings.hideInactiveOnMap && uiState.lineVehicles.isNotEmpty()) {
-                                "${uiState.lineVehicles.size} mezzi in deposito o fermi nascosti"
-                            } else {
-                                "Nessun mezzo attivo ora sulla linea ${uiState.settings.selectedLine}"
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextBody,
-                        )
+                        Column(modifier = Modifier.weight(1f, fill = false)) {
+                            Text(
+                                text = when {
+                                    uiState.settings.hideInactiveOnMap && uiState.lineVehicles.isNotEmpty() ->
+                                        "${uiState.lineVehicles.size} mezzi in deposito o fermi nascosti"
+                                    isFixedMato ->
+                                        "MaTO Live · 0 mezzi sulla linea ${uiState.settings.selectedLine}"
+                                    else ->
+                                        "Nessun mezzo attivo ora sulla linea ${uiState.settings.selectedLine}"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextBody,
+                            )
+                            if (!matoStatusDetail.isNullOrBlank()) {
+                                Text(
+                                    text = matoStatusDetail,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextBody.copy(alpha = 0.75f),
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                        if (isFixedMato) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            TextButton(
+                                onClick = { onSelectDataSourceMode(DataSourceMode.AUTO) },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("switch_to_auto_source_button"),
+                            ) {
+                                Text(
+                                    text = "Usa Auto",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = AccentCyan,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
+                        }
                     }
                 }
             }

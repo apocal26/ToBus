@@ -76,7 +76,7 @@ jobs:
           VERSION_CLEAN="${RELEASE_TAG#v}"
           VERSION_CLEAN="${VERSION_CLEAN#V}"
 
-          # Compute strictly monotonic versionCode from semantic version + run_number
+          # Compute strictly monotonic Int32-safe versionCode from semantic version + run_number
           # e.g. v1.0 (run 5) -> 10000005, v1.1 (run 6) -> 10100006, v1.1.2 (run 7) -> 10102007
           VERSION_CODE="$(python3 - "$VERSION_CLEAN" "$RUN_NUMBER" <<'PY'
           import re, sys
@@ -85,8 +85,12 @@ jobs:
           major = nums[0] if len(nums) > 0 else 1
           minor = nums[1] if len(nums) > 1 else 0
           patch = nums[2] if len(nums) > 2 else 0
-          code = major * 10_000_000 + minor * 100_000 + patch * 1_000 + (run_num % 1_000)
-          print(code)
+          if major >= 2000:
+              # Date-based tag (e.g. v2026.11.26) -> keep strictly within Int32 max (2,147,483,647)
+              code = ((major % 100) * 10_000_000) + ((minor % 100) * 100_000) + ((patch % 100) * 1_000) + (run_num % 1_000)
+          else:
+              code = min(major, 200) * 10_000_000 + min(minor, 99) * 100_000 + min(patch, 99) * 1_000 + (run_num % 1_000)
+          print(max(1, min(code, 2_100_000_000)))
           PY
           )"
           echo "Resolved release version: versionName=${VERSION_CLEAN}, versionCode=${VERSION_CODE}"
@@ -113,8 +117,8 @@ jobs:
             SIGN_PASS="$STORE_PASSWORD"
             SIGN_KEY_PASS="$KEY_PASSWORD"
           elif [ -f "debug.keystore.base64" ]; then
-            SIGN_SOURCE="Repository debug.keystore.base64"
-            echo "Compiling R8-optimized release APK signed with consistent project certificate..."
+            SIGN_SOURCE="Repository debug.keystore.base64 (fallback)"
+            echo "::warning::GitHub Secrets non configurati: firma con certificato fallback debug.keystore.base64. Configura KEYSTORE_BASE64, STORE_PASSWORD e KEY_PASSWORD per una firma release definitiva."
             tr -d '[:space:]' < debug.keystore.base64 | base64 -d > "${RUNNER_TEMP}/ci-release.keystore"
             DETECTED_ALIAS="$(keytool -list -keystore "${RUNNER_TEMP}/ci-release.keystore" -storepass android \
               | awk -F',' '/PrivateKeyEntry|KeyEntry/ {print $1; exit}')"
@@ -128,12 +132,15 @@ jobs:
             SIGN_PASS="android"
             SIGN_KEY_PASS="android"
           else
-            echo "::error::Nessun keystore persistente trovato! Senza un certificato fisso Android rifiuta gli aggiornamenti con 'App non installata'. Configura i 3 GitHub Secrets del repository (KEYSTORE_BASE64, STORE_PASSWORD, KEY_PASSWORD) oppure verifica la presenza del keystore persistente."
+            echo "::error::Nessun keystore persistente trovato! Senza un certificato fisso Android rifiuta gli aggiornamenti con 'App non installata'. Configura i 3 GitHub Secrets del repository (KEYSTORE_BASE64, STORE_PASSWORD, KEY_PASSWORD)."
             exit 1
           fi
 
           CERT_SHA256="$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass "$SIGN_PASS" -alias upload \
             | awk '/SHA256:/ {print $2; exit}')"
+          CERT_OWNER="$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass "$SIGN_PASS" -alias upload \
+            | awk -F': ' '/^Owner:/ {print $2; exit}')"
+          echo "Signing certificate Owner: ${CERT_OWNER}"
           echo "Signing certificate SHA-256: ${CERT_SHA256}"
 
           gradle :app:assembleRelease $GRADLE_PROPS --no-daemon --stacktrace
@@ -141,32 +148,45 @@ jobs:
 
           BUILD_TOOLS_DIR="$(ls -d "${ANDROID_HOME}/build-tools/"* 2>/dev/null | sort -V | tail -n 1)"
           if [ -n "$BUILD_TOOLS_DIR" ] && [ -x "${BUILD_TOOLS_DIR}/apksigner" ]; then
-            # Re-sign explicitly with v1+v2+v3 schemes after zipalign verification for maximum Android 7-16 compatibility
+            # Gradle already zipaligns (16 KB page aligned) and signs the release APK.
+            # Verify first WITHOUT mutating in-place; only re-align + sign to a fresh file if verification fails.
+            if ! "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$APK_SOURCE" || \
+               ! "${BUILD_TOOLS_DIR}/apksigner" verify --min-sdk-version 24 "$APK_SOURCE" >/dev/null 2>&1; then
+              echo "Re-aligning and re-signing APK cleanly to a fresh output file..."
+              "${BUILD_TOOLS_DIR}/zipalign" -P 16 -f 4 "$APK_SOURCE" "${RUNNER_TEMP}/aligned.apk"
+              "${BUILD_TOOLS_DIR}/apksigner" sign \
+                --ks "$KEYSTORE_PATH" \
+                --ks-key-alias upload \
+                --ks-pass "pass:${SIGN_PASS}" \
+                --key-pass "pass:${SIGN_KEY_PASS}" \
+                --min-sdk-version 24 \
+                --v2-signing-enabled true \
+                --v3-signing-enabled true \
+                --out "${RUNNER_TEMP}/signed.apk" \
+                "${RUNNER_TEMP}/aligned.apk"
+              cp "${RUNNER_TEMP}/signed.apk" "$APK_SOURCE"
+            fi
+            # Strictly verify BOTH alignment and signature on the exact final APK before uploading
             "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$APK_SOURCE"
-            "${BUILD_TOOLS_DIR}/apksigner" sign \
-              --ks "$KEYSTORE_PATH" \
-              --ks-key-alias upload \
-              --ks-pass "pass:${SIGN_PASS}" \
-              --key-pass "pass:${SIGN_KEY_PASS}" \
-              --v1-signing-enabled true \
-              --v2-signing-enabled true \
-              --v3-signing-enabled true \
-              "$APK_SOURCE"
-            "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "$APK_SOURCE"
+            "${BUILD_TOOLS_DIR}/apksigner" verify --min-sdk-version 24 --verbose --print-certs "$APK_SOURCE"
           fi
 
           mkdir -p release-artifacts
           APK_NAME="ToBus-${RELEASE_TAG}.apk"
           cp "$APK_SOURCE" "release-artifacts/${APK_NAME}"
+          APK_SHA256="$(sha256sum "release-artifacts/${APK_NAME}" | awk '{print $1}')"
+          APK_SIZE="$(ls -lh "release-artifacts/${APK_NAME}" | awk '{print $5}')"
           ls -lh "release-artifacts/${APK_NAME}"
           echo "APK_FILE=release-artifacts/${APK_NAME}" >> "$GITHUB_ENV"
 
           {
             echo "### Release APK Summary"
-            echo "- **APK**: \`${APK_NAME}\`"
+            echo "- **APK**: \`${APK_NAME}\` (${APK_SIZE})"
+            echo "- **APK SHA-256**: \`${APK_SHA256}\`"
             echo "- **versionName**: \`${VERSION_CLEAN}\`"
             echo "- **versionCode**: \`${VERSION_CODE}\`"
             echo "- **Signing source**: ${SIGN_SOURCE}"
+            echo "- **Certificate Owner**: \`${CERT_OWNER}\`"
             echo "- **Certificate SHA-256**: \`${CERT_SHA256}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 

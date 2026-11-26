@@ -355,6 +355,7 @@ fun ToBusApp(
                             onOpenFavoriteStop = viewModel::openFavoriteStop,
                             onFocusArrivalBus = viewModel::focusBusForArrival,
                             onSelectLine = viewModel::selectLine,
+                            onSelectDataSourceMode = viewModel::setDataSourceMode,
                         )
 
                         AppDestination.WIDGET -> WidgetStudioScreen(

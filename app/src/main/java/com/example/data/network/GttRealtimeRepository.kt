@@ -18,6 +18,7 @@ import com.example.data.model.VehicleStopStatus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -163,14 +164,21 @@ class GttRealtimeRepository private constructor(context: Context) {
         val rawMsgs = matoMqttClient.rawPublishCount()
         val parsed = matoMqttClient.parsedVehicleCount()
         val cached = matoMqttClient.totalCachedVehicles()
+        val subOk = matoMqttClient.subAckAcceptedCount()
+        val subRej = matoMqttClient.subAckRejectedCount()
+        val sampleTopic = matoMqttClient.lastSampleTopic()?.take(24)
         val connSince = matoMqttClient.connectedSinceMillis()
         val connectedAgeMs = if (connSince > 0L) (nowMillis - connSince).coerceAtLeast(0L) else 0L
         return when {
-            matoMqttClient.subAckRejectedAll() -> "${prefix}Topic rifiutati"
-            rawMsgs > 0L && parsed == 0L -> "${prefix}$rawMsgs msg · formato non riconosciuto"
+            matoMqttClient.subAckRejectedAll() -> "${prefix}Topic rifiutati dal broker 5T ($subRej)"
+            rawMsgs > 0L && parsed == 0L -> {
+                val topicPart = sampleTopic?.let { " ($it)" }.orEmpty()
+                "${prefix}$rawMsgs msg non riconosciuti$topicPart"
+            }
             cached > 0 -> "${prefix}0 mezzi su linea ($cached in rete)"
-            connectedAgeMs < 10_000L -> "${prefix}In attesa dati…"
-            else -> "${prefix}Connesso · 0 mezzi ricevuti"
+            connectedAgeMs < 10_000L -> "${prefix}Connesso · in attesa dati…"
+            subOk > 0 -> "${prefix}Connesso ($subOk topic OK · 0 msg da 5T)"
+            else -> "${prefix}Connesso · 0 msg dal broker 5T"
         }
     }
 
@@ -199,19 +207,24 @@ class GttRealtimeRepository private constructor(context: Context) {
         val nowMillis = System.currentTimeMillis()
         val matoLive = matoMqttClient.snapshotFreshVehicles(nowMillis)
         val connected = matoMqttClient.isConnected()
-        if (matoLive.isEmpty() && !connected) return null
-
         val isFixedMato = dataSourceMode == DataSourceMode.MATO_LIVE
+        val lastErr = matoMqttClient.lastError()
+        if (matoLive.isEmpty() && !connected && !(isFixedMato && lastErr != null)) return null
+
         val base = lastSnapshot
         if (matoLive.isEmpty() && base != null) {
-            // MQTT just connected before first vehicle frame arrived -> reflect real wait/diagnostic state
+            // MQTT connected (waiting/diagnostics) or fixed MaTO errored -> reflect real live diagnostic state
             val matoStatus = DataSourceStatus(
                 id = "mato_live",
                 name = "MaTO Live",
-                isOnline = true,
+                isOnline = connected,
                 latencyMs = 0L,
                 itemCount = 0,
-                detail = buildMatoConnectedIdleDetail(isFixedMato, nowMillis),
+                detail = if (connected) {
+                    buildMatoConnectedIdleDetail(isFixedMato, nowMillis)
+                } else {
+                    "Fonte fissa · ${lastErr ?: "Disconnesso"}"
+                },
             )
             val filteredBaseStatuses = if (isFixedMato) {
                 base.sourceStatuses.filterNot { it.id == "mato_live" || it.id == "gtt_official" || it.id == "busone_proxy" }
@@ -219,7 +232,14 @@ class GttRealtimeRepository private constructor(context: Context) {
                 base.sourceStatuses.filterNot { it.id == "mato_live" }
             }
             val updatedStatuses = listOf(matoStatus) + filteredBaseStatuses
-            val updated = base.copy(sourceStatuses = updatedStatuses)
+            val updated = if (isFixedMato) {
+                base.copy(
+                    allVehicles = base.allVehicles.filter { it.sourceName == "MaTO Live" },
+                    sourceStatuses = updatedStatuses,
+                )
+            } else {
+                base.copy(sourceStatuses = updatedStatuses)
+            }
             lastSnapshot = updated
             return updated
         }
@@ -434,10 +454,28 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val tripRes = tripUpdatesJob?.await()
                 val alertsRes = alertsJob?.await()
 
-                val matoMqttVehicles = if (!widgetFastMode && useMato) {
+                var matoMqttVehicles = if (!widgetFastMode && useMato) {
                     matoMqttClient.snapshotFreshVehicles(nowMillis)
                 } else {
                     emptyList()
+                }
+                // In fixed MATO_LIVE mode, give a newly opened MQTT WebSocket up to 2.4s to finish
+                // TLS + CONNACK + SUBSCRIBE + first vehicle burst before returning an empty poll.
+                if (effectiveMode == DataSourceMode.MATO_LIVE &&
+                    !widgetFastMode &&
+                    matoMqttVehicles.isEmpty() &&
+                    matoGqlVehicles.isEmpty() &&
+                    matoMqttClient.isActiveOrConnecting()
+                ) {
+                    val waitDeadline = System.currentTimeMillis() + 2_400L
+                    while (System.currentTimeMillis() < waitDeadline) {
+                        delay(200L)
+                        val fresh = matoMqttClient.snapshotFreshVehicles(System.currentTimeMillis())
+                        if (fresh.isNotEmpty()) {
+                            matoMqttVehicles = fresh
+                            break
+                        }
+                    }
                 }
                 var matoCombined = if (useMato) {
                     mergeMultiSourceVehicles(
@@ -555,12 +593,15 @@ class GttRealtimeRepository private constructor(context: Context) {
                     sourceReports["MaTO Live"]?.isFrozenForLine(normFocus ?: "", normFocus) == true
 
                 val statuses = mutableListOf<DataSourceStatus>()
+                val matoConnecting = useMato && !widgetFastMode && matoMqttClient.isActiveOrConnecting()
                 val matoOnline = useMato && ((!widgetFastMode && matoMqttClient.isConnected()) || matoCombined.isNotEmpty())
                 if (useMato && (!widgetFastMode || matoGqlVehicles.isNotEmpty() || effectiveMode == DataSourceMode.MATO_LIVE)) {
                     val matoMode = when {
                         effectiveMode == DataSourceMode.MATO_LIVE && matoCombined.isNotEmpty() -> "Fonte fissa"
                         effectiveMode == DataSourceMode.MATO_LIVE && !widgetFastMode && matoMqttClient.isConnected() ->
                             buildMatoConnectedIdleDetail(isFixedMato = true, nowMillis = nowMillis)
+                        effectiveMode == DataSourceMode.MATO_LIVE && matoConnecting ->
+                            "Fonte fissa · ${matoMqttClient.lastError() ?: "Connessione in corso…"}"
                         finalMatoFrozen && matoCombined.isNotEmpty() -> "GPS fermi · fallback attivo"
                         (finalGttFrozen || finalBusOneFrozen) && matoCombined.isNotEmpty() -> "Priorità attiva"
                         matoMqttVehicles.isNotEmpty() && matoGqlVehicles.isNotEmpty() -> "MQTT + GraphQL"
@@ -656,7 +697,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                         }
                     }
                     DataSourceMode.MATO_LIVE -> {
-                        if (matoCombined.isEmpty() && !matoOnline) {
+                        if (matoCombined.isEmpty() && !matoOnline && !matoConnecting) {
                             return@coroutineScope Result.failure(
                                 IOException("Feed MaTO Live non raggiungibile"),
                             )

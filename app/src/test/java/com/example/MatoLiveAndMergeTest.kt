@@ -439,6 +439,106 @@ class MatoLiveAndMergeTest {
         assertEquals(42, pub1.packetId)
         val pubAck = MatoMqttLiveClient.encodePubAckPacket(42)
         assertEquals(listOf(0x40, 0x02, 0x00, 0x2A), pubAck.map { it.toInt() and 0xFF })
+
+        // 6. Primary exact subscription group must include /map/v1/eta/12U & /gtt:12U with zero '#' wildcards
+        val exactGroup = MatoMqttLiveClient.buildLineSubscriptionGroups("12").first()
+        assertTrue(exactGroup.contains("/12U"))
+        assertTrue(exactGroup.contains("/gtt:12U"))
+        assertTrue(exactGroup.contains("/map/v1/eta/12U"))
+        assertFalse(exactGroup.any { it.contains("#") })
+
+        // 7. Bare GTFS-RT VehiclePosition protobuf (no FeedMessage wrapper, route/veh inferred from topic)
+        fun writeFixed32LE(out: ByteArrayOutputStream, bits: Int) {
+            out.write(bits and 0xFF)
+            out.write((bits ushr 8) and 0xFF)
+            out.write((bits ushr 16) and 0xFF)
+            out.write((bits ushr 24) and 0xFF)
+        }
+        val posBytes = ByteArrayOutputStream().apply {
+            write(0x0D) // field 1 (lat), wire 5 (32-bit float)
+            writeFixed32LE(this, java.lang.Float.floatToRawIntBits(45.0612f))
+            write(0x15) // field 2 (lon), wire 5 (32-bit float)
+            writeFixed32LE(this, java.lang.Float.floatToRawIntBits(7.6725f))
+        }.toByteArray()
+        val bareVpBytes = ByteArrayOutputStream().apply {
+            write(0x12) // field 2 (position), wire 2 (length-delimited)
+            write(posBytes.size)
+            write(posBytes)
+        }.toByteArray()
+        val bareProtoParsed = MatoMqttLiveClient.parseMatoMessage("/map/v1/eta/12U/9088", bareVpBytes, nowMillis)
+        assertEquals(1, bareProtoParsed.size)
+        assertEquals("12", bareProtoParsed[0].lineCode)
+        assertEquals("9088", bareProtoParsed[0].vehicleId)
+        assertEquals(45.0612, bareProtoParsed[0].latitude, 0.001)
+        assertEquals(7.6725, bareProtoParsed[0].longitude, 0.001)
+    }
+
+    @Test
+    fun parseMatoMessageDecodes5tScreFlatPositionalJsonArrays() {
+        // 1. Real 5T /scre positional JSONArray (lon, lat, heading, speed, tripId, direct, nextStop, full)
+        val lonLatArray = """[7.6584, 45.0512, 140, 28, "gtt:T88421", 0, 1245, false]"""
+            .toByteArray(StandardCharsets.UTF_8)
+        val p1 = MatoMqttLiveClient.parseMatoMessage("/12U/9037", lonLatArray, nowMillis)
+        assertEquals(1, p1.size)
+        assertEquals("9037", p1[0].vehicleId)
+        assertEquals("12", p1[0].lineCode)
+        assertEquals(45.0512, p1[0].latitude, 0.0001)
+        assertEquals(7.6584, p1[0].longitude, 0.0001)
+        assertEquals(140f, p1[0].bearing ?: -1f, 0.01f)
+        assertEquals(28f, p1[0].speedKmh ?: -1f, 0.01f)
+        assertEquals("T88421", p1[0].tripId)
+        assertEquals(0, p1[0].directionId)
+        assertEquals("1245", p1[0].stopId)
+
+        // 2. Lat-first positional JSONArray + direct=1 + boolean full=true
+        val latLonArray = """[45.0425, 7.6410, 275, 19, "T99100", 1, 2514, true]"""
+            .toByteArray(StandardCharsets.UTF_8)
+        val p2 = MatoMqttLiveClient.parseMatoMessage("/12U/9042", latLonArray, nowMillis)
+        assertEquals(1, p2.size)
+        assertEquals("9042", p2[0].vehicleId)
+        assertEquals("12", p2[0].lineCode)
+        assertEquals(45.0425, p2[0].latitude, 0.0001)
+        assertEquals(7.6410, p2[0].longitude, 0.0001)
+        assertEquals(275f, p2[0].bearing ?: -1f, 0.01f)
+        assertEquals(1, p2[0].directionId)
+        assertEquals("2514", p2[0].stopId)
+
+        // 3. Sparse positional JSONArray with null optional fields on topic without vehicleId (falls back to tripId)
+        val sparseArray = """[7.6690, 45.0610, null, null, "gtt:TR1234", null, null]"""
+            .toByteArray(StandardCharsets.UTF_8)
+        val p3 = MatoMqttLiveClient.parseMatoMessage("/12U", sparseArray, nowMillis)
+        assertEquals(1, p3.size)
+        assertEquals("TR1234", p3[0].vehicleId)
+        assertEquals("12", p3[0].lineCode)
+        assertNull(p3[0].bearing)
+        assertNull(p3[0].speedKmh)
+        assertNull(p3[0].directionId)
+        assertNull(p3[0].stopId)
+
+        // 4. Keyed map of vehicleId -> positional JSONArray on line topic
+        val keyedPosMap = """{"9051": [7.6510, 45.0480, 90, 22, "T51", 1, 470]}"""
+            .toByteArray(StandardCharsets.UTF_8)
+        val p4 = MatoMqttLiveClient.parseMatoMessage("/12U", keyedPosMap, nowMillis)
+        assertEquals(1, p4.size)
+        assertEquals("9051", p4[0].vehicleId)
+        assertEquals("12", p4[0].lineCode)
+        assertEquals(45.0480, p4[0].latitude, 0.0001)
+
+        // 5. 2-level map route -> vehicleId -> positional JSONArray on /ALL
+        val twoLevelPosMap = """{"12U": {"9060": [7.6550, 45.0500, 120, 30, "T60", 0, 317]}}"""
+            .toByteArray(StandardCharsets.UTF_8)
+        val p5 = MatoMqttLiveClient.parseMatoMessage("/ALL", twoLevelPosMap, nowMillis)
+        assertEquals(1, p5.size)
+        assertEquals("9060", p5[0].vehicleId)
+        assertEquals("12", p5[0].lineCode)
+
+        // 6. 4-digit suburban GTT route topic + positional JSONArray
+        val subArray = """[7.6584, 45.0512, 90, 35, "T55", 1, 882]"""
+            .toByteArray(StandardCharsets.UTF_8)
+        val p6 = MatoMqttLiveClient.parseMatoMessage("/1085/3301", subArray, nowMillis)
+        assertEquals(1, p6.size)
+        assertEquals("3301", p6[0].vehicleId)
+        assertEquals("1085", p6[0].lineCode)
     }
 
     @Test

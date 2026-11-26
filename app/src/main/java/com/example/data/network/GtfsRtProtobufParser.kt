@@ -156,10 +156,78 @@ object GtfsRtProtobufParser {
         return ts
     }
 
+    /**
+     * Parses a binary GTFS-RT protobuf payload received over MQTT, supporting:
+     * 1. Standard `FeedMessage` containing one or more `FeedEntity` items
+     * 2. Bare `FeedEntity` containing a `VehiclePosition`
+     * 3. Bare `VehiclePosition` directly as the MQTT payload
+     *
+     * Uses [fallbackRouteId] and [fallbackVehicleId] (e.g. derived from the MQTT topic)
+     * whenever the protobuf omits `trip.route_id` or `vehicle.id`.
+     */
+    fun parseSingleVehicleMessage(
+        bytes: ByteArray,
+        fallbackRouteId: String? = null,
+        fallbackVehicleId: String? = null,
+        sourceName: String = "MaTO Live",
+        fetchedAtMillis: Long = System.currentTimeMillis(),
+    ): List<BusVehicle> {
+        if (bytes.isEmpty()) return emptyList()
+        // 1. Try full FeedMessage (applying topic fallbacks if route/vehicle missing)
+        val feedVehicles = mutableListOf<BusVehicle>()
+        runCatching {
+            val reader = ProtoReader(bytes, 0, bytes.size)
+            while (reader.hasRemaining()) {
+                val tag = reader.readVarint32()
+                val fieldNumber = tag ushr 3
+                val wireType = tag and 0x07
+                if (fieldNumber == 2 && wireType == WIRE_LENGTH_DELIMITED) {
+                    parseFeedEntityVehicle(
+                        reader = reader.readSubReader(),
+                        sourceName = sourceName,
+                        fetchedAtMillis = fetchedAtMillis,
+                        fallbackRouteId = fallbackRouteId,
+                        fallbackVehicleId = fallbackVehicleId,
+                    )?.let { feedVehicles.add(it) }
+                } else {
+                    reader.skipField(wireType)
+                }
+            }
+        }
+        if (feedVehicles.isNotEmpty()) return feedVehicles
+
+        // 2. Try bare FeedEntity (field 1 = id, field 4 = VehiclePosition)
+        val entityVehicle = runCatching {
+            parseFeedEntityVehicle(
+                reader = ProtoReader(bytes, 0, bytes.size),
+                sourceName = sourceName,
+                fetchedAtMillis = fetchedAtMillis,
+                fallbackRouteId = fallbackRouteId,
+                fallbackVehicleId = fallbackVehicleId,
+            )
+        }.getOrNull()
+        if (entityVehicle != null) return listOf(entityVehicle)
+
+        // 3. Try bare VehiclePosition (field 1 = TripDescriptor, field 2 = Position, ...)
+        val bareVehicle = runCatching {
+            parseVehiclePosition(
+                reader = ProtoReader(bytes, 0, bytes.size),
+                entityId = "",
+                sourceName = sourceName,
+                fetchedAtMillis = fetchedAtMillis,
+                fallbackRouteId = fallbackRouteId,
+                fallbackVehicleId = fallbackVehicleId,
+            )
+        }.getOrNull()
+        return listOfNotNull(bareVehicle)
+    }
+
     private fun parseFeedEntityVehicle(
         reader: ProtoReader,
         sourceName: String,
         fetchedAtMillis: Long,
+        fallbackRouteId: String? = null,
+        fallbackVehicleId: String? = null,
     ): BusVehicle? {
         var entityId = ""
         var vehicle: BusVehicle? = null
@@ -170,7 +238,14 @@ object GtfsRtProtobufParser {
             when {
                 fieldNumber == 1 && wireType == WIRE_LENGTH_DELIMITED -> entityId = reader.readString()
                 fieldNumber == 4 && wireType == WIRE_LENGTH_DELIMITED -> {
-                    vehicle = parseVehiclePosition(reader.readSubReader(), entityId, sourceName, fetchedAtMillis)
+                    vehicle = parseVehiclePosition(
+                        reader = reader.readSubReader(),
+                        entityId = entityId,
+                        sourceName = sourceName,
+                        fetchedAtMillis = fetchedAtMillis,
+                        fallbackRouteId = fallbackRouteId,
+                        fallbackVehicleId = fallbackVehicleId,
+                    )
                 }
                 else -> reader.skipField(wireType)
             }
@@ -185,6 +260,8 @@ object GtfsRtProtobufParser {
         entityId: String,
         sourceName: String,
         fetchedAtMillis: Long,
+        fallbackRouteId: String? = null,
+        fallbackVehicleId: String? = null,
     ): BusVehicle? {
         var tripId: String? = null
         var routeId = ""
@@ -263,9 +340,15 @@ object GtfsRtProtobufParser {
         if (lat.isNaN() || lon.isNaN() || lat == 0.0 || lon == 0.0) return null
         if (lat !in 44.0..46.5 || lon !in 6.5..9.0) return null
 
-        val effectiveRoute = routeId.ifBlank { return null }
+        val effectiveRoute = routeId.ifBlank { fallbackRouteId?.trim().orEmpty() }.ifBlank { return null }
         val normalizedLine = normalizeGttLineCode(effectiveRoute)
-        val effectiveVehicleId = vehicleId.ifBlank { vehicleLabel.ifBlank { entityId.ifBlank { "?" } } }
+        val effectiveVehicleId = vehicleId.ifBlank {
+            vehicleLabel.ifBlank {
+                fallbackVehicleId?.trim().orEmpty().ifBlank {
+                    entityId.ifBlank { tripId?.trim().orEmpty().ifBlank { "?" } }
+                }
+            }
+        }
         val effectiveLabel = vehicleLabel.ifBlank { effectiveVehicleId }
 
         return BusVehicle(
@@ -280,7 +363,7 @@ object GtfsRtProtobufParser {
             longitude = lon,
             bearing = bearing?.takeIf { !it.isNaN() && it >= 0f },
             speedKmh = speedMs?.takeIf { !it.isNaN() && it >= 0f }?.let { it * 3.6f },
-            timestampSeconds = timestamp,
+            timestampSeconds = if (timestamp > 0L) timestamp else fetchedAtMillis / 1000L,
             stopId = stopId,
             status = status,
             sourceName = sourceName,
