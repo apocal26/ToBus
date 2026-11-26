@@ -349,6 +349,96 @@ class MatoLiveAndMergeTest {
         assertEquals("9101", keyedParsed[0].vehicleId)
         assertEquals("12", keyedParsed[0].lineCode)
         assertEquals(0, keyedParsed[0].directionId)
+
+        // 4. Verify exact 5T direct + prefixed topics are included while keeping initial subscriptions ACL-safe
+        assertTrue(allTopics.contains("/12U"))
+        assertTrue(allTopics.contains("12U"))
+        assertTrue(allTopics.contains("/gtt/12U/#"))
+        assertTrue(allTopics.contains("/+/12U/#"))
+        assertTrue(allTopics.contains("/gtfsrt/vp/+/12U/#"))
+        assertTrue(allTopics.contains("/gtfsrt/vp/+/+/12U/#"))
+    }
+
+    @Test
+    fun parseMatoMessageHandles5tPositionUpdateWithoutVehVersionedTopicsNestedAllMapsGzipAndQos1() {
+        // 1. 5T MQTTPositionUpdate JSON with tripId but NO veh/id field on exact `/12U` topic
+        val posUpdateNoVeh = """
+            {
+              "latitude": 45.0512,
+              "longitude": 7.6584,
+              "heading": 140,
+              "speed": 28,
+              "tripId": "gtt:T88421",
+              "direct": 0,
+              "nextStop": 1245
+            }
+        """.trimIndent().toByteArray(StandardCharsets.UTF_8)
+        val noVehParsed = MatoMqttLiveClient.parseMatoMessage("/12U", posUpdateNoVeh, nowMillis)
+        assertEquals(1, noVehParsed.size)
+        assertEquals("T88421", noVehParsed[0].vehicleId)
+        assertEquals("12", noVehParsed[0].lineCode)
+        assertEquals("1245", noVehParsed[0].stopId)
+
+        // 2. Versioned topic `/map/v1/eta/12U/9055` must NOT mistake `v1` for the bus line!
+        val versionedParsed = MatoMqttLiveClient.parseMatoMessage(
+            "/map/v1/eta/12U/9055",
+            """{"Latitude":45.0490,"Longitude":7.6530,"Heading":90}""".toByteArray(StandardCharsets.UTF_8),
+            nowMillis,
+        )
+        assertEquals(1, versionedParsed.size)
+        assertEquals("12", versionedParsed[0].lineCode)
+        assertEquals("9055", versionedParsed[0].vehicleId)
+
+        // 3. 2-level nested map on `/ALL` (route -> vehicleId -> position)
+        val allMapPayload = """
+            {
+              "12U": {
+                "9037": {"latitude": 45.0410, "longitude": 7.6410, "direct": 1, "nextStop": 470}
+              },
+              "4U": {
+                "6012": {"position": {"lat": 45.0705, "lon": 7.6865}, "heading": 12}
+              }
+            }
+        """.trimIndent().toByteArray(StandardCharsets.UTF_8)
+        val allParsed = MatoMqttLiveClient.parseMatoMessage("/ALL", allMapPayload, nowMillis)
+        assertEquals(2, allParsed.size)
+        val b12 = allParsed.first { it.vehicleId == "9037" }
+        val b4 = allParsed.first { it.vehicleId == "6012" }
+        assertEquals("12", b12.lineCode)
+        assertEquals(1, b12.directionId)
+        assertEquals("4", b4.lineCode)
+        assertEquals(45.0705, b4.latitude, 0.0001)
+
+        // 4. GZIP-compressed payload auto-decompression
+        val gzipBytes = ByteArrayOutputStream().apply {
+            java.util.zip.GZIPOutputStream(this).use { gz ->
+                gz.write("""{"veh":"9077","line":"12U","lat":45.055,"lon":7.661}""".toByteArray(StandardCharsets.UTF_8))
+            }
+        }.toByteArray()
+        val gzipParsed = MatoMqttLiveClient.parseMatoMessage("/12U/9077", gzipBytes, nowMillis)
+        assertEquals(1, gzipParsed.size)
+        assertEquals("9077", gzipParsed[0].vehicleId)
+        assertEquals("12", gzipParsed[0].lineCode)
+
+        // 5. QoS 1 PUBLISH packet decoding + PUBACK packet encoding
+        val topicBytes = "/12U/9037".toByteArray(StandardCharsets.UTF_8)
+        val payBytes = """{"latitude":45.060,"longitude":7.670}""".toByteArray(StandardCharsets.UTF_8)
+        val qos1Body = ByteArrayOutputStream().apply {
+            write((topicBytes.size ushr 8) and 0xFF)
+            write(topicBytes.size and 0xFF)
+            write(topicBytes)
+            write(0x00)
+            write(0x2A) // packetId = 42
+            write(payBytes)
+        }.toByteArray()
+        val qos1Pkt = byteArrayOf(0x32, qos1Body.size.toByte()) + qos1Body
+        val decoded = MatoMqttLiveClient.MqttFrameAccumulator().appendAndDecode(qos1Pkt)
+        assertEquals(1, decoded.size)
+        val pub1 = decoded[0] as MatoMqttLiveClient.MqttPacket.Publish
+        assertEquals(1, pub1.qos)
+        assertEquals(42, pub1.packetId)
+        val pubAck = MatoMqttLiveClient.encodePubAckPacket(42)
+        assertEquals(listOf(0x40, 0x02, 0x00, 0x2A), pubAck.map { it.toInt() and 0xFF })
     }
 
     @Test

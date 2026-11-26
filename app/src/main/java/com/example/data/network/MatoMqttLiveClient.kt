@@ -17,15 +17,18 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.time.OffsetDateTime
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.zip.GZIPInputStream
 
 /**
  * Pure-Kotlin MQTT 3.1 / 3.1.1 over WebSocket client for 5T / Muoversi a Torino (MaTO) real-time
@@ -35,10 +38,13 @@ import java.util.concurrent.atomic.AtomicLong
  * - Atomic connection generation tracking (eliminates OkHttp onOpen/assignment race conditions).
  * - Automatic WebSocket subprotocol & MQTT protocol version negotiation (`mqtt`, `mqttv3.1`,
  *   combined, and bare WS; MQTT 3.1.1 + MQTT 3.1 `MQIsdp`), remembering the working profile.
- * - ACL-safe line-scoped subscriptions first (never immediately sends raw `#` which can trigger
- *   broker ACL disconnects), with automatic fallback wildcard if silent.
- * - Universal parser supporting 5T flat JSON, Digitransit nested `{"VP":{...}}`, JSON arrays,
- *   GeoJSON `FeatureCollection`, keyed vehicle maps, and binary GTFS-RT protobuf.
+ * - ACL-safe line-scoped subscriptions first (exact `/12U`, `12U`, `/12U/#`, `/gtt/12U/#`,
+ *   `/+/12U/#`, multi-depth `/gtfsrt/vp/...`), with automatic staged fallback (`/ALL`, `ALL`,
+ *   `/+/#`, `+/#`, `/#`, `#`) if zero vehicles are parsed after connect.
+ * - Automatic QoS 1 PUBACK acknowledgment and transparent GZIP payload decompression.
+ * - Universal parser supporting 5T `MQTTPositionUpdate` JSON (including tripId-only without `veh`),
+ *   nested 1-level & 2-level maps, Digitransit `{"VP":{...}}`, GeoJSON `FeatureCollection`,
+ *   wrapped envelopes, compact arrays/CSV, and binary GTFS-RT protobuf.
  */
 class MatoMqttLiveClient(
     private val baseClientProvider: () -> OkHttpClient,
@@ -58,7 +64,12 @@ class MatoMqttLiveClient(
     private val isActiveDesired = AtomicBoolean(false)
     private val isMqttConnected = AtomicBoolean(false)
     private val lastMessageReceivedAtMillis = AtomicLong(0L)
+    private val lastParsedVehicleAtMillis = AtomicLong(0L)
     private val connectedSinceMillis = AtomicLong(0L)
+    private val rawPublishCount = AtomicLong(0L)
+    private val parsedVehicleCount = AtomicLong(0L)
+    private val subAckAcceptedCount = AtomicInteger(0)
+    private val subAckRejectedCount = AtomicInteger(0)
 
     @Volatile
     private var activeWebSocket: WebSocket? = null
@@ -76,6 +87,9 @@ class MatoMqttLiveClient(
     private var lastErrorDetail: String? = null
 
     @Volatile
+    private var lastSampleTopic: String? = null
+
+    @Volatile
     private var workingProfileIdx: Int = -1
 
     private var reconnectAttempt = 0
@@ -88,6 +102,21 @@ class MatoMqttLiveClient(
     fun lastError(): String? = lastErrorDetail
 
     fun lastReceivedMillis(): Long = lastMessageReceivedAtMillis.get()
+
+    fun lastParsedVehicleMillis(): Long = lastParsedVehicleAtMillis.get()
+
+    fun connectedSinceMillis(): Long = connectedSinceMillis.get()
+
+    fun rawPublishCount(): Long = rawPublishCount.get()
+
+    fun parsedVehicleCount(): Long = parsedVehicleCount.get()
+
+    fun subAckRejectedAll(): Boolean =
+        subAckRejectedCount.get() > 0 && subAckAcceptedCount.get() == 0
+
+    fun totalCachedVehicles(): Int = vehiclesById.size
+
+    fun lastSampleTopic(): String? = lastSampleTopic
 
     fun start(lineCode: String, onFocusedUpdate: () -> Unit) {
         val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
@@ -110,8 +139,17 @@ class MatoMqttLiveClient(
         if (norm.isEmpty() || norm == "?" || norm == focusedLine) return
         focusedLine = norm
         if (isMqttConnected.get()) {
+            val ws = activeWebSocket
+            val gen = connectionGen.get()
             scope.launch {
-                subscribeForLine(activeWebSocket, norm)
+                subscribeForLine(ws, norm)
+                val hasLineCached = vehiclesById.values.any {
+                    it.lineCode.equals(norm, ignoreCase = true) ||
+                        it.rawRouteId.equals(norm, ignoreCase = true)
+                }
+                if (!hasLineCached && ws != null && isMqttConnected.get() && connectionGen.get() == gen) {
+                    scheduleSilentTopicFallback(ws, gen, onlyIfNoParsedSince = System.currentTimeMillis())
+                }
             }
         }
     }
@@ -127,12 +165,14 @@ class MatoMqttLiveClient(
     fun ensureHealthyConnection(nowMillis: Long = System.currentTimeMillis()) {
         if (!isActiveDesired.get()) return
         val ws = activeWebSocket
-        val lastMsg = lastMessageReceivedAtMillis.get()
+        val lastParsed = lastParsedVehicleAtMillis.get()
+        val lastRaw = lastMessageReceivedAtMillis.get()
+        val lastActivity = maxOf(lastParsed, lastRaw)
         val connSince = connectedSinceMillis.get()
         val stalled = isMqttConnected.get() &&
             connSince > 0L &&
-            (nowMillis - connSince) > 55_000L &&
-            (lastMsg == 0L || (nowMillis - lastMsg) > 65_000L)
+            (nowMillis - connSince) > 65_000L &&
+            (lastActivity == 0L || (nowMillis - lastActivity) > 70_000L)
         if (ws == null || stalled) {
             scope.launch {
                 if (!isActiveDesired.get()) return@launch
@@ -143,15 +183,16 @@ class MatoMqttLiveClient(
     }
 
     /**
-     * Lightweight fallback kick triggered ONLY when GTFS-RT/BusOne feeds are detected as frozen
-     * while MaTO MQTT has not yet delivered moving vehicles for the active line (throttled to 30s).
+     * Non-destructive subscription nudge: NEVER kills a freshly connected WebSocket before
+     * `scheduleSilentTopicFallback` finishes! Only re-subscribes while connected, or reconnects
+     * if disconnected / truly silent for >= 25s after connect.
      */
     fun nudgeFocusedLineSubscription(
         lineCode: String?,
         nowMillis: Long = System.currentTimeMillis(),
     ) {
         if (!isActiveDesired.get()) return
-        if (nowMillis - lastNudgeMillis < 30_000L) return
+        if (nowMillis - lastNudgeMillis < 25_000L) return
         lastNudgeMillis = nowMillis
 
         val targetLine = lineCode?.let { GtfsRtProtobufParser.normalizeGttLineCode(it) }
@@ -160,14 +201,26 @@ class MatoMqttLiveClient(
         focusedLine = targetLine
 
         val ws = activeWebSocket
-        val lastMsg = lastMessageReceivedAtMillis.get()
-        val silentTooLong = lastMsg == 0L || (nowMillis - lastMsg) > 35_000L
+        val connSince = connectedSinceMillis.get()
+        val connectedAgeMs = if (connSince > 0L) nowMillis - connSince else 0L
+        val lastParsed = lastParsedVehicleAtMillis.get()
+        val staleAfterWarmup = connectedAgeMs >= 25_000L &&
+            (lastParsed == 0L || (nowMillis - lastParsed) > 40_000L)
+
         scope.launch {
             if (!isActiveDesired.get()) return@launch
-            if (ws != null && isMqttConnected.get() && !silentTooLong) {
+            if (ws != null && isMqttConnected.get() && !staleAfterWarmup) {
                 subscribeForLine(ws, targetLine)
-            } else {
-                reconnectAttempt = 0
+                if (connectedAgeMs >= 6_000L && lastParsed < connSince) {
+                    sendBroadFallbackSubscriptions(ws)
+                }
+            } else if (ws == null || !isMqttConnected.get() || staleAfterWarmup) {
+                if (staleAfterWarmup) {
+                    // Advance handshake profile on silent-stall reconnect instead of retrying the same one forever
+                    reconnectAttempt = (reconnectAttempt + 1) % HANDSHAKE_PROFILES.size
+                } else {
+                    reconnectAttempt = 0
+                }
                 openSocket()
             }
         }
@@ -221,6 +274,11 @@ class MatoMqttLiveClient(
         val myGen = connectionGen.incrementAndGet()
         activeWebSocket?.cancel()
         activeWebSocket = null
+        rawPublishCount.set(0L)
+        parsedVehicleCount.set(0L)
+        subAckAcceptedCount.set(0)
+        subAckRejectedCount.set(0)
+        lastSampleTopic = null
 
         val profileIdx = if (workingProfileIdx in HANDSHAKE_PROFILES.indices && reconnectAttempt == 0) {
             workingProfileIdx
@@ -263,6 +321,7 @@ class MatoMqttLiveClient(
                     val packets = accumulator.appendAndDecode(bytes.toByteArray())
                     val nowMillis = System.currentTimeMillis()
                     var touchedFocusedLine = false
+                    var parsedAnyNow = false
                     var justConnected = false
 
                     for (pkt in packets) {
@@ -277,7 +336,7 @@ class MatoMqttLiveClient(
                                     justConnected = true
                                     subscribeForLine(webSocket, focusedLine)
                                     startKeepAliveLoop(webSocket, myGen)
-                                    scheduleSilentTopicFallback(webSocket, myGen)
+                                    scheduleSilentTopicFallback(webSocket, myGen, onlyIfNoParsedSince = nowMillis)
                                 } else {
                                     lastErrorDetail = "CONNACK ${pkt.returnCode}"
                                     webSocket.close(1002, "CONNACK rejected")
@@ -285,20 +344,44 @@ class MatoMqttLiveClient(
                             }
                             is MqttPacket.SubAck -> {
                                 val accepted = pkt.returnCodes.count { it in 0..2 }
-                                if (accepted == 0 && pkt.returnCodes.isNotEmpty()) {
-                                    lastErrorDetail = "SUBACK rifiutato"
+                                val rejected = pkt.returnCodes.count { it == 0x80 }
+                                if (accepted > 0) subAckAcceptedCount.addAndGet(accepted)
+                                if (rejected > 0) subAckRejectedCount.addAndGet(rejected)
+                                if (accepted == 0 && rejected > 0 && subAckAcceptedCount.get() == 0) {
+                                    lastErrorDetail = "Topic rifiutati (SUBACK)"
+                                } else if (accepted > 0 && lastErrorDetail == "Topic rifiutati (SUBACK)") {
+                                    lastErrorDetail = null
                                 }
                             }
                             is MqttPacket.Publish -> {
-                                lastMessageReceivedAtMillis.set(nowMillis)
-                                val parsed = parseMatoMessage(pkt.topic, pkt.payload, nowMillis)
-                                for (bus in parsed) {
-                                    vehiclesById[bus.vehicleId] = bus
-                                    if (bus.lineCode.equals(focusedLine, ignoreCase = true) ||
-                                        bus.rawRouteId.equals(focusedLine, ignoreCase = true)
-                                    ) {
-                                        touchedFocusedLine = true
+                                if (pkt.qos == 1 && pkt.packetId != null) {
+                                    runCatching {
+                                        webSocket.send(encodePubAckPacket(pkt.packetId).toByteString())
                                     }
+                                }
+                                lastMessageReceivedAtMillis.set(nowMillis)
+                                val count = rawPublishCount.incrementAndGet()
+                                if (pkt.topic.isNotBlank()) {
+                                    lastSampleTopic = pkt.topic.take(64)
+                                }
+                                val parsed = parseMatoMessage(pkt.topic, pkt.payload, nowMillis)
+                                if (parsed.isNotEmpty()) {
+                                    lastParsedVehicleAtMillis.set(nowMillis)
+                                    parsedVehicleCount.addAndGet(parsed.size.toLong())
+                                    parsedAnyNow = true
+                                    for (bus in parsed) {
+                                        vehiclesById[bus.vehicleId] = bus
+                                        if (bus.lineCode.equals(focusedLine, ignoreCase = true) ||
+                                            bus.rawRouteId.equals(focusedLine, ignoreCase = true)
+                                        ) {
+                                            touchedFocusedLine = true
+                                        }
+                                    }
+                                } else if (count <= 3L) {
+                                    val preview = runCatching {
+                                        String(pkt.payload.copyOfRange(0, pkt.payload.size.coerceAtMost(120)), StandardCharsets.UTF_8)
+                                    }.getOrDefault("<bin:${pkt.payload.size}B>")
+                                    Log.d(TAG, "MaTO unparsed frame #$count topic='${pkt.topic}' payload='$preview'")
                                 }
                             }
                             is MqttPacket.PingResp -> Unit
@@ -307,7 +390,9 @@ class MatoMqttLiveClient(
 
                     if (justConnected) {
                         onFocusedLineUpdate?.invoke()
-                    } else if (touchedFocusedLine && nowMillis - lastNotifyMillis >= NOTIFY_DEBOUNCE_MS) {
+                    } else if ((touchedFocusedLine || (parsedAnyNow && parsedVehicleCount.get() <= 4L)) &&
+                        nowMillis - lastNotifyMillis >= NOTIFY_DEBOUNCE_MS
+                    ) {
                         lastNotifyMillis = nowMillis
                         onFocusedLineUpdate?.invoke()
                     }
@@ -316,11 +401,14 @@ class MatoMqttLiveClient(
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     if (connectionGen.get() != myGen) return
                     val nowMillis = System.currentTimeMillis()
+                    lastMessageReceivedAtMillis.set(nowMillis)
+                    rawPublishCount.incrementAndGet()
                     val parsed = parseMatoMessage("", text.toByteArray(StandardCharsets.UTF_8), nowMillis)
                     if (parsed.isNotEmpty()) {
                         isMqttConnected.set(true)
                         workingProfileIdx = profileIdx
-                        lastMessageReceivedAtMillis.set(nowMillis)
+                        lastParsedVehicleAtMillis.set(nowMillis)
+                        parsedVehicleCount.addAndGet(parsed.size.toLong())
                         var touched = false
                         for (bus in parsed) {
                             vehiclesById[bus.vehicleId] = bus
@@ -387,34 +475,46 @@ class MatoMqttLiveClient(
         }
     }
 
+    private fun sendBroadFallbackSubscriptions(webSocket: WebSocket) {
+        val broadGroups = listOf(
+            listOf("/ALL", "ALL", "/ALL/#", "ALL/#"),
+            listOf("/gtfsrt/vp/#", "/hfp/v2/journey/ongoing/vp/#", "/+/#", "+/#"),
+        )
+        for (topics in broadGroups) {
+            val pid = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
+            runCatching {
+                webSocket.send(encodeSubscribePacket(pid, topics).toByteString())
+            }
+        }
+    }
+
     /**
-     * If line-scoped topics stay silent for 6s after CONNACK (for example if 5T introduces a new
-     * topic prefix), cautiously add broader non-root and root wildcards without breaking initial ACLs.
+     * If line-scoped topics yield zero parsed vehicles for 3.5s after CONNACK (or line switch),
+     * progressively add `/ALL`, `ALL`, non-root wildcards (`/+/#`, `+/#`), and finally `/#` & `#`
+     * in separate packets so an ACL rejection on one topic never blocks the others.
      */
-    private fun scheduleSilentTopicFallback(webSocket: WebSocket, myGen: Long) {
+    private fun scheduleSilentTopicFallback(
+        webSocket: WebSocket,
+        myGen: Long,
+        onlyIfNoParsedSince: Long,
+    ) {
         silentFallbackJob?.cancel()
         silentFallbackJob = scope.launch {
-            delay(6_000L)
+            delay(3_500L)
             if (!isActive || connectionGen.get() != myGen || !isMqttConnected.get()) return@launch
-            if (lastMessageReceivedAtMillis.get() >= connectedSinceMillis.get()) return@launch
+            if (lastParsedVehicleAtMillis.get() >= onlyIfNoParsedSince) return@launch
 
-            val pid1 = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
-            runCatching {
-                webSocket.send(
-                    encodeSubscribePacket(
-                        pid1,
-                        listOf("/gtfsrt/vp/#", "/hfp/v2/journey/ongoing/vp/#", "/+/#"),
-                    ).toByteString(),
-                )
-            }
+            sendBroadFallbackSubscriptions(webSocket)
 
-            delay(6_000L)
+            delay(4_500L)
             if (!isActive || connectionGen.get() != myGen || !isMqttConnected.get()) return@launch
-            if (lastMessageReceivedAtMillis.get() >= connectedSinceMillis.get()) return@launch
+            if (lastParsedVehicleAtMillis.get() >= onlyIfNoParsedSince) return@launch
 
-            val pid2 = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
-            runCatching {
-                webSocket.send(encodeSubscribePacket(pid2, listOf("#")).toByteString())
+            for (rootTopic in listOf("/#", "#")) {
+                val pid = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
+                runCatching {
+                    webSocket.send(encodeSubscribePacket(pid, listOf(rootTopic)).toByteString())
+                }
             }
         }
     }
@@ -459,7 +559,12 @@ class MatoMqttLiveClient(
     sealed class MqttPacket {
         data class ConnAck(val returnCode: Int) : MqttPacket()
         data class SubAck(val packetId: Int, val returnCodes: List<Int>) : MqttPacket()
-        data class Publish(val topic: String, val payload: ByteArray) : MqttPacket()
+        data class Publish(
+            val topic: String,
+            val payload: ByteArray,
+            val qos: Int = 0,
+            val packetId: Int? = null,
+        ) : MqttPacket()
         data object PingResp : MqttPacket()
     }
 
@@ -517,9 +622,15 @@ class MatoMqttLiveClient(
                             val topicStart = bodyStart + 2
                             val topicEnd = (topicStart + topicLen).coerceAtMost(packetEnd)
                             val topic = String(combined, topicStart, topicEnd - topicStart, StandardCharsets.UTF_8)
+                            val packetId = if (qos > 0 && topicEnd + 2 <= packetEnd) {
+                                ((combined[topicEnd].toInt() and 0xFF) shl 8) or
+                                    (combined[topicEnd + 1].toInt() and 0xFF)
+                            } else {
+                                null
+                            }
                             val payloadStart = (topicEnd + if (qos > 0) 2 else 0).coerceAtMost(packetEnd)
                             val payload = combined.copyOfRange(payloadStart, packetEnd)
-                            packets.add(MqttPacket.Publish(topic, payload))
+                            packets.add(MqttPacket.Publish(topic, payload, qos, packetId))
                         }
                     }
                     9 -> { // SUBACK
@@ -548,12 +659,24 @@ class MatoMqttLiveClient(
     companion object {
         private const val TAG = "MatoMqttLive"
         private const val LIVE_TTL_MILLIS = 95_000L
-        private const val NOTIFY_DEBOUNCE_MS = 2_000L
+        private const val NOTIFY_DEBOUNCE_MS = 1_500L
         private const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
+        private val TOPIC_NON_ROUTE_SEGMENTS = setOf(
+            "5t", "gtt", "mato", "scre", "map", "eta", "vp", "bus", "tram", "metro",
+            "rail", "train", "all", "vehicles", "vehicle", "positions", "position", "pos",
+            "live", "realtime", "rt", "gtfs", "gtfsrt", "hfp", "journey", "ongoing",
+            "torino", "turin", "piemonte", "to", "api", "ws", "mqtt", "feed", "data",
+            "v1", "v2", "v3", "v4", "v5", "s1", "s2",
+        )
+
+        private val KNOWN_ALPHA_LINES = setOf(
+            "BLU", "DORA", "STAR", "METRO", "VENARIA", "RIVOLI", "SUPERGA",
+        )
+
         private val HANDSHAKE_PROFILES = listOf(
-            HandshakeProfile("scre-mqtt", "wss://mapi.5t.torino.it/scre", "mqtt", useMqtt31 = false),
+            HandshakeProfile("scre-443-mqtt", "wss://mapi.5t.torino.it:443/scre", "mqtt", useMqtt31 = false),
             HandshakeProfile("scre-443-mqttv31", "wss://mapi.5t.torino.it:443/scre", "mqttv3.1", useMqtt31 = false),
             HandshakeProfile("scre-both", "wss://mapi.5t.torino.it/scre", "mqtt, mqttv3.1", useMqtt31 = false),
             HandshakeProfile("scre-mqisdp", "wss://mapi.5t.torino.it:443/scre", "mqttv3.1", useMqtt31 = true),
@@ -563,9 +686,21 @@ class MatoMqttLiveClient(
         internal fun buildLineSubscriptionGroups(lineCode: String): List<List<String>> {
             val base = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
             if (base.isEmpty() || base == "?") return emptyList()
-            val variants = linkedSetOf(base).apply {
+            val variants = linkedSetOf<String>().apply {
                 if (!base.endsWith("U")) add("${base}U")
-                if (base.all { it.isDigit() }) add("${base}F")
+                add(base)
+                if (base.all { it.isDigit() }) {
+                    add("${base}F")
+                    add("${base}E")
+                }
+                if (base.endsWith("/")) {
+                    val bForm = base.dropLast(1) + "B"
+                    add("${bForm}U")
+                    add(bForm)
+                } else if (base.endsWith("B") && base.dropLast(1).all { it.isDigit() }) {
+                    val slashForm = base.dropLast(1) + "/"
+                    add(slashForm)
+                }
             }
 
             val group1 = mutableListOf<String>()
@@ -573,12 +708,27 @@ class MatoMqttLiveClient(
             val group3 = mutableListOf<String>()
 
             for (v in variants) {
+                // Direct 5T `/scre` exact & wildcard topics
+                group1.add("/$v")
+                group1.add(v)
+                group1.add("/$v/+")
                 group1.add("/$v/#")
                 group1.add("$v/#")
+
+                // Single-prefix GTT / 5T topics (both slash and colon conventions)
+                group2.add("/gtt/$v")
+                group2.add("/gtt/$v/#")
+                group2.add("gtt/$v/#")
+                group2.add("/+/$v/#")
+                group2.add("+/$v/#")
                 group2.add("/gtt:$v/#")
                 group2.add("gtt:$v/#")
-                group2.add("/gtfsrt/vp/+/+/+/$v/#")
-                group2.add("/gtfsrt/vp/+/+/+/gtt:$v/#")
+
+                // Digitransit GTFS-RT & HFP topics across 1, 2, and 3 intermediate hierarchy levels
+                group3.add("/gtfsrt/vp/+/$v/#")
+                group3.add("/gtfsrt/vp/+/+/$v/#")
+                group3.add("/gtfsrt/vp/+/+/+/$v/#")
+                group3.add("/gtfsrt/vp/+/+/+/gtt:$v/#")
                 group3.add("/hfp/v2/journey/ongoing/vp/+/+/+/$v/#")
             }
 
@@ -619,6 +769,13 @@ class MatoMqttLiveClient(
             return wrapFixedHeader(0x82, body.toByteArray())
         }
 
+        internal fun encodePubAckPacket(packetId: Int): ByteArray = byteArrayOf(
+            0x40,
+            0x02,
+            ((packetId ushr 8) and 0xFF).toByte(),
+            (packetId and 0xFF).toByte(),
+        )
+
         internal fun encodePingReqPacket(): ByteArray = byteArrayOf(0xC0.toByte(), 0x00)
 
         internal fun encodeDisconnectPacket(): ByteArray = byteArrayOf(0xE0.toByte(), 0x00)
@@ -646,10 +803,12 @@ class MatoMqttLiveClient(
 
         /**
          * Universal parser for 5T MaTO `/scre` MQTT vehicle position messages:
-         * - 5T native flat JSON (`longitude`/`latitude`/`heading`/`speed`/`direct`/`tripId`/`nextStop`/`veh`/`line`)
-         * - Digitransit HFP nested `{"VP": {...}}` JSON
-         * - JSON arrays `[ {...}, {...} ]`, GeoJSON `{"features":[...]}`, and vehicle map envelopes
-         * - Topic-derived route/direction/vehicleId fallbacks (`/12U/0/9037`, `12U/9037`, `/gtt/12U/9037`, `/gtfsrt/vp/...`)
+         * - Automatic GZIP decompression (`1F 8B`)
+         * - 5T native `MQTTPositionUpdate` JSON (`latitude`/`longitude`/`heading`/`speed`/`direct`/`tripId`/`nextStop`/`veh`/`line`)
+         * - Digitransit HFP nested `{"VP": {...}}` / `{"vp": {...}}` JSON
+         * - JSON arrays `[ {...}, {...} ]`, GeoJSON `{"features":[...]}`, wrapped envelopes, 1-level & 2-level vehicle maps
+         * - Compact CSV / delimited text payloads
+         * - Topic-derived route/direction/vehicleId fallbacks (`/12U/0/9037`, `/map/v1/eta/12U/9037`, `/gtt/12U/9037`, `/gtfsrt/vp/...`)
          * - Binary GTFS-RT protobuf fallback
          */
         internal fun parseMatoMessage(
@@ -658,7 +817,20 @@ class MatoMqttLiveClient(
             nowMillis: Long = System.currentTimeMillis(),
         ): List<BusVehicle> {
             if (payload.isEmpty()) return emptyList()
-            val firstNonSpace = payload.firstOrNull {
+            val effectivePayload = if (
+                payload.size >= 2 &&
+                (payload[0].toInt() and 0xFF) == 0x1F &&
+                (payload[1].toInt() and 0xFF) == 0x8B
+            ) {
+                runCatching {
+                    GZIPInputStream(ByteArrayInputStream(payload)).use { it.readBytes() }
+                }.getOrDefault(payload)
+            } else {
+                payload
+            }
+            if (effectivePayload.isEmpty()) return emptyList()
+
+            val firstNonSpace = effectivePayload.firstOrNull {
                 it != ' '.code.toByte() &&
                     it != '\n'.code.toByte() &&
                     it != '\r'.code.toByte() &&
@@ -666,14 +838,106 @@ class MatoMqttLiveClient(
             } ?: return emptyList()
 
             if (firstNonSpace == '{'.code.toByte() || firstNonSpace == '['.code.toByte()) {
-                val text = String(payload, StandardCharsets.UTF_8)
-                return parseMatoJsonRoot(topic, text, nowMillis)
+                val text = String(effectivePayload, StandardCharsets.UTF_8)
+                val jsonVehicles = parseMatoJsonRoot(topic, text, nowMillis)
+                if (jsonVehicles.isNotEmpty()) return jsonVehicles
             }
 
-            // Fallback: binary GTFS-RT protobuf FeedMessage over MQTT
+            // Fallback 1: plain-text CSV/delimited position line (e.g. "9037,12U,45.0703,7.6869,180")
+            if (isLikelyAsciiText(effectivePayload)) {
+                val text = String(effectivePayload, StandardCharsets.UTF_8).trim()
+                val csvVehicles = parseDelimitedTextPayload(topic, text, nowMillis)
+                if (csvVehicles.isNotEmpty()) return csvVehicles
+            }
+
+            // Fallback 2: binary GTFS-RT protobuf FeedMessage over MQTT
             return runCatching {
-                GtfsRtProtobufParser.parseFeedMessage(payload, "MaTO Live", nowMillis).allVehicles
+                GtfsRtProtobufParser.parseFeedMessage(effectivePayload, "MaTO Live", nowMillis).allVehicles
             }.getOrDefault(emptyList())
+        }
+
+        private fun isLikelyAsciiText(bytes: ByteArray): Boolean {
+            val limit = bytes.size.coerceAtMost(96)
+            for (i in 0 until limit) {
+                val b = bytes[i].toInt() and 0xFF
+                if (b != 9 && b != 10 && b != 13 && (b < 32 || b > 126)) return false
+            }
+            return true
+        }
+
+        private fun parseDelimitedTextPayload(
+            topic: String,
+            text: String,
+            nowMillis: Long,
+        ): List<BusVehicle> {
+            if (text.length < 8) return emptyList()
+            val topicMeta = extractTopicMetadata(topic.trim('/').split('/').filter { it.isNotBlank() })
+            val out = mutableListOf<BusVehicle>()
+            for (rawLine in text.lineSequence()) {
+                val line = rawLine.trim()
+                if (line.isEmpty()) continue
+                val delim = when {
+                    line.contains(';') -> ';'
+                    line.contains('|') -> '|'
+                    line.contains(',') -> ','
+                    else -> continue
+                }
+                val tokens = line.split(delim).map { it.trim().trim('"') }
+                if (tokens.size < 2) continue
+                var lat: Double? = null
+                var lon: Double? = null
+                var latIdx = -1
+                var lonIdx = -1
+                tokens.forEachIndexed { idx, tok ->
+                    val d = tok.toDoubleOrNull() ?: return@forEachIndexed
+                    if (lat == null && d in 44.0..46.5) {
+                        lat = d
+                        latIdx = idx
+                    } else if (lon == null && d in 6.5..9.0) {
+                        lon = d
+                        lonIdx = idx
+                    }
+                }
+                val fLat = lat ?: continue
+                val fLon = lon ?: continue
+                val nonCoord = tokens.filterIndexed { idx, s ->
+                    idx != latIdx && idx != lonIdx && s.isNotBlank()
+                }
+                val route = topicMeta.routeId
+                    ?: nonCoord.firstOrNull { isPlausibleRouteToken(it) }
+                    ?: continue
+                val normRoute = GtfsRtProtobufParser.normalizeGttLineCode(route)
+                if (normRoute == "?" || normRoute.isBlank()) continue
+                val vehId = topicMeta.vehicleId
+                    ?: nonCoord.firstOrNull { !it.equals(route, ignoreCase = true) && it.any(Char::isDigit) }
+                    ?: continue
+                val heading = nonCoord
+                    .mapNotNull { it.toFloatOrNull() }
+                    .firstOrNull { it in 0f..360f && it.toString() != vehId }
+                out.add(
+                    BusVehicle(
+                        entityId = "mato_${vehId}_$normRoute",
+                        vehicleId = vehId,
+                        label = vehId,
+                        rawRouteId = route.trim().uppercase(),
+                        lineCode = normRoute,
+                        tripId = topicMeta.tripId,
+                        directionId = topicMeta.directionId,
+                        latitude = fLat,
+                        longitude = fLon,
+                        bearing = heading,
+                        speedKmh = null,
+                        timestampSeconds = nowMillis / 1000L,
+                        stopId = topicMeta.nextStopId,
+                        status = VehicleStopStatus.IN_TRANSIT_TO,
+                        sourceName = "MaTO Live",
+                        contributingSources = setOf("MaTO Live"),
+                        nextStopId = topicMeta.nextStopId,
+                        fetchedAtMillis = nowMillis,
+                    ),
+                )
+            }
+            return out
         }
 
         @Suppress("UNCHECKED_CAST")
@@ -686,36 +950,100 @@ class MatoMqttLiveClient(
             val topicMeta = extractTopicMetadata(topic.trim('/').split('/').filter { it.isNotBlank() })
 
             return when (parsed) {
-                is List<*> -> parsed.mapNotNull { item ->
-                    (item as? Map<String, Any?>)?.let { buildVehicleFromJsonMap(it, topicMeta, null, nowMillis) }
-                }
-                is Map<*, *> -> {
-                    val root = parsed as Map<String, Any?>
-                    val features = root["features"] as? List<*>
-                    if (features != null) {
-                        return features.mapNotNull { f ->
-                            (f as? Map<String, Any?>)?.let { buildVehicleFromJsonMap(it, topicMeta, null, nowMillis) }
-                        }
-                    }
-                    val listEnvelope = (root["vehicles"] as? List<*>) ?: (root["entities"] as? List<*>)
-                    if (listEnvelope != null) {
-                        return listEnvelope.mapNotNull { item ->
-                            (item as? Map<String, Any?>)?.let { buildVehicleFromJsonMap(it, topicMeta, null, nowMillis) }
-                        }
-                    }
-                    // Single vehicle object (flat or {"VP":{...}} or {"vehicle":{...}})
-                    buildVehicleFromJsonMap(root, topicMeta, null, nowMillis)?.let { return listOf(it) }
-
-                    // Keyed map of vehicles e.g. {"9037": {"lat":..., "lon":...}, "9040": {...}}
-                    val keyedOut = mutableListOf<BusVehicle>()
-                    for ((k, v) in root) {
-                        val subMap = v as? Map<String, Any?> ?: continue
-                        buildVehicleFromJsonMap(subMap, topicMeta, k, nowMillis)?.let { keyedOut.add(it) }
-                    }
-                    keyedOut
-                }
+                is List<*> -> parseJsonList(parsed, topicMeta, null, nowMillis)
+                is Map<*, *> -> parseJsonMap(parsed as Map<String, Any?>, topicMeta, null, nowMillis)
                 else -> emptyList()
             }
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun parseJsonList(
+            list: List<*>,
+            topicMeta: TopicMeta,
+            routeHint: String?,
+            nowMillis: Long,
+        ): List<BusVehicle> {
+            val out = mutableListOf<BusVehicle>()
+            for (item in list) {
+                when (item) {
+                    is Map<*, *> -> {
+                        buildVehicleFromJsonMap(
+                            root = item as Map<String, Any?>,
+                            topicMeta = topicMeta,
+                            keyedVehicleHint = null,
+                            routeHint = routeHint,
+                            nowMillis = nowMillis,
+                        )?.let { out.add(it) }
+                    }
+                    is List<*> -> {
+                        // Tuple format e.g. ["9037", "12U", 45.07, 7.68, 180]
+                        val joined = item.joinToString(",") { it?.toString().orEmpty() }
+                        out.addAll(parseDelimitedTextPayload("", joined, nowMillis))
+                    }
+                }
+            }
+            return out
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun parseJsonMap(
+            root: Map<String, Any?>,
+            topicMeta: TopicMeta,
+            routeHint: String?,
+            nowMillis: Long,
+        ): List<BusVehicle> {
+            // 1. GeoJSON FeatureCollection or list/map envelopes
+            val listEnvelopeKeys = listOf("features", "vehicles", "positions", "buses", "entities", "data", "items", "list", "payload")
+            for (envKey in listEnvelopeKeys) {
+                val value = root[envKey] ?: continue
+                when (value) {
+                    is List<*> -> {
+                        val listRes = parseJsonList(value, topicMeta, routeHint, nowMillis)
+                        if (listRes.isNotEmpty()) return listRes
+                    }
+                    is Map<*, *> -> {
+                        // Could be a single vehicle wrapper (e.g. {"data": {"latitude": ...}}) OR a keyed map ({"vehicles": {"9037": {...}}})
+                        val mapRes = parseJsonMap(value as Map<String, Any?>, topicMeta, routeHint, nowMillis)
+                        if (mapRes.isNotEmpty()) return mapRes
+                    }
+                }
+            }
+
+            // 2. Single vehicle object (flat or {"VP":{...}} or {"vehicle":{...}} or {"position":{...}})
+            buildVehicleFromJsonMap(root, topicMeta, null, routeHint, nowMillis)?.let { return listOf(it) }
+
+            // 3. 1-level keyed map of vehicles e.g. {"9037": {"lat":..., "lon":...}}
+            //    OR 2-level map by route -> vehicle e.g. {"12U": {"9037": {"latitude":..., "longitude":...}}}
+            val keyedOut = mutableListOf<BusVehicle>()
+            for ((k, v) in root) {
+                when (v) {
+                    is Map<*, *> -> {
+                        val subMap = v as Map<String, Any?>
+                        val direct = buildVehicleFromJsonMap(subMap, topicMeta, k, routeHint, nowMillis)
+                        if (direct != null) {
+                            keyedOut.add(direct)
+                        } else if (isPlausibleRouteToken(k)) {
+                            // 2-level map: outer key is line code (e.g. "12U"), inner keys are vehicle IDs
+                            for ((innerKey, innerVal) in subMap) {
+                                val innerMap = innerVal as? Map<String, Any?> ?: continue
+                                buildVehicleFromJsonMap(
+                                    root = innerMap,
+                                    topicMeta = topicMeta,
+                                    keyedVehicleHint = innerKey,
+                                    routeHint = k,
+                                    nowMillis = nowMillis,
+                                )?.let { keyedOut.add(it) }
+                            }
+                        }
+                    }
+                    is List<*> -> {
+                        if (isPlausibleRouteToken(k)) {
+                            keyedOut.addAll(parseJsonList(v, topicMeta, k, nowMillis))
+                        }
+                    }
+                }
+            }
+            return keyedOut
         }
 
         @Suppress("UNCHECKED_CAST")
@@ -723,38 +1051,94 @@ class MatoMqttLiveClient(
             root: Map<String, Any?>,
             topicMeta: TopicMeta,
             keyedVehicleHint: String?,
+            routeHint: String?,
             nowMillis: Long,
         ): BusVehicle? {
             val fields = LinkedHashMap<String, String>()
-            fun collect(map: Map<String, Any?>) {
+            fun collect(map: Map<String, Any?>, allowOverwrite: Boolean = true) {
                 for ((k, v) in map) {
                     if (v != null && v !is Map<*, *> && v !is List<*>) {
-                        fields[k] = v.toString()
+                        val lower = k.lowercase(Locale.ROOT)
+                        if (allowOverwrite || !fields.containsKey(lower)) {
+                            fields[lower] = v.toString()
+                        }
                     }
                 }
             }
             collect(root)
-            (root["properties"] as? Map<String, Any?>)?.let(::collect)
-            (root["VP"] as? Map<String, Any?>)?.let(::collect)
-            (root["vehicle"] as? Map<String, Any?>)?.let(::collect)
-
-            // Support GeoJSON geometry.coordinates = [lon, lat]
-            var geoLat: Double? = null
-            var geoLon: Double? = null
-            val geom = root["geometry"] as? Map<String, Any?>
-            val coords = geom?.get("coordinates") as? List<*>
-            if (coords != null && coords.size >= 2) {
-                geoLon = coords[0]?.toString()?.toDoubleOrNull()
-                geoLat = coords[1]?.toString()?.toDoubleOrNull()
+            for (nestedKey in listOf("properties", "VP", "vp", "vehicle", "position", "pos", "location", "loc", "coord", "coords", "data", "payload")) {
+                (root[nestedKey] as? Map<String, Any?>)?.let { collect(it) }
+            }
+            // Extract nested trip/stop/route metadata without clobbering vehicle's own `id`
+            val nestedTrip = root["trip"] as? Map<String, Any?>
+            val nestedTripId = nestedTrip?.let {
+                (it["gtfsId"] ?: it["tripId"] ?: it["trip_id"] ?: it["id"])?.toString()
+            }
+            val nestedRoute = root["route"] as? Map<String, Any?>
+            val nestedRouteId = nestedRoute?.let {
+                (it["shortName"] ?: it["short_name"] ?: it["gtfsId"] ?: it["id"] ?: it["name"])?.toString()
             }
 
-            val lat = readDouble(fields, "latitude", "lat", "y") ?: geoLat ?: return null
-            val lon = readDouble(fields, "longitude", "lon", "long", "lng", "x") ?: geoLon ?: return null
+            // Support GeoJSON geometry.coordinates or top-level coordinate arrays ([lon, lat] or [lat, lon])
+            var geoLat: Double? = null
+            var geoLon: Double? = null
+            val coordArray = ((root["geometry"] as? Map<String, Any?>)?.get("coordinates") as? List<*>)
+                ?: (root["coordinates"] as? List<*>)
+                ?: (root["coords"] as? List<*>)
+                ?: (root["position"] as? List<*>)
+                ?: (root["pos"] as? List<*>)
+                ?: (root["location"] as? List<*>)
+            if (coordArray != null && coordArray.size >= 2) {
+                val c0 = coordArray[0]?.toString()?.toDoubleOrNull()
+                val c1 = coordArray[1]?.toString()?.toDoubleOrNull()
+                if (c0 != null && c1 != null) {
+                    when {
+                        c0 in 44.0..46.5 && c1 in 6.5..9.0 -> {
+                            geoLat = c0
+                            geoLon = c1
+                        }
+                        c1 in 44.0..46.5 && c0 in 6.5..9.0 -> {
+                            geoLon = c0
+                            geoLat = c1
+                        }
+                    }
+                }
+            }
+
+            val lat = readDouble(fields, "latitude", "lat", "latitudine", "y") ?: geoLat ?: return null
+            val lon = readDouble(fields, "longitude", "lon", "long", "lng", "longitudine", "x") ?: geoLon ?: return null
             if (!lat.isFinite() || !lon.isFinite() || lat !in 44.0..46.5 || lon !in 6.5..9.0) return null
 
-            val rawRoute = readString(fields, "line", "linea", "route", "routeId", "route_id", "desi", "shortName", "l")
+            val tripId = readString(fields, "tripid", "trip_id", "trip", "corsa", "journeyid")
                 ?.substringAfterLast(":")
+                ?: nestedTripId?.substringAfterLast(":")?.takeIf { it.isNotBlank() }
+                ?: topicMeta.tripId
+
+            val rawRoute = readString(
+                fields,
+                "line",
+                "linea",
+                "linecode",
+                "line_code",
+                "lineid",
+                "line_id",
+                "codlinea",
+                "codicelinea",
+                "numlinea",
+                "route",
+                "routeid",
+                "route_id",
+                "routeshortname",
+                "route_short_name",
+                "routename",
+                "desi",
+                "shortname",
+                "l",
+            )?.substringAfterLast(":")
+                ?: nestedRouteId?.substringAfterLast(":")?.takeIf { it.isNotBlank() }
+                ?: routeHint?.substringAfterLast(":")?.takeIf { it.isNotBlank() }
                 ?: topicMeta.routeId
+                ?: extractRouteFromTripId(tripId)
                 ?: return null
             val normalizedLine = GtfsRtProtobufParser.normalizeGttLineCode(rawRoute)
             if (normalizedLine == "?" || normalizedLine.isBlank()) return null
@@ -762,7 +1146,7 @@ class MatoMqttLiveClient(
             val rawVehId = readString(
                 fields,
                 "veh",
-                "vehicleId",
+                "vehicleid",
                 "vehicle_id",
                 "num",
                 "id",
@@ -770,23 +1154,33 @@ class MatoMqttLiveClient(
                 "vehicle",
                 "matr",
                 "matricola",
+                "vid",
+                "bus",
+                "busid",
+                "bus_id",
+                "fleet",
+                "fleetid",
+                "code",
+                "plate",
+                "v",
             )?.substringAfterLast(":")
-                ?: keyedVehicleHint
+                ?: keyedVehicleHint?.substringAfterLast(":")
                 ?: topicMeta.vehicleId
+                ?: tripId?.takeIf { it.isNotBlank() }
                 ?: return null
             val cleanVehId = rawVehId.trim()
             if (cleanVehId.isEmpty()) return null
 
-            val bearing = readDouble(fields, "heading", "bearing", "hdg", "dir_deg", "angle", "course")
+            val bearing = readDouble(fields, "heading", "bearing", "hdg", "dir_deg", "angle", "course", "orientamento")
                 ?.toFloat()
                 ?.takeIf { it.isFinite() && it >= 0f && it <= 360f }
 
-            val rawSpeed = readDouble(fields, "speed", "spd")
+            val rawSpeed = readDouble(fields, "speed", "spd", "velocita")
             val speedKmh = rawSpeed?.toFloat()?.takeIf { it.isFinite() && it >= 0f }?.let { s ->
                 if (fields.containsKey("spd") && s <= 25f) s * 3.6f else s
             }
 
-            val dirId = readInt(fields, "direct", "directionId", "direction_id", "direction", "dir")
+            val dirId = readInt(fields, "direct", "directionid", "direction_id", "direction", "dir", "verso")
                 ?.let { raw ->
                     when (raw) {
                         0, 1 -> raw
@@ -796,11 +1190,7 @@ class MatoMqttLiveClient(
                 }
                 ?: topicMeta.directionId
 
-            val tripId = readString(fields, "tripId", "trip_id", "trip")
-                ?.substringAfterLast(":")
-                ?: topicMeta.tripId
-
-            val nextStop = readString(fields, "nextStop", "next_stop", "stop", "stopId", "stop_id", "fermata")
+            val nextStop = readString(fields, "nextstop", "next_stop", "stop", "stopid", "stop_id", "fermata", "prossimafermata")
                 ?.substringAfterLast(":")
                 ?: topicMeta.nextStopId
 
@@ -826,6 +1216,25 @@ class MatoMqttLiveClient(
                 nextStopId = nextStop,
                 fetchedAtMillis = nowMillis,
             )
+        }
+
+        private fun isPlausibleRouteToken(raw: String): Boolean {
+            val clean = raw.substringAfterLast(":").trim()
+            if (clean.isEmpty() || clean.length > 8) return false
+            val lower = clean.lowercase(Locale.ROOT)
+            if (lower in TOPIC_NON_ROUTE_SEGMENTS) return false
+            if (clean.uppercase(Locale.ROOT) in KNOWN_ALPHA_LINES) return true
+            // Skip version tags like v1, v2, v10 and long pure-numeric vehicle/trip IDs (>= 4 digits)
+            if (lower.startsWith("v") && lower.drop(1).all { it.isDigit() }) return false
+            if (clean.length >= 4 && clean.all { it.isDigit() }) return false
+            return clean.length in 1..6 && clean.any { it.isDigit() }
+        }
+
+        private fun extractRouteFromTripId(tripId: String?): String? {
+            if (tripId.isNullOrBlank()) return null
+            val clean = tripId.substringAfterLast(":").trim()
+            val prefix = clean.substringBefore("_").substringBefore("-").trim()
+            return prefix.takeIf { prefix != clean && isPlausibleRouteToken(it) }
         }
 
         private data class TopicMeta(
@@ -862,11 +1271,8 @@ class MatoMqttLiveClient(
                     nextStopId = parts.getOrNull(12)?.substringAfterLast(":")?.takeIf { it.isNotBlank() },
                 )
             }
-            // Case 3: 5T MaTO compact topic with optional prefix e.g. /12U/9037, /12U/0/9037, /gtt/12U/9037, /scre/12U/0/9037
-            val routeIdx = parts.indexOfFirst { seg ->
-                val clean = seg.substringAfterLast(":")
-                clean.length in 1..6 && clean.any { it.isDigit() } && !clean.equals("5t", ignoreCase = true)
-            }
+            // Case 3: 5T MaTO compact/prefixed topic e.g. /12U, /12U/9037, /12U/0/9037, /gtt/12U/9037, /map/v1/eta/12U/9037
+            val routeIdx = parts.indexOfFirst { seg -> isPlausibleRouteToken(seg) }
             if (routeIdx >= 0) {
                 val routeId = parts[routeIdx].substringAfterLast(":")
                 val tail = parts.subList(routeIdx + 1, parts.size)
@@ -882,10 +1288,14 @@ class MatoMqttLiveClient(
                                 vehicleId = tail[1].substringAfterLast(":"),
                             )
                         } else {
+                            // Prefer the last short numeric/alphanumeric fleet ID segment (avoid mistaking a long tripId for vehId)
+                            val vehSeg = tail.lastOrNull { seg ->
+                                val c = seg.substringAfterLast(":")
+                                c.length in 2..6 && c.any(Char::isDigit)
+                            } ?: tail.last()
                             TopicMeta(
                                 routeId = routeId,
-                                vehicleId = tail.firstOrNull { it.any(Char::isDigit) }?.substringAfterLast(":")
-                                    ?: tail.last().substringAfterLast(":"),
+                                vehicleId = vehSeg.substringAfterLast(":"),
                             )
                         }
                     }
@@ -1055,13 +1465,13 @@ class MatoMqttLiveClient(
 
         private fun parseTimestampSeconds(fields: Map<String, String>, nowMillis: Long): Long {
             val nowSec = nowMillis / 1000L
-            for (k in listOf("tsi", "timestamp", "ts", "lastUpdated", "time", "t")) {
+            for (k in listOf("tsi", "timestamp", "ts", "lastupdated", "last_updated", "time", "t")) {
                 val rawStr = fields[k]?.trim() ?: continue
                 val raw = rawStr.toLongOrNull() ?: rawStr.toDoubleOrNull()?.toLong() ?: continue
                 val sec = if (raw > 1_000_000_000_000L) raw / 1000L else raw
                 if (sec in 1_600_000_000L..(nowSec + 120L)) return sec
             }
-            val iso = readString(fields, "tst", "lastUpdate", "updatedAt")
+            val iso = readString(fields, "tst", "lastupdate", "last_update", "updatedat", "updated_at")
             if (iso != null) {
                 runCatching { OffsetDateTime.parse(iso).toEpochSecond() }
                     .getOrNull()

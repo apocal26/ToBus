@@ -158,6 +158,22 @@ class GttRealtimeRepository private constructor(context: Context) {
         matoMqttClient.stop()
     }
 
+    private fun buildMatoConnectedIdleDetail(isFixedMato: Boolean, nowMillis: Long): String {
+        val prefix = if (isFixedMato) "Fonte fissa · " else ""
+        val rawMsgs = matoMqttClient.rawPublishCount()
+        val parsed = matoMqttClient.parsedVehicleCount()
+        val cached = matoMqttClient.totalCachedVehicles()
+        val connSince = matoMqttClient.connectedSinceMillis()
+        val connectedAgeMs = if (connSince > 0L) (nowMillis - connSince).coerceAtLeast(0L) else 0L
+        return when {
+            matoMqttClient.subAckRejectedAll() -> "${prefix}Topic rifiutati"
+            rawMsgs > 0L && parsed == 0L -> "${prefix}$rawMsgs msg · formato non riconosciuto"
+            cached > 0 -> "${prefix}0 mezzi su linea ($cached in rete)"
+            connectedAgeMs < 10_000L -> "${prefix}In attesa dati…"
+            else -> "${prefix}Connesso · 0 mezzi ricevuti"
+        }
+    }
+
     suspend fun clearLocalCaches(): Int = withContext(Dispatchers.IO) {
         routeMemoryCache.clear()
         stopNameMemoryCache.clear()
@@ -188,14 +204,14 @@ class GttRealtimeRepository private constructor(context: Context) {
         val isFixedMato = dataSourceMode == DataSourceMode.MATO_LIVE
         val base = lastSnapshot
         if (matoLive.isEmpty() && base != null) {
-            // MQTT just connected before first vehicle frame arrived -> immediately reflect online status
+            // MQTT just connected before first vehicle frame arrived -> reflect real wait/diagnostic state
             val matoStatus = DataSourceStatus(
                 id = "mato_live",
                 name = "MaTO Live",
                 isOnline = true,
                 latencyMs = 0L,
                 itemCount = 0,
-                detail = if (isFixedMato) "MQTT connesso · Fonte fissa" else "MQTT connesso",
+                detail = buildMatoConnectedIdleDetail(isFixedMato, nowMillis),
             )
             val filteredBaseStatuses = if (isFixedMato) {
                 base.sourceStatuses.filterNot { it.id == "mato_live" || it.id == "gtt_official" || it.id == "busone_proxy" }
@@ -529,22 +545,6 @@ class GttRealtimeRepository private constructor(context: Context) {
                     if (!widgetFastMode) {
                         matoMqttClient.nudgeFocusedLineSubscription(normFocus, nowMillis)
                     }
-                    preferredMatoVpEndpointIdx = 0
-                    preferredMatoVpQueryIdx = 0
-                    val retriedMato = withTimeoutOrNull(3_500L) {
-                        fetchMatoGraphQlVehiclePositions(normFocus, nowMillis)
-                    }.orEmpty()
-                    if (retriedMato.isNotEmpty()) {
-                        matoGqlVehicles = retriedMato
-                        lastMatoGqlRawVehicles = retriedMato
-                        lastMatoGqlFetchedAtMillis = nowMillis
-                        matoCombined = mergeMultiSourceVehicles(
-                            matoVehicles = matoMqttVehicles,
-                            gttVehicles = matoGqlVehicles,
-                            busOneVehicles = emptyList(),
-                            nowMillis = nowMillis,
-                        )
-                    }
                 }
 
                 val finalGttFrozen = allowCrossSourceFallback &&
@@ -559,13 +559,15 @@ class GttRealtimeRepository private constructor(context: Context) {
                 if (useMato && (!widgetFastMode || matoGqlVehicles.isNotEmpty() || effectiveMode == DataSourceMode.MATO_LIVE)) {
                     val matoMode = when {
                         effectiveMode == DataSourceMode.MATO_LIVE && matoCombined.isNotEmpty() -> "Fonte fissa"
-                        effectiveMode == DataSourceMode.MATO_LIVE && !widgetFastMode && matoMqttClient.isConnected() -> "Fonte fissa · Stream attivo"
+                        effectiveMode == DataSourceMode.MATO_LIVE && !widgetFastMode && matoMqttClient.isConnected() ->
+                            buildMatoConnectedIdleDetail(isFixedMato = true, nowMillis = nowMillis)
                         finalMatoFrozen && matoCombined.isNotEmpty() -> "GPS fermi · fallback attivo"
                         (finalGttFrozen || finalBusOneFrozen) && matoCombined.isNotEmpty() -> "Priorità attiva"
                         matoMqttVehicles.isNotEmpty() && matoGqlVehicles.isNotEmpty() -> "MQTT + GraphQL"
                         matoMqttVehicles.isNotEmpty() -> "MQTT Live"
                         matoGqlVehicles.isNotEmpty() -> "GraphQL Live"
-                        !widgetFastMode && matoMqttClient.isConnected() -> "Stream attivo"
+                        !widgetFastMode && matoMqttClient.isConnected() ->
+                            buildMatoConnectedIdleDetail(isFixedMato = false, nowMillis = nowMillis)
                         else -> matoMqttClient.lastError() ?: "In connessione…"
                     }
                     statuses.add(
@@ -842,10 +844,12 @@ class GttRealtimeRepository private constructor(context: Context) {
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val nowSec = nowMillis / 1000L
 
-        // OTP2 `/otp/gtfs/v1` first for `vehiclePositions` support, then OTP1/legacy endpoints
+        // OTP2 `/otp/gtfs/v1` first for `vehiclePositions` support, then OTP1/plan endpoints
         val vpEndpoints = listOf(
             "https://mato.muoversiatorino.it/otp/gtfs/v1",
+            "https://plan.muoversiatorino.it/otp/gtfs/v1",
             "https://mato.muoversiatorino.it/otp/routers/mato/index/graphql",
+            "https://plan.muoversiatorino.it/otp/routers/mato/index/graphql",
             "https://map.5t.torino.it/otp/routers/default/index/graphql",
             "https://mato.muoversiatorino.it/otp/routers/default/index/graphql",
         )
@@ -879,7 +883,15 @@ class GttRealtimeRepository private constructor(context: Context) {
                         }
                         val body = resp.body?.string() ?: continue
                         val root = JSONObject(body)
-                        val routes = root.optJSONObject("data")?.optJSONArray("routes") ?: continue
+                        val errors = root.optJSONArray("errors")
+                        val routes = root.optJSONObject("data")?.optJSONArray("routes")
+                        if (routes == null) {
+                            if (errors != null && errors.toString().contains("vehiclePositions", ignoreCase = true)) {
+                                // This OTP instance schema doesn't expose Pattern.vehiclePositions at all
+                                endpointHttpFailed = true
+                            }
+                            continue
+                        }
                         val out = mutableListOf<BusVehicle>()
 
                         for (r in 0 until routes.length()) {
