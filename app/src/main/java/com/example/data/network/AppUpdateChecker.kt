@@ -175,7 +175,7 @@ object AppUpdateChecker {
             val rawNotes = obj.optString("body", "").trim()
                 .replace(Regex("\r\n"), "\n")
                 .replace(Regex("\n{3,}"), "\n\n")
-            val notes = if (rawNotes.length > 320) rawNotes.take(317).trimEnd() + "…" else rawNotes
+            val notes = if (rawNotes.length > 4000) rawNotes.take(3997).trimEnd() + "…" else rawNotes
 
             var apkUrl: String? = null
             val assets = obj.optJSONArray("assets")

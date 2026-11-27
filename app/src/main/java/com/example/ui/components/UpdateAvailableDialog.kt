@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,8 +35,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -140,20 +149,101 @@ fun UpdateAvailableDialog(
                 }
 
                 if (update.releaseNotes.isNotBlank() && installState is UpdateInstallState.Idle) {
+                    val notesScrollState = rememberScrollState()
+                    val isScrollable by remember(notesScrollState) {
+                        derivedStateOf { notesScrollState.maxValue > 0 }
+                    }
+                    val canScrollUp by remember(notesScrollState) {
+                        derivedStateOf { notesScrollState.canScrollBackward }
+                    }
+                    val canScrollDown by remember(notesScrollState) {
+                        derivedStateOf { notesScrollState.canScrollForward }
+                    }
+
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(max = 150.dp)
+                            .heightIn(max = 240.dp)
                             .background(GlassRowFill, RoundedCornerShape(14.dp))
                             .border(1.dp, GlassRowBorder, RoundedCornerShape(14.dp))
-                            .padding(12.dp)
-                            .verticalScroll(rememberScrollState()),
+                            .drawWithContent {
+                                drawContent()
+                                val maxScroll = notesScrollState.maxValue
+                                if (maxScroll > 0 && size.height > 28f) {
+                                    val barWidth = 2.5.dp.toPx()
+                                    val vPad = 10.dp.toPx()
+                                    val trackHeight = (size.height - vPad * 2f).coerceAtLeast(16f)
+                                    val totalHeight = size.height + maxScroll.toFloat()
+                                    val thumbFraction = (size.height / totalHeight).coerceIn(0.18f, 0.82f)
+                                    val thumbHeight = (trackHeight * thumbFraction)
+                                        .coerceAtLeast(22.dp.toPx())
+                                        .coerceAtMost(trackHeight)
+                                    val progress = (notesScrollState.value.toFloat() / maxScroll.toFloat()).coerceIn(0f, 1f)
+                                    val thumbY = vPad + (trackHeight - thumbHeight) * progress
+                                    val barX = size.width - barWidth - 4.dp.toPx()
+                                    val radius = CornerRadius(barWidth / 2f, barWidth / 2f)
+                                    drawRoundRect(
+                                        color = Color.White.copy(alpha = 0.09f),
+                                        topLeft = Offset(barX, vPad),
+                                        size = Size(barWidth, trackHeight),
+                                        cornerRadius = radius,
+                                    )
+                                    drawRoundRect(
+                                        color = AccentCyan.copy(alpha = 0.68f),
+                                        topLeft = Offset(barX, thumbY),
+                                        size = Size(barWidth, thumbHeight),
+                                        cornerRadius = radius,
+                                    )
+                                }
+                            },
                     ) {
-                        Text(
-                            text = update.releaseNotes,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextBody,
-                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                                .drawWithContent {
+                                    drawContent()
+                                    val topFadePx = 14.dp.toPx().coerceAtMost(size.height * 0.2f)
+                                    val bottomFadePx = 28.dp.toPx().coerceAtMost(size.height * 0.3f)
+                                    if (canScrollUp && topFadePx > 0f) {
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                colors = listOf(Color.Transparent, Color.Black),
+                                                startY = 0f,
+                                                endY = topFadePx,
+                                            ),
+                                            topLeft = Offset.Zero,
+                                            size = Size(size.width, topFadePx),
+                                            blendMode = BlendMode.DstIn,
+                                        )
+                                    }
+                                    if (canScrollDown && bottomFadePx > 0f) {
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                colors = listOf(Color.Black, Color.Transparent),
+                                                startY = size.height - bottomFadePx,
+                                                endY = size.height,
+                                            ),
+                                            topLeft = Offset(0f, size.height - bottomFadePx),
+                                            size = Size(size.width, bottomFadePx),
+                                            blendMode = BlendMode.DstIn,
+                                        )
+                                    }
+                                }
+                                .verticalScroll(notesScrollState)
+                                .padding(
+                                    start = 12.dp,
+                                    top = 12.dp,
+                                    end = if (isScrollable) 16.dp else 12.dp,
+                                    bottom = if (isScrollable) 18.dp else 12.dp,
+                                ),
+                        ) {
+                            MarkdownChangelogContent(
+                                markdown = update.releaseNotes,
+                                accentColor = AccentCyan,
+                                modifier = Modifier.testTag("update_release_notes_markdown"),
+                            )
+                        }
                     }
                 } else if (installState is UpdateInstallState.Idle) {
                     Text(
