@@ -39,8 +39,11 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
@@ -667,11 +670,19 @@ fun GlassModalDialog(
     onDismissRequest: () -> Unit,
     accentTint: Color? = null,
     modifier: Modifier = Modifier,
+    maxWidth: Dp = 520.dp,
+    dismissOnBackPress: Boolean = true,
+    dismissOnClickOutside: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Dialog(
         onDismissRequest = onDismissRequest,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
+        properties = DialogProperties(
+            dismissOnBackPress = dismissOnBackPress,
+            dismissOnClickOutside = dismissOnClickOutside,
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
     ) {
         val borderBrush = remember(accentTint) {
             Brush.verticalGradient(
@@ -690,28 +701,52 @@ fun GlassModalDialog(
                 )
             }
         }
+        val scrimInteraction = remember { MutableInteractionSource() }
+        val cardInteraction = remember { MutableInteractionSource() }
 
-        Box(
-            modifier = modifier
-                .fillMaxWidth()
-                .padding(horizontal = 18.dp)
-                .widthIn(max = 520.dp)
-                .background(ModalGlassSurfaceBrush, ModalDialogShape)
-                .then(
-                    if (accentWashBrush != null) {
-                        Modifier.background(accentWashBrush, ModalDialogShape)
-                    } else {
-                        Modifier
-                    },
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .safeDrawingPadding()
+                .imePadding()
+                .clickable(
+                    interactionSource = scrimInteraction,
+                    indication = null,
+                    enabled = dismissOnClickOutside,
+                    onClick = onDismissRequest,
                 )
-                .border(1.2.dp, borderBrush, ModalDialogShape),
+                .padding(horizontal = 20.dp, vertical = 20.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            Column(
-                modifier = Modifier
+            val cappedMaxHeight = (this.maxHeight * 0.90f).coerceAtLeast(240.dp)
+
+            Box(
+                modifier = modifier
+                    .widthIn(max = maxWidth)
                     .fillMaxWidth()
-                    .padding(18.dp),
-                content = content,
-            )
+                    .heightIn(max = cappedMaxHeight)
+                    .background(ModalGlassSurfaceBrush, ModalDialogShape)
+                    .then(
+                        if (accentWashBrush != null) {
+                            Modifier.background(accentWashBrush, ModalDialogShape)
+                        } else {
+                            Modifier
+                        },
+                    )
+                    .border(1.2.dp, borderBrush, ModalDialogShape)
+                    .clickable(
+                        interactionSource = cardInteraction,
+                        indication = null,
+                        onClick = {},
+                    ),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(18.dp),
+                    content = content,
+                )
+            }
         }
     }
 }

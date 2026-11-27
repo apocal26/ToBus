@@ -1960,6 +1960,7 @@ private fun GttAlertsDialog(
     GlassModalDialog(
         onDismissRequest = onDismiss,
         accentTint = headerAccent,
+        maxWidth = 540.dp,
     ) {
         // Glass Header
         Row(
@@ -2021,7 +2022,7 @@ private fun GttAlertsDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 420.dp)
+                    .weight(1f, fill = false)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {

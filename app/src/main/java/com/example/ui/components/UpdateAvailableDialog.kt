@@ -56,7 +56,7 @@ import com.example.data.network.AppUpdateDownloader
 import com.example.data.network.AppUpdateInfo
 import com.example.data.network.UpdateInstallState
 import com.example.ui.glass.AccentIconBadge
-import com.example.ui.glass.liquidGlassRimBrush
+import com.example.ui.glass.GlassModalDialog
 import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
@@ -72,9 +72,6 @@ import com.example.ui.theme.TextHero
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSubtitle
 
-private val DialogShape = RoundedCornerShape(24.dp)
-private val DialogRimBrush = liquidGlassRimBrush(topAlpha = 0.42f, midAlpha = 0.14f, bottomAlpha = 0.24f)
-
 @Composable
 fun UpdateAvailableDialog(
     update: AppUpdateInfo,
@@ -88,38 +85,31 @@ fun UpdateAvailableDialog(
     onIgnoreVersion: () -> Unit,
 ) {
     val isDownloading = installState is UpdateInstallState.Downloading
-    Dialog(
+    val badgeAccent = when (installState) {
+        is UpdateInstallState.ReadyToInstall -> AccentEmerald
+        is UpdateInstallState.NeedsInstallPermission -> AccentGold
+        is UpdateInstallState.Error -> AccentRed
+        else -> AccentCyan
+    }
+    GlassModalDialog(
         onDismissRequest = {
             if (!isDownloading) onDismissLater()
         },
-        properties = DialogProperties(
-            dismissOnBackPress = !isDownloading,
-            dismissOnClickOutside = !isDownloading,
-        ),
+        accentTint = badgeAccent,
+        maxWidth = 460.dp,
+        dismissOnBackPress = !isDownloading,
+        dismissOnClickOutside = !isDownloading,
+        modifier = Modifier.testTag("update_available_dialog"),
     ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("update_available_dialog"),
-            shape = DialogShape,
-            color = SmokedGlassFill,
-            border = BorderStroke(1.2.dp, DialogRimBrush),
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Column(
-                modifier = Modifier.padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    val badgeAccent = when (installState) {
-                        is UpdateInstallState.ReadyToInstall -> AccentEmerald
-                        is UpdateInstallState.NeedsInstallPermission -> AccentGold
-                        is UpdateInstallState.Error -> AccentRed
-                        else -> AccentCyan
-                    }
-                    AccentIconBadge(
+                AccentIconBadge(
                         icon = ToBusIcons.SystemUpdate,
                         accent = badgeAccent,
                         size = 42.dp,
@@ -549,7 +539,6 @@ fun UpdateAvailableDialog(
             }
         }
     }
-}
 
 @Composable
 fun ConfigureGithubRepoDialog(
@@ -561,85 +550,81 @@ fun ConfigureGithubRepoDialog(
     val normalized = remember(repoText) { AppUpdateChecker.normalizeRepoSlug(repoText) }
     val canSave = repoText.isBlank() || normalized != null
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("github_repo_dialog"),
-            shape = DialogShape,
-            color = SmokedGlassFill,
-            border = BorderStroke(1.2.dp, DialogRimBrush),
+    GlassModalDialog(
+        onDismissRequest = onDismiss,
+        accentTint = AccentGold,
+        maxWidth = 460.dp,
+        modifier = Modifier.testTag("github_repo_dialog"),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Column(
-                modifier = Modifier.padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+            Text(
+                text = "Repository GitHub",
+                style = MaterialTheme.typography.titleMedium,
+                color = TextHero,
+            )
+            Text(
+                text = "Inserisci utente/nome-repo (es. mario/ToBus) o l'URL GitHub per controllare una volta al giorno le nuove release.",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSubtitle,
+            )
+            OutlinedTextField(
+                value = repoText,
+                onValueChange = { repoText = it },
+                singleLine = true,
+                placeholder = { Text("utente/repository", color = TextSubtitle) },
+                isError = repoText.isNotBlank() && normalized == null,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = TextPrimary,
+                    unfocusedTextColor = TextPrimary,
+                    focusedBorderColor = AccentGold,
+                    unfocusedBorderColor = GlassPillBorder,
+                    cursorColor = AccentGold,
+                ),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("github_repo_input"),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
             ) {
-                Text(
-                    text = "Repository GitHub",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = TextHero,
-                )
-                Text(
-                    text = "Inserisci utente/nome-repo (es. mario/ToBus) o l'URL GitHub per controllare una volta al giorno le nuove release.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSubtitle,
-                )
-                OutlinedTextField(
-                    value = repoText,
-                    onValueChange = { repoText = it },
-                    singleLine = true,
-                    placeholder = { Text("utente/repository", color = TextSubtitle) },
-                    isError = repoText.isNotBlank() && normalized == null,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = TextPrimary,
-                        unfocusedTextColor = TextPrimary,
-                        focusedBorderColor = AccentGold,
-                        unfocusedBorderColor = GlassPillBorder,
-                        cursorColor = AccentGold,
-                    ),
-                    shape = RoundedCornerShape(14.dp),
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("github_repo_input"),
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
+                        .height(48.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .clickable(onClick = onDismiss)
+                        .padding(horizontal = 16.dp)
+                        .testTag("github_repo_cancel_button"),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(999.dp))
-                            .clickable(onClick = onDismiss)
-                            .padding(horizontal = 16.dp)
-                            .testTag("github_repo_cancel_button"),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = "Annulla",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = TextSubtitle,
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Box(
-                        modifier = Modifier
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(if (canSave) AccentGold else GlassPillFill, RoundedCornerShape(999.dp))
-                            .clickable(enabled = canSave) {
-                                onSave(normalized.orEmpty())
-                            }
-                            .padding(horizontal = 18.dp)
-                            .testTag("github_repo_save_button"),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = "Salva",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (canSave) DarkInkOnAccent else TextSubtitle,
-                        )
-                    }
+                    Text(
+                        text = "Annulla",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = TextSubtitle,
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .height(48.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(if (canSave) AccentGold else GlassPillFill, RoundedCornerShape(999.dp))
+                        .clickable(enabled = canSave) {
+                            onSave(normalized.orEmpty())
+                        }
+                        .padding(horizontal = 18.dp)
+                        .testTag("github_repo_save_button"),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Salva",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (canSave) DarkInkOnAccent else TextSubtitle,
+                    )
                 }
             }
         }

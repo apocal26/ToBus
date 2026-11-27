@@ -142,6 +142,7 @@ fun HiddenDebugMenuDialog(
     GlassModalDialog(
         onDismissRequest = onDismiss,
         accentTint = AccentGold,
+        maxWidth = 560.dp,
     ) {
         Column(
             modifier = Modifier
@@ -221,7 +222,7 @@ fun HiddenDebugMenuDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 390.dp)
+                    .weight(1f, fill = false)
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
