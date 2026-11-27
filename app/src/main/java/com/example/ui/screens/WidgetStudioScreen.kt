@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,6 +34,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Star
@@ -45,6 +48,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -74,6 +79,7 @@ import com.example.data.model.StopArrival
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.shortTurinPlaceName
 import com.example.ui.components.ConfigureGithubRepoDialog
+import com.example.ui.components.HiddenDebugMenuDialog
 import com.example.ui.glass.AccentIconBadge
 import com.example.ui.glass.DirectionColorBadge
 import com.example.ui.glass.GlassBand
@@ -91,6 +97,7 @@ import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
 import com.example.ui.theme.AccentRed
 import com.example.ui.theme.DarkInkOnAccent
+import com.example.ui.theme.visualStyle
 import com.example.ui.theme.GlassBandBorder
 import com.example.ui.theme.GlassPillBorder
 import com.example.ui.theme.GlassPillFill
@@ -107,6 +114,7 @@ import com.example.ui.theme.TextSubtitle
 import com.example.ui.viewmodel.ToBusUiState
 import com.example.ui.viewmodel.WidgetPreviewSize
 import com.example.widget.BusMapWidgetProvider
+import com.example.widget.FavoriteAlertsWidgetProvider
 import com.example.widget.StopArrivalsWidgetProvider
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -127,6 +135,7 @@ fun WidgetStudioScreen(
     onToggleHideInactiveInWidget: (Boolean) -> Unit,
     onToggleHideInactiveOnMap: (Boolean) -> Unit = {},
     onToggleShowServiceAlerts: (Boolean) -> Unit = {},
+    onToggleNotifyFavoriteLineAlerts: (Boolean) -> Unit = {},
     onToggleKeepScreenOn: (Boolean) -> Unit = {},
     onSelectDataSourceMode: (DataSourceMode) -> Unit = {},
     onSelectLivePollInterval: (LivePollInterval) -> Unit = {},
@@ -139,11 +148,13 @@ fun WidgetStudioScreen(
     onCheckUpdates: () -> Unit = {},
     onSaveGithubRepo: (String) -> Unit = {},
     onClearAppCaches: () -> Unit = {},
+    onDebugStateChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     var showManualGuideDialog by remember { mutableStateOf(false) }
     var showGithubRepoDialog by remember { mutableStateOf(false) }
+    var showHiddenDebugDialog by remember { mutableStateOf(false) }
 
     if (showGithubRepoDialog) {
         ConfigureGithubRepoDialog(
@@ -153,6 +164,14 @@ fun WidgetStudioScreen(
                 onSaveGithubRepo(slug)
             },
             onDismiss = { showGithubRepoDialog = false },
+        )
+    }
+
+    if (showHiddenDebugDialog) {
+        HiddenDebugMenuDialog(
+            uiState = uiState,
+            onDebugStateChanged = onDebugStateChanged,
+            onDismiss = { showHiddenDebugDialog = false },
         )
     }
 
@@ -193,7 +212,7 @@ fun WidgetStudioScreen(
                 text = "1. Torna alla schermata Home del telefono o tablet.\n" +
                     "2. Tieni premuto su uno spazio vuoto dello sfondo.\n" +
                     "3. Apri \"Widget\" e cerca \"ToBus\".\n" +
-                    "4. Scegli \"Mappa 2×2\", \"Mappa 4×2\" oppure \"Fermate Live\".",
+                    "4. Scegli \"Mappa 2×2\", \"Mappa 4×2\", \"Fermate Live\" oppure \"Avvisi Preferite\".",
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextBody,
             )
@@ -201,10 +220,10 @@ fun WidgetStudioScreen(
     }
 
     val pinSelectedWidget = {
-        val ok = if (uiState.previewSize == WidgetPreviewSize.STOPS_LIVE) {
-            StopArrivalsWidgetProvider.requestPinWidget(context)
-        } else {
-            BusMapWidgetProvider.requestPinWidget(context, square = uiState.previewSize.isSquare)
+        val ok = when (uiState.previewSize) {
+            WidgetPreviewSize.STOPS_LIVE -> StopArrivalsWidgetProvider.requestPinWidget(context)
+            WidgetPreviewSize.ALERTS_LIVE -> FavoriteAlertsWidgetProvider.requestPinWidget(context)
+            else -> BusMapWidgetProvider.requestPinWidget(context, square = uiState.previewSize.isSquare)
         }
         if (!ok) {
             showManualGuideDialog = true
@@ -270,6 +289,7 @@ fun WidgetStudioScreen(
                         onToggleHideInactiveInWidget = onToggleHideInactiveInWidget,
                         onToggleHideInactiveOnMap = onToggleHideInactiveOnMap,
                         onToggleShowServiceAlerts = onToggleShowServiceAlerts,
+                        onToggleNotifyFavoriteLineAlerts = onToggleNotifyFavoriteLineAlerts,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
                         onSelectDataSourceMode = onSelectDataSourceMode,
                         onSelectLivePollInterval = onSelectLivePollInterval,
@@ -285,6 +305,7 @@ fun WidgetStudioScreen(
                         },
                         onEditGithubRepo = { showGithubRepoDialog = true },
                         onClearAppCaches = onClearAppCaches,
+                        onOpenHiddenDebugMenu = { showHiddenDebugDialog = true },
                     )
                     Spacer(modifier = Modifier.height(20.dp))
                 }
@@ -330,6 +351,7 @@ fun WidgetStudioScreen(
                         onToggleHideInactiveInWidget = onToggleHideInactiveInWidget,
                         onToggleHideInactiveOnMap = onToggleHideInactiveOnMap,
                         onToggleShowServiceAlerts = onToggleShowServiceAlerts,
+                        onToggleNotifyFavoriteLineAlerts = onToggleNotifyFavoriteLineAlerts,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
                         onSelectDataSourceMode = onSelectDataSourceMode,
                         onSelectLivePollInterval = onSelectLivePollInterval,
@@ -345,6 +367,7 @@ fun WidgetStudioScreen(
                         },
                         onEditGithubRepo = { showGithubRepoDialog = true },
                         onClearAppCaches = onClearAppCaches,
+                        onOpenHiddenDebugMenu = { showHiddenDebugDialog = true },
                     )
                     Spacer(modifier = Modifier.height(bottomNavClearance + 16.dp))
                 }
@@ -428,6 +451,12 @@ private fun LiveWidgetShowcaseBand(
                     timeLabel = timeLabel,
                     onRefreshPreview = onRefreshPreview,
                 )
+            } else if (uiState.previewSize == WidgetPreviewSize.ALERTS_LIVE) {
+                FavoriteAlertsWidgetPreviewCard(
+                    uiState = uiState,
+                    timeLabel = timeLabel,
+                    onRefreshPreview = onRefreshPreview,
+                )
             } else {
                 val spatialById = remember(uiState.lineVehicles, uiState.routePatterns) {
                     uiState.lineVehicles.associate { bus ->
@@ -460,6 +489,7 @@ private fun LiveWidgetShowcaseBand(
                                 WidgetPreviewSize.WIDE_4X2 -> 0.96f
                                 WidgetPreviewSize.TABLET_5X3 -> 1.0f
                                 WidgetPreviewSize.STOPS_LIVE -> 0.96f
+                                WidgetPreviewSize.ALERTS_LIVE -> 0.96f
                             },
                         )
                         .aspectRatio(aspectRatio)
@@ -806,42 +836,116 @@ private fun StopsLiveWidgetPreviewCard(
         } else {
             val savedLine = activeFav.lineCode.trim().uppercase()
             val savedTerminus = activeFav.terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                groupedLines.take(4).forEach { (lineCode, arrivals) ->
-                    val isPrimary = savedLine.isNotEmpty() && lineCode.equals(savedLine, ignoreCase = true)
-                    val headsign = arrivals
-                        .firstOrNull { !com.example.data.model.isGenericDirectionLabel(it.headsign) }
-                        ?.headsign
-                        ?.let(::shortTurinPlaceName)
-                        ?: (if (isPrimary) savedTerminus else null)
-                        ?: arrivals
-                            .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
+            val hasMoreLines = groupedLines.size > 3
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (hasMoreLines) {
+                            Modifier
+                                .heightIn(max = 216.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                        } else {
+                            Modifier
+                        },
+                    ),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(end = if (hasMoreLines) 7.dp else 0.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    groupedLines.take(4).forEach { (lineCode, arrivals) ->
+                        val isPrimary = savedLine.isNotEmpty() && lineCode.equals(savedLine, ignoreCase = true)
+                        val headsign = arrivals
+                            .firstOrNull { !com.example.data.model.isGenericDirectionLabel(it.headsign) }
                             ?.headsign
                             ?.let(::shortTurinPlaceName)
-                        ?: ""
-                    val badgeColor = when {
-                        isPrimary && uiState.settings.colorByDirection && activeFav.directionId == 1 -> AccentCyan
-                        isPrimary -> AccentGold
-                        else -> Color(0x2EFFFFFF)
+                            ?: (if (isPrimary) savedTerminus else null)
+                            ?: arrivals
+                                .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
+                                ?.headsign
+                                ?.let(::shortTurinPlaceName)
+                            ?: ""
+                        val badgeColor = when {
+                            isPrimary && uiState.settings.colorByDirection && activeFav.directionId == 1 -> AccentCyan
+                            isPrimary -> AccentGold
+                            else -> Color(0x2EFFFFFF)
+                        }
+                        PreviewStopCardRow(
+                            lineCode = lineCode,
+                            isPrimaryLine = isPrimary,
+                            badgeColor = badgeColor,
+                            headsign = headsign,
+                            arrivals = arrivals,
+                            nowMillis = uiState.nowMillis,
+                            clockFormat = clockFormat,
+                        )
                     }
-                    PreviewStopCardRow(
-                        lineCode = lineCode,
-                        isPrimaryLine = isPrimary,
-                        badgeColor = badgeColor,
-                        headsign = headsign,
-                        arrivals = arrivals,
-                        nowMillis = uiState.nowMillis,
-                        clockFormat = clockFormat,
+                }
+                if (hasMoreLines) {
+                    WidgetPreviewScrollCue(
+                        modifier = Modifier.matchParentSize(),
                     )
                 }
-                if (groupedLines.size > 4) {
-                    Text(
-                        text = "+ altre ${groupedLines.size - 4} linee scorrevoli nel widget",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextSubtitle,
-                        modifier = Modifier.padding(start = 4.dp),
-                    )
-                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WidgetPreviewScrollCue(
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier) {
+        // Hairline translucent scrollbar on the right edge mirroring widget_scrollbar_thumb.xml
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 4.dp, bottom = 26.dp)
+                .width(2.5.dp)
+                .fillMaxHeight()
+                .background(Color(0x18FFFFFF), CircleShape),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.46f)
+                    .background(Color(0x66FFFFFF), CircleShape),
+            )
+        }
+        // Bottom fade gradient + minimal frosted chevron pill mirroring widget_bottom_scroll_fade.xml
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(30.dp)
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0x000E1117),
+                            Color(0xB80E1117),
+                            Color(0xF50E1117),
+                        ),
+                    ),
+                ),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            Box(
+                modifier = Modifier
+                    .padding(bottom = 2.dp)
+                    .size(width = 28.dp, height = 15.dp)
+                    .background(Color(0xCC171D2A), CircleShape)
+                    .border(1.dp, Color(0x38FFFFFF), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = Color(0xE0FFFFFF),
+                    modifier = Modifier.size(13.dp),
+                )
             }
         }
     }
@@ -941,17 +1045,287 @@ private fun PreviewStopCardRow(
 }
 
 @Composable
+private fun FavoriteAlertsWidgetPreviewCard(
+    uiState: ToBusUiState,
+    timeLabel: String,
+    onRefreshPreview: () -> Unit,
+) {
+    val favorites = uiState.favoriteLines
+    val refreshInt = remember { MutableInteractionSource() }
+    val rows = remember(uiState.allAlerts, favorites, uiState.nowMillis) {
+        FavoriteAlertsWidgetProvider.buildAlertRows(
+            alerts = uiState.allAlerts,
+            favoriteLines = favorites,
+            nowEpochSeconds = uiState.nowMillis / 1000L,
+        )
+    }
+    val favPreview = remember(favorites) {
+        favorites.take(4).joinToString(", ") + if (favorites.size > 4) "…" else ""
+    }
+    val hasAlerts = rows.isNotEmpty()
+    val allClear = favorites.isNotEmpty() && !hasAlerts
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth(0.98f)
+            .shadow(elevation = 16.dp, shape = RoundedCornerShape(26.dp))
+            .background(Color(0xF00E1117), RoundedCornerShape(26.dp))
+            .border(1.dp, Color(0x38FFFFFF), RoundedCornerShape(26.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // Header mirroring widget_favorite_alerts.xml
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .background(
+                        if (allClear) Color(0x2434D399) else Color(0x29FBBF24),
+                        CircleShape,
+                    )
+                    .border(
+                        1.dp,
+                        if (allClear) Color(0x5934D399) else Color(0x66FBBF24),
+                        CircleShape,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = when {
+                        favorites.isEmpty() -> "★"
+                        allClear -> "✓"
+                        else -> "!"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (allClear) AccentEmerald else AccentGold,
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Avvisi Preferite",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = if (favorites.isEmpty()) {
+                        "Nessuna linea preferita"
+                    } else {
+                        "$favPreview · $timeLabel"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSubtitle,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (hasAlerts) {
+                Spacer(modifier = Modifier.width(6.dp))
+                Box(
+                    modifier = Modifier
+                        .background(Color(0x29FBBF24), RoundedCornerShape(999.dp))
+                        .border(1.dp, Color(0x66FBBF24), RoundedCornerShape(999.dp))
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        text = if (rows.size == 1) "1 attivo" else "${rows.size} attivi",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = AccentGold,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(6.dp))
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .glassInteractive(refreshInt, onClick = onRefreshPreview)
+                    .background(OverlayPillFill, CircleShape)
+                    .border(1.dp, OverlayPillBorder, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Refresh,
+                    contentDescription = stringResource(R.string.widget_tap_to_refresh),
+                    tint = TextPrimary,
+                    modifier = Modifier.size(15.dp),
+                )
+            }
+        }
+
+        when {
+            favorites.isEmpty() -> {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0x16FFFFFF), RoundedCornerShape(14.dp))
+                        .border(1.dp, Color(0x24FFFFFF), RoundedCornerShape(14.dp))
+                        .padding(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = "★ Aggiungi le tue linee",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = AccentGold,
+                    )
+                    Text(
+                        text = "Tocca ★ sulle linee che usi per vedere qui deviazioni e avvisi GTT.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextBody,
+                    )
+                }
+            }
+
+            hasAlerts -> {
+                val hasMoreAlerts = rows.size > 2
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(
+                            if (hasMoreAlerts) {
+                                Modifier
+                                    .heightIn(max = 216.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                            } else {
+                                Modifier
+                            },
+                        ),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(end = if (hasMoreAlerts) 7.dp else 0.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        rows.take(3).forEach { row ->
+                            val style = row.category.visualStyle()
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(
+                                        if (row.isActiveNow) style.accent.copy(alpha = 0.14f) else Color(0x16FFFFFF),
+                                        RoundedCornerShape(14.dp),
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (row.isActiveNow) style.accent.copy(alpha = 0.42f) else Color(0x24FFFFFF),
+                                        RoundedCornerShape(14.dp),
+                                    )
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    row.matchedLines.take(3).forEach { code ->
+                                        Box(
+                                            modifier = Modifier
+                                                .background(style.accent, RoundedCornerShape(999.dp))
+                                                .padding(horizontal = 7.dp, vertical = 1.dp),
+                                        ) {
+                                            Text(
+                                                text = code,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = style.onAccentInk,
+                                            )
+                                        }
+                                    }
+                                    if (row.matchedLines.size > 3) {
+                                        Box(
+                                            modifier = Modifier
+                                                .background(OverlayPillFill, RoundedCornerShape(999.dp))
+                                                .padding(horizontal = 6.dp, vertical = 1.dp),
+                                        ) {
+                                            Text(
+                                                text = "+${row.matchedLines.size - 3}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextPrimary,
+                                            )
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.weight(1f))
+                                    Text(
+                                        text = row.statusLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = style.softText,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Text(
+                                    text = row.title,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = TextPrimary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (row.body.isNotBlank()) {
+                                    Text(
+                                        text = row.body,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextBody,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (hasMoreAlerts) {
+                        WidgetPreviewScrollCue(
+                            modifier = Modifier.matchParentSize(),
+                        )
+                    }
+                }
+            }
+
+            else -> {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0x1434D399), RoundedCornerShape(14.dp))
+                        .border(1.dp, Color(0x3D34D399), RoundedCornerShape(14.dp))
+                        .padding(12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = "✓ Servizio regolare",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = AccentEmerald,
+                    )
+                    Text(
+                        text = "Nessun avviso o deviazione attiva sulle linee $favPreview.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextBody,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun PinWidgetActionButton(
     previewSize: WidgetPreviewSize,
     onPin: () -> Unit,
 ) {
     val isSquare = previewSize.isSquare
     val isStops = previewSize == WidgetPreviewSize.STOPS_LIVE
+    val isAlerts = previewSize == WidgetPreviewSize.ALERTS_LIVE
     val label = when (previewSize) {
         WidgetPreviewSize.SQUARE_2X2 -> "Aggiungi widget 2×2 alla Home"
         WidgetPreviewSize.WIDE_4X2 -> "Aggiungi widget 4×2 alla Home"
         WidgetPreviewSize.TABLET_5X3 -> "Aggiungi widget 5×3 alla Home"
         WidgetPreviewSize.STOPS_LIVE -> "Aggiungi widget Fermate alla Home"
+        WidgetPreviewSize.ALERTS_LIVE -> "Aggiungi widget Avvisi alla Home"
     }
     val interaction = remember { MutableInteractionSource() }
     Surface(
@@ -961,7 +1335,7 @@ private fun PinWidgetActionButton(
             .glassInteractive(interaction, onClick = onPin)
             .testTag("pin_widget_button"),
         shape = RoundedCornerShape(999.dp),
-        color = if (isStops) AccentGold else AccentCyan,
+        color = if (isStops || isAlerts) AccentGold else AccentCyan,
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 20.dp),
@@ -970,6 +1344,7 @@ private fun PinWidgetActionButton(
         ) {
             Icon(
                 imageVector = when {
+                    isAlerts -> Icons.Rounded.Notifications
                     isStops -> Icons.Rounded.Star
                     isSquare -> ToBusIcons.GridView
                     else -> ToBusIcons.Widgets
@@ -1002,6 +1377,7 @@ private fun WidgetControlsColumn(
     onToggleHideInactiveInWidget: (Boolean) -> Unit,
     onToggleHideInactiveOnMap: (Boolean) -> Unit,
     onToggleShowServiceAlerts: (Boolean) -> Unit,
+    onToggleNotifyFavoriteLineAlerts: (Boolean) -> Unit,
     onToggleKeepScreenOn: (Boolean) -> Unit,
     onSelectDataSourceMode: (DataSourceMode) -> Unit,
     onSelectLivePollInterval: (LivePollInterval) -> Unit,
@@ -1011,6 +1387,7 @@ private fun WidgetControlsColumn(
     onCheckUpdates: () -> Unit,
     onEditGithubRepo: () -> Unit,
     onClearAppCaches: () -> Unit,
+    onOpenHiddenDebugMenu: () -> Unit = {},
 ) {
     val settings = uiState.settings
 
@@ -1067,6 +1444,9 @@ private fun WidgetControlsColumn(
                     Text(
                         text = when {
                             !settings.hasSelectedLine -> "Scegli una linea per iniziare"
+                            com.example.data.network.GtfsRtProtobufParser.isNonLiveTrackedLine(settings.selectedLine) &&
+                                uiState.lineVehicles.isEmpty() ->
+                                "La linea ${settings.selectedLine} non viene tracciata in tempo reale"
                             uiState.lineVehicles.isEmpty() -> "Nessun mezzo attivo ora"
                             activeReliableCount == 0 -> "${uiState.lineVehicles.size} in deposito o fermi · ${uiState.onlineSourcesCount} fonti"
                             activeReliableCount == 1 -> "1 pullman attivo · ${uiState.onlineSourcesCount} fonti"
@@ -1454,6 +1834,23 @@ private fun WidgetControlsColumn(
             testTag = "toggle_service_alerts",
         )
         HorizontalDivider(color = GlassBandBorder)
+        val favLinesPreview = remember(uiState.favoriteLines) {
+            if (uiState.favoriteLines.isEmpty()) {
+                "Aggiungi almeno una linea ai preferiti (★) per ricevere avvisi"
+            } else {
+                val head = uiState.favoriteLines.take(5).joinToString(", ")
+                val suffix = if (uiState.favoriteLines.size > 5) "…" else ""
+                "Solo nuovi avvisi per $head$suffix (senza ripetizioni)"
+            }
+        }
+        GlassToggleRow(
+            title = "Notifiche avvisi linee preferite",
+            subtitle = favLinesPreview,
+            checked = settings.notifyFavoriteLineAlerts,
+            onCheckedChange = onToggleNotifyFavoriteLineAlerts,
+            testTag = "toggle_notify_favorite_alerts",
+        )
+        HorizontalDivider(color = GlassBandBorder)
         GlassToggleRow(
             title = "Schermo sempre acceso sulla mappa",
             subtitle = "Evita lo spegnimento mentre aspetti il pullman",
@@ -1533,7 +1930,27 @@ private fun WidgetControlsColumn(
                 size = 40.dp,
                 iconSize = 20.dp,
             )
-            Column(modifier = Modifier.weight(1f)) {
+            var versionTapCount by remember { mutableIntStateOf(0) }
+            var lastVersionTapMillis by remember { mutableLongStateOf(0L) }
+            val silentVersionInteraction = remember { MutableInteractionSource() }
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(
+                        interactionSource = silentVersionInteraction,
+                        indication = null,
+                    ) {
+                        val now = System.currentTimeMillis()
+                        val nextCount = if (now - lastVersionTapMillis <= 1_800L) versionTapCount + 1 else 1
+                        lastVersionTapMillis = now
+                        if (nextCount >= 7) {
+                            versionTapCount = 0
+                            onOpenHiddenDebugMenu()
+                        } else {
+                            versionTapCount = nextCount
+                        }
+                    },
+            ) {
                 Text(
                     text = "Aggiornamenti app",
                     style = MaterialTheme.typography.titleMedium,

@@ -144,7 +144,7 @@ class GttStaticRouteStoreTest {
         )
 
         val merged = com.example.data.network.GttRealtimeRepository.mergeLineSummariesWithCatalog(live, catalog)
-        assertEquals(listOf("4", "15", "55", "VE1"), merged.map { it.lineCode })
+        assertEquals(listOf("METRO", "4", "15", "55", "VE1"), merged.map { it.lineCode })
         assertEquals(4, merged.first { it.lineCode == "55" }.activeVehicleCount)
         assertEquals(2, merged.first { it.lineCode == "15" }.activeVehicleCount)
         assertEquals(0, merged.first { it.lineCode == "4" }.activeVehicleCount)

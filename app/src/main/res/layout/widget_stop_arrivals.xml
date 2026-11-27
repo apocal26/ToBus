@@ -92,11 +92,41 @@
             android:id="@+id/stop_widget_list"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
+            android:clipToPadding="false"
             android:divider="@android:color/transparent"
             android:dividerHeight="0dp"
-            android:fadingEdge="vertical"
-            android:fadingEdgeLength="10dp"
-            android:scrollbars="none" />
+            android:fadeScrollbars="false"
+            android:fadingEdgeLength="22dp"
+            android:paddingBottom="18dp"
+            android:paddingEnd="5dp"
+            android:requiresFadingEdge="vertical"
+            android:scrollbarSize="2.5dp"
+            android:scrollbarStyle="outsideOverlay"
+            android:scrollbarThumbVertical="@drawable/widget_scrollbar_thumb"
+            android:scrollbars="vertical" />
+
+        <!-- Subtle non-interactive bottom fade + minimal chevron hinting more lines below -->
+        <FrameLayout
+            android:id="@+id/stop_widget_scroll_hint"
+            android:layout_width="match_parent"
+            android:layout_height="26dp"
+            android:layout_gravity="bottom"
+            android:background="@drawable/widget_bottom_scroll_fade"
+            android:clickable="false"
+            android:focusable="false"
+            android:visibility="gone">
+
+            <ImageView
+                android:layout_width="28dp"
+                android:layout_height="15dp"
+                android:layout_gravity="bottom|center_horizontal"
+                android:layout_marginBottom="1dp"
+                android:background="@drawable/widget_scroll_chevron_pill"
+                android:contentDescription="@null"
+                android:padding="1dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_widget_chevron_down" />
+        </FrameLayout>
 
         <TextView
             android:id="@+id/stop_widget_empty_text"

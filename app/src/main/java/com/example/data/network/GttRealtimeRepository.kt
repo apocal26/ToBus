@@ -7,6 +7,7 @@ import com.example.data.model.BusVehicle
 import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.GeoPoint
+import com.example.data.model.GttDataOutageReport
 import com.example.data.model.LineSummary
 import com.example.data.model.LiveFeedSnapshot
 import com.example.data.model.RoutePattern
@@ -109,10 +110,22 @@ class GttRealtimeRepository private constructor(context: Context) {
 
     private val movementTracker = ConcurrentHashMap<String, MovementRecord>()
     private val sourceHealthTracker = SourceHealthTracker()
+    private val outageDetector: GttServiceOutageDetector by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        GttServiceOutageDetector(appContext) { matoFastHttpClient }
+    }
     private val singleLineLiveCache = ConcurrentHashMap<String, CachedSingleLineVehicles>()
 
     @Volatile
     private var lastSnapshot: LiveFeedSnapshot? = null
+
+    @Volatile
+    private var lastSourceReports: Map<String, SourceHealthReport> = emptyMap()
+
+    @Volatile
+    private var lastRouteLoadSummary: String = "Nessun percorso caricato"
+
+    @Volatile
+    private var lastStopArrivalsSummary: String = "Nessuna fermata interrogata"
 
     @Volatile
     private var lastGttRawVehicles: List<BusVehicle> = emptyList()
@@ -152,6 +165,202 @@ class GttRealtimeRepository private constructor(context: Context) {
 
     @Volatile
     private var preferredMatoVpQueryIdx: Int = 0
+
+    data class DebugSourceMotionSummary(
+        val sourceName: String,
+        val statusLabel: String,
+        val observedNonDepot: Int,
+        val movingCount: Int,
+        val stuckCount: Int,
+        val frozenDurationSec: Long,
+        val fleetFrozen: Boolean,
+        val focusLineFrozen: Boolean,
+    )
+
+    data class DebugMqttSummary(
+        val isActiveDesired: Boolean,
+        val isConnected: Boolean,
+        val profileLabel: String,
+        val focusedLine: String,
+        val rawPublishCount: Long,
+        val parsedVehicleCount: Long,
+        val cachedVehicles: Int,
+        val subAckAccepted: Int,
+        val subAckRejected: Int,
+        val reconnectAttempts: Int,
+        val lastSampleTopic: String?,
+        val lastError: String?,
+    )
+
+    data class DebugRuntimeTelemetry(
+        val outageSnapshot: OutageDetectorSnapshot,
+        val mqtt: DebugMqttSummary,
+        val sourceMotion: List<DebugSourceMotionSummary>,
+        val routeCacheRamCount: Int,
+        val routeCacheDiskCount: Int,
+        val movementTrackedCount: Int,
+        val tripUpdatesCount: Int,
+        val staticStoreSummary: String,
+        val lastRouteLoadSummary: String,
+        val lastStopArrivalsSummary: String,
+        val matoGqlPreferredEndpointIdx: Int,
+        val matoGqlPreferredQueryIdx: Int,
+    )
+
+    fun getCurrentOutageReport(): GttDataOutageReport? = outageDetector.currentActiveOutage()
+
+    fun isSimulatedOutageEnabled(): Boolean = outageDetector.isSimulatedOutageEnabled()
+
+    fun toggleSimulatedOutage(): GttDataOutageReport? {
+        val next = !outageDetector.isSimulatedOutageEnabled()
+        return outageDetector.setSimulatedOutage(next)
+    }
+
+    fun forceReconnectMatoMqtt(lineCode: String? = null): String {
+        val target = lineCode?.takeIf { it.isNotBlank() } ?: lastFocusLine
+        matoMqttClient.forceReconnect(target)
+        return "Riconnessione MaTO MQTT avviata (linea ${target ?: "-"}, profilo ${matoMqttClient.activeProfileLabel()})."
+    }
+
+    fun resetHealthAndOutageTrackers() {
+        sourceHealthTracker.reset()
+        movementTracker.clear()
+        outageDetector.reset()
+        lastSourceReports = emptyMap()
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.DEBUG,
+            message = "Azzerati tracker GPS bloccati, movimento e rilevatore disservizi",
+            severity = DiagSeverity.OK,
+        )
+    }
+
+    fun getDebugRuntimeTelemetry(): DebugRuntimeTelemetry {
+        val diskFiles = runCatching { routeCacheDir.listFiles()?.count { it.isFile } ?: 0 }.getOrDefault(0)
+        val motion = lastSourceReports.values
+            .sortedBy { it.sourceName }
+            .map { r ->
+                DebugSourceMotionSummary(
+                    sourceName = r.sourceName,
+                    statusLabel = when {
+                        r.isFrozenOverall -> "FERMO (${r.frozenDurationSeconds}s)"
+                        r.status == SourceMotionStatus.MOVING -> "IN MOTO"
+                        else -> "WARMUP"
+                    },
+                    observedNonDepot = r.observedNonDepotCount,
+                    movingCount = r.movingCount,
+                    stuckCount = r.stuckVehicleIds.size,
+                    frozenDurationSec = r.frozenDurationSeconds,
+                    fleetFrozen = r.fleetFrozen,
+                    focusLineFrozen = r.focusLineFrozen,
+                )
+            }
+        return DebugRuntimeTelemetry(
+            outageSnapshot = outageDetector.getDiagnosticSnapshot(),
+            mqtt = DebugMqttSummary(
+                isActiveDesired = matoMqttClient.isActiveOrConnecting(),
+                isConnected = matoMqttClient.isConnected(),
+                profileLabel = matoMqttClient.activeProfileLabel(),
+                focusedLine = matoMqttClient.focusedLineCode(),
+                rawPublishCount = matoMqttClient.rawPublishCount(),
+                parsedVehicleCount = matoMqttClient.parsedVehicleCount(),
+                cachedVehicles = matoMqttClient.totalCachedVehicles(),
+                subAckAccepted = matoMqttClient.subAckAcceptedCount(),
+                subAckRejected = matoMqttClient.subAckRejectedCount(),
+                reconnectAttempts = matoMqttClient.reconnectAttemptCount(),
+                lastSampleTopic = matoMqttClient.lastSampleTopic(),
+                lastError = matoMqttClient.lastError(),
+            ),
+            sourceMotion = motion,
+            routeCacheRamCount = routeMemoryCache.size,
+            routeCacheDiskCount = diskFiles,
+            movementTrackedCount = movementTracker.size,
+            tripUpdatesCount = lastTripUpdates.size,
+            staticStoreSummary = staticRouteStore.getCacheDiagnosticSummary(),
+            lastRouteLoadSummary = lastRouteLoadSummary,
+            lastStopArrivalsSummary = lastStopArrivalsSummary,
+            matoGqlPreferredEndpointIdx = preferredMatoVpEndpointIdx,
+            matoGqlPreferredQueryIdx = preferredMatoVpQueryIdx,
+        )
+    }
+
+    /**
+     * Runs an on-demand parallel probe of neutral internet connectivity + every GTT / BusOne / MaTO
+     * data feed, recording detailed latencies and item counts into [ToBusDiagnosticsLog].
+     */
+    suspend fun runFullSourcesProbeNow(focusLine: String?): String = withContext(Dispatchers.IO) {
+        val nowMillis = System.currentTimeMillis()
+        val normLine = focusLine?.let { GtfsRtProtobufParser.normalizeGttLineCode(it) }
+            ?.takeIf { it.isNotEmpty() && it != "?" }
+        val conn = outageDetector.checkCurrentConnectivity()
+
+        val summary = coroutineScope {
+            val netDef = async { outageDetector.probeNeutralInternet(force = true, nowMillis = nowMillis) }
+            val gttDef = async { fetchVehicleSource("gtt_official", "GTT Ufficiale", GTT_VP_URLS, nowMillis) }
+            val busOneDef = async { fetchVehicleSource("busone_proxy", "BusOne Proxy", BUSONE_VP_URLS, nowMillis) }
+            val tripDef = async { fetchTripUpdatesSource() }
+            val alertsDef = async { fetchAlertsSource() }
+            val matoGqlDef = async {
+                if (normLine != null) {
+                    val t0 = SystemClock.elapsedRealtime()
+                    val v = runCatching { fetchMatoGraphQlVehiclePositions(normLine, nowMillis) }.getOrDefault(emptyList())
+                    v.size to (SystemClock.elapsedRealtime() - t0)
+                } else {
+                    0 to 0L
+                }
+            }
+
+            val net = netDef.await()
+            val gtt = gttDef.await()
+            val busOne = busOneDef.await()
+            val trip = tripDef.await()
+            val alerts = alertsDef.await()
+            val (matoCount, matoMs) = matoGqlDef.await()
+
+            val lines = buildList {
+                add("Rete: ${conn.transportLabel} (validata=${conn.isValidated}, captive=${conn.isCaptivePortal}) · Probe neutrale: ${if (net.reachable) "OK" else "FAIL"} (${net.detail})")
+                add("GTT Ufficiale: ${if (gtt.status.isOnline) "OK" else "FAIL"} · ${gtt.status.detail}")
+                add("BusOne Proxy: ${if (busOne.status.isOnline) "OK" else "FAIL"} · ${busOne.status.detail}")
+                add("TripUpdates: ${if (trip.status.isOnline) "OK" else "FAIL"} · ${trip.status.detail}")
+                add("Avvisi GTT: ${if (alerts.status.isOnline) "OK" else "FAIL"} · ${alerts.status.itemCount} avvisi (${alerts.status.latencyMs}ms)")
+                if (normLine != null) {
+                    add("MaTO GraphQL (L.$normLine): $matoCount mezzi · ${matoMs}ms (ep#$preferredMatoVpEndpointIdx/q#$preferredMatoVpQueryIdx)")
+                }
+                add("MaTO MQTT: conn=${matoMqttClient.isConnected()} · profilo=${matoMqttClient.activeProfileLabel()} · raw=${matoMqttClient.rawPublishCount()} · parsed=${matoMqttClient.parsedVehicleCount()} · subOk=${matoMqttClient.subAckAcceptedCount()}/rej=${matoMqttClient.subAckRejectedCount()}")
+            }
+            lines.joinToString("\n")
+        }
+
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.DEBUG,
+            message = "Test completo fonti completato",
+            detail = summary.replace("\n", " || "),
+            severity = DiagSeverity.OK,
+        )
+        summary
+    }
+
+    /**
+     * Bypasses RAM/disk caches to trace route geometry loading for [lineCode] end-to-end.
+     */
+    suspend fun diagnoseRouteFetch(lineCode: String): String = withContext(Dispatchers.IO) {
+        val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
+        val start = SystemClock.elapsedRealtime()
+        val patterns = fetchRoutePatterns(norm, forceRefresh = true)
+        val elapsed = SystemClock.elapsedRealtime() - start
+        val totalStops = patterns.sumOf { it.stops.size }
+        val totalPoints = patterns.sumOf { it.points.size }
+        val dirs = patterns.joinToString(", ") { p ->
+            "dir${p.directionId}=${p.terminusName() ?: p.name.take(18)}(${p.stops.size}f)"
+        }.ifBlank { "nessun tracciato" }
+        val msg = "Percorso L.$norm ricaricato in ${elapsed}ms: ${patterns.size} direzioni, $totalStops fermate, $totalPoints punti [$dirs] ($lastRouteLoadSummary)"
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.DEBUG,
+            message = "Diagnostica percorso L.$norm",
+            detail = msg,
+            severity = if (patterns.isNotEmpty()) DiagSeverity.OK else DiagSeverity.WARN,
+        )
+        msg
+    }
 
     fun startMatoLiveStream(lineCode: String, onFocusedUpdate: () -> Unit) {
         val cleaned = lineCode.trim().uppercase()
@@ -711,32 +920,67 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val primarySnap = gttRes?.snapshot
                 val secondarySnap = busOneRes?.snapshot
 
+                lastSourceReports = sourceReports
+
                 when (effectiveMode) {
                     DataSourceMode.GTT_OFFICIAL -> {
                         if (primarySnap == null) {
-                            return@coroutineScope Result.failure(
-                                gttRes?.error ?: IOException("Feed GTT Ufficiale non raggiungibile"),
-                            )
+                            val err = gttRes?.error ?: IOException("Feed GTT Ufficiale non raggiungibile")
+                            if (!widgetFastMode) {
+                                outageDetector.onTotalFeedFailure(effectiveMode, err.message, nowMillis)
+                                ToBusDiagnosticsLog.record(
+                                    category = DiagCategory.POLL,
+                                    message = "Poll fallito (GTT Ufficiale fisso)",
+                                    detail = err.message,
+                                    severity = DiagSeverity.ERROR,
+                                )
+                            }
+                            return@coroutineScope Result.failure(err)
                         }
                     }
                     DataSourceMode.BUSONE_PROXY -> {
                         if (secondarySnap == null) {
-                            return@coroutineScope Result.failure(
-                                busOneRes?.error ?: IOException("Feed BusOne Proxy non raggiungibile"),
-                            )
+                            val err = busOneRes?.error ?: IOException("Feed BusOne Proxy non raggiungibile")
+                            if (!widgetFastMode) {
+                                outageDetector.onTotalFeedFailure(effectiveMode, err.message, nowMillis)
+                                ToBusDiagnosticsLog.record(
+                                    category = DiagCategory.POLL,
+                                    message = "Poll fallito (BusOne Proxy fisso)",
+                                    detail = err.message,
+                                    severity = DiagSeverity.ERROR,
+                                )
+                            }
+                            return@coroutineScope Result.failure(err)
                         }
                     }
                     DataSourceMode.MATO_LIVE -> {
                         if (matoCombined.isEmpty() && !matoOnline && !matoConnecting) {
-                            return@coroutineScope Result.failure(
-                                IOException("Feed MaTO Live non raggiungibile"),
-                            )
+                            val err = IOException("Feed MaTO Live non raggiungibile")
+                            if (!widgetFastMode) {
+                                outageDetector.onTotalFeedFailure(effectiveMode, err.message, nowMillis)
+                                ToBusDiagnosticsLog.record(
+                                    category = DiagCategory.POLL,
+                                    message = "Poll fallito (MaTO Live fisso)",
+                                    detail = matoMqttClient.lastError(),
+                                    severity = DiagSeverity.ERROR,
+                                )
+                            }
+                            return@coroutineScope Result.failure(err)
                         }
                     }
                     DataSourceMode.AUTO -> {
                         if (primarySnap == null && secondarySnap == null && matoCombined.isEmpty()) {
                             val err = gttRes?.error ?: busOneRes?.error
                                 ?: IOException("Tutte le fonti GTT/MaTO sono irraggiungibili")
+                            if (!widgetFastMode) {
+                                outageDetector.onTotalFeedFailure(effectiveMode, err.message, nowMillis)
+                                ToBusDiagnosticsLog.record(
+                                    category = DiagCategory.POLL,
+                                    message = "Poll AUTO fallito: tutte le fonti irraggiungibili",
+                                    detail = "gtt=${gttRes?.error?.message ?: "n/d"} busOne=${busOneRes?.error?.message ?: "n/d"} mqtt=${matoMqttClient.lastError() ?: "off"}",
+                                    severity = DiagSeverity.ERROR,
+                                )
+                            }
                             return@coroutineScope Result.failure(err)
                         }
                     }
@@ -763,16 +1007,44 @@ class GttRealtimeRepository private constructor(context: Context) {
                     matoMaxTs,
                 )
 
+                val outageReport = if (!widgetFastMode) {
+                    outageDetector.onLivePollSuccess(
+                        vehicles = enriched,
+                        feedTimestampSeconds = feedTs,
+                        sourceReports = sourceReports,
+                        dataSourceMode = effectiveMode,
+                        nowMillis = nowMillis,
+                    )
+                } else {
+                    outageDetector.currentActiveOutage(nowMillis)
+                }
+
+                if (!widgetFastMode) {
+                    val gttTag = gttRes?.let { "GTT=${it.status.itemCount}(${it.status.latencyMs}ms${if (finalGttFrozen) ",FROZEN" else ""})" } ?: "GTT=skip"
+                    val busOneTag = busOneRes?.let { "BusOne=${it.status.itemCount}(${it.status.latencyMs}ms${if (finalBusOneFrozen) ",FROZEN" else ""})" } ?: "BusOne=skip"
+                    val matoTag = "MaTO=${matoMqttVehicles.size}mq+${matoGqlVehicles.size}gql"
+                    ToBusDiagnosticsLog.record(
+                        category = DiagCategory.POLL,
+                        message = "Poll ${effectiveMode.shortLabelIt} OK · ${enriched.size} mezzi (L.${normFocus ?: "-"})",
+                        detail = "$gttTag · $busOneTag · $matoTag · TU=${activeTripUpdates.size}",
+                        severity = if (outageReport != null && !outageReport.isSimulated) DiagSeverity.WARN else DiagSeverity.OK,
+                    )
+                }
+
                 val rawSummaries = GtfsRtProtobufParser.buildLineSummaries(enriched)
                 if (rawSummaries.size > 1 || (effectiveMode != DataSourceMode.MATO_LIVE && rawSummaries.isNotEmpty())) {
                     saveActiveLinesCache(rawSummaries)
                 }
-                val summaries = if (rawSummaries.size <= 5) {
-                    val catalogFallback = staticRouteStore.getCachedLineCatalogFast()
-                        .ifEmpty { getCachedActiveLinesFast(maxAgeMillis = Long.MAX_VALUE) }
-                    mergeLineSummariesWithCatalog(rawSummaries, catalogFallback)
-                } else {
-                    rawSummaries
+                val staticCatalog = staticRouteStore.getCachedLineCatalogFast()
+                val summaries = when {
+                    rawSummaries.size > 5 && staticCatalog.isNotEmpty() ->
+                        mergeLiveSummariesWithStaticCatalog(rawSummaries, staticCatalog)
+                    rawSummaries.size <= 5 -> {
+                        val catalogFallback = staticCatalog
+                            .ifEmpty { getCachedActiveLinesFast(maxAgeMillis = Long.MAX_VALUE) }
+                        mergeLineSummariesWithCatalog(rawSummaries, catalogFallback)
+                    }
+                    else -> mergeLiveSummariesWithStaticCatalog(rawSummaries, listOf(METRO_LINE_SUMMARY))
                 }
                 val finalSnapshot = LiveFeedSnapshot(
                     feedTimestampSeconds = feedTs,
@@ -781,6 +1053,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                     availableLines = summaries,
                     sourceStatuses = statuses,
                     alerts = if (includeAlerts) cachedAlerts else emptyList(),
+                    outageReport = outageReport,
                 )
                 lastSnapshot = finalSnapshot
                 if (!normFocus.isNullOrBlank()) {
@@ -1296,7 +1569,14 @@ class GttRealtimeRepository private constructor(context: Context) {
             val liveSummaries = liveJob.await()
             if (liveSummaries.size > 5) {
                 saveActiveLinesCache(liveSummaries)
-                return@coroutineScope Result.success(liveSummaries)
+                val fullCatalog = fastStatic.ifEmpty {
+                    matoCatalogJob?.await().orEmpty()
+                }
+                val combined = mergeLiveSummariesWithStaticCatalog(
+                    liveSummaries = liveSummaries,
+                    staticCatalog = fullCatalog.ifEmpty { listOf(METRO_LINE_SUMMARY) },
+                )
+                return@coroutineScope Result.success(combined)
             }
 
             var catalog = fastStatic
@@ -1319,7 +1599,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                 saveActiveLinesCache(liveSummaries)
             }
 
-            val combined = mergeLineSummariesWithCatalog(liveSummaries, catalog)
+            val combined = mergeLiveSummariesWithStaticCatalog(liveSummaries, catalog)
             if (combined.isNotEmpty()) {
                 return@coroutineScope Result.success(combined)
             }
@@ -1331,6 +1611,28 @@ class GttRealtimeRepository private constructor(context: Context) {
 
             Result.failure(IOException("Feed linee GTT non raggiungibili al momento"))
         }
+    }
+
+    /**
+     * Returns all known Turin GTT lines from the cached static GTFS routes catalog (with 0-count
+     * baseline) so the Line Picker can surface inactive lines in a separate section at the bottom.
+     */
+    suspend fun getKnownStaticLineCatalog(): List<LineSummary> = withContext(Dispatchers.IO) {
+        staticRouteStore.getAllKnownLineSummaries(downloadIfNeeded = false)
+    }
+
+    /**
+     * Lightweight on-demand fetch of current GTT GTFS-RT service alerts used by background
+     * favorite-line alert notifications without touching vehicle or route feeds.
+     */
+    suspend fun fetchServiceAlertsNow(): List<ServiceAlertInfo>? = withContext(Dispatchers.IO) {
+        val result = fetchAlertsSource()
+        val alerts = result.alerts
+        if (alerts != null) {
+            cachedAlerts = alerts
+            lastAlertsFetchMillis = System.currentTimeMillis()
+        }
+        alerts
     }
 
     private fun fetchMatoGraphQlLineCatalog(): List<LineSummary> {
@@ -1580,6 +1882,12 @@ class GttRealtimeRepository private constructor(context: Context) {
                                 .thenBy { it.earliestRelevantStartSeconds(nowSec) },
                         )
                     val latency = SystemClock.elapsedRealtime() - start
+                    ToBusDiagnosticsLog.record(
+                        category = DiagCategory.ALERTS,
+                        message = "Avvisi GTT scaricati: ${list.size} attuali (su ${rawList.size} totali)",
+                        detail = "${latency}ms · ${url.substringAfter("://").substringBefore("/")}",
+                        severity = DiagSeverity.OK,
+                    )
                     return AlertsSourceResult(
                         alerts = list,
                         status = DataSourceStatus(
@@ -1596,6 +1904,12 @@ class GttRealtimeRepository private constructor(context: Context) {
                 Log.d(TAG, "Alerts skip $url: ${e.message}")
             }
         }
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.ALERTS,
+            message = "Feed avvisi GTT non raggiungibile",
+            detail = "cache=${cachedAlerts.size} avvisi",
+            severity = DiagSeverity.WARN,
+        )
         return AlertsSourceResult(
             alerts = null,
             status = DataSourceStatus(
@@ -1651,18 +1965,55 @@ class GttRealtimeRepository private constructor(context: Context) {
                 }
         }
 
+        val routeFetchStart = SystemClock.elapsedRealtime()
+        var routeSourceTag = "none"
+
         // Prefer daily-updated MATO GraphQL filtered by today's active serviceDate & live tripIds
         // so Sunday deviations and live detours match MaTO / Infomezzi 1-to-1.
         var fetched: List<RoutePattern> = queryMatoGraphQl(normalized, todayYyyyMmDd, activeTripIds)
+        if (fetched.isNotEmpty()) {
+            routeSourceTag = "MaTO GraphQL ($normalized)"
+        }
+        if (fetched.isEmpty()) {
+            for (altQuery in GtfsRtProtobufParser.alternateFeedQueryCodes(normalized)) {
+                fetched = queryMatoGraphQl(altQuery, todayYyyyMmDd, activeTripIds, matchTargetLine = normalized)
+                if (fetched.isNotEmpty()) {
+                    routeSourceTag = "MaTO GraphQL (alt:$altQuery)"
+                    break
+                }
+            }
+        }
 
         if (fetched.isEmpty()) {
             fetched = staticRouteStore.getRoutePatternsForLine(normalized, nowMillis, activeTripIds)
+            if (fetched.isNotEmpty()) routeSourceTag = "GTFS Statico"
         }
 
         // Last-resort OpenStreetMap Overpass API fallback
         if (fetched.isEmpty()) {
             fetched = queryOverpassTurinRoute(normalized)
+            if (fetched.isNotEmpty()) {
+                routeSourceTag = "OSM Overpass ($normalized)"
+            } else {
+                for (altQuery in GtfsRtProtobufParser.alternateFeedQueryCodes(normalized)) {
+                    fetched = queryOverpassTurinRoute(altQuery)
+                    if (fetched.isNotEmpty()) {
+                        routeSourceTag = "OSM Overpass (alt:$altQuery)"
+                        break
+                    }
+                }
+            }
         }
+
+        val routeElapsedMs = SystemClock.elapsedRealtime() - routeFetchStart
+        val totalStops = fetched.sumOf { it.stops.size }
+        lastRouteLoadSummary = "L.$normalized via $routeSourceTag (${fetched.size} dir, $totalStops ferm, ${routeElapsedMs}ms)"
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.ROUTE,
+            message = "Percorso L.$normalized: $routeSourceTag",
+            detail = "dir=${fetched.size} fermate=$totalStops ${routeElapsedMs}ms liveTrips=${activeTripIds.size}",
+            severity = if (fetched.isNotEmpty()) DiagSeverity.OK else DiagSeverity.WARN,
+        )
 
         if (fetched.isNotEmpty()) {
             cacheRouteStops(fetched)
@@ -2010,13 +2361,24 @@ class GttRealtimeRepository private constructor(context: Context) {
             otherLinePatterns = otherLinePatterns,
         )
 
-        deduplicateArrivals(reconciled)
+        val finalArrivals = deduplicateArrivals(reconciled)
             .filter { it.arrivalEpochSeconds in (nowSec - 60L)..(nowSec + STOP_ARRIVAL_HORIZON_SEC) }
             .sortedWith(
                 compareByDescending<StopArrival> { it.lineCode.equals(normPref, ignoreCase = true) }
                     .thenBy { it.arrivalEpochSeconds },
             )
             .take(18)
+
+        val linkedGps = finalArrivals.count { !it.vehicleId.isNullOrBlank() }
+        val rtCount = finalArrivals.count { it.isRealtime }
+        lastStopArrivalsSummary = "#${stop.displayCode}: ${finalArrivals.size} passaggi (RT=$rtCount, GPS=$linkedGps · Palina=${palinaArrivals.size}, MaTO=${matoArrivals.size})"
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.STOP,
+            message = "Fermata #${stop.displayCode} (${stop.name.take(24)})",
+            detail = "out=${finalArrivals.size} (RT=$rtCount GPS=$linkedGps) · Palina=${palinaArrivals.size} MaTO=${matoArrivals.size} extraBus=${extraSingleLineVehicles.size}",
+            severity = if (finalArrivals.isNotEmpty()) DiagSeverity.OK else DiagSeverity.INFO,
+        )
+        finalArrivals
     }
 
     internal fun deduplicateArrivals(
@@ -2322,6 +2684,7 @@ class GttRealtimeRepository private constructor(context: Context) {
         lineCode: String,
         todayYyyyMmDd: String,
         activeTripIds: Set<String> = emptySet(),
+        matchTargetLine: String = lineCode,
     ): List<RoutePattern> {
         val escapedName = lineCode.replace("\"", "")
         // Prioritize queries that include `tripsForDate(serviceDate)` so Sunday/detour patterns win over weekday shapes!
@@ -2443,7 +2806,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                     matoFastHttpClient.newCall(request).execute().use { response ->
                         if (!response.isSuccessful) continue
                         val body = response.body?.string() ?: continue
-                        val parsed = parseMatoGraphQlResponse(body, lineCode, activeTripIds)
+                        val parsed = parseMatoGraphQlResponse(body, matchTargetLine, activeTripIds)
                         if (parsed.isNotEmpty()) return parsed
                     }
                 } catch (e: Exception) {
@@ -2897,7 +3260,7 @@ class GttRealtimeRepository private constructor(context: Context) {
         private const val SINGLE_LINE_LIVE_CACHE_TTL_MS = 25_000L
         private const val SINGLE_LINE_EMPTY_CACHE_TTL_MS = 10_000L
         private val SAFE_ROUTE_KEY_REGEX = Regex("[^A-Z0-9_]")
-        private val OVERPASS_SAFE_REF_REGEX = Regex("[^A-Za-z0-9/\\- ]")
+        private val OVERPASS_SAFE_REF_REGEX = Regex("[^A-Za-z0-9/+\\- ]")
 
         internal fun filterFreshOverlayVehicles(
             rawVehicles: List<BusVehicle>,
@@ -3008,37 +3371,102 @@ class GttRealtimeRepository private constructor(context: Context) {
             return merged
         }
 
+        private val METRO_LINE_SUMMARY = LineSummary(
+            lineCode = GtfsRtProtobufParser.LINE_CODE_METRO,
+            rawRouteIds = setOf("METRO", "M1", "M1U"),
+            activeVehicleCount = 0,
+        )
+
         internal fun mergeLineSummariesWithCatalog(
             liveSummaries: List<LineSummary>,
             catalogSummaries: List<LineSummary>,
         ): List<LineSummary> {
-            if (catalogSummaries.isEmpty()) return liveSummaries.sortedWith(GtfsRtProtobufParser.lineCodeComparator)
-            if (liveSummaries.isEmpty()) return catalogSummaries.sortedWith(GtfsRtProtobufParser.lineCodeComparator)
+            return mergeCatalogAndLive(
+                liveSummaries = liveSummaries,
+                catalogSummaries = catalogSummaries,
+                resetCatalogCountsToZero = false,
+            )
+        }
 
-            val byCode = LinkedHashMap<String, LineSummary>(catalogSummaries.size + liveSummaries.size)
+        /**
+         * Combines authoritative citywide [liveSummaries] with the full [staticCatalog] so every
+         * known Turin GTT line appears (including Turin's METRO), while lines with no live buses
+         * right now accurately report `activeVehicleCount = 0` (never preserving stale counts).
+         */
+        internal fun mergeLiveSummariesWithStaticCatalog(
+            liveSummaries: List<LineSummary>,
+            staticCatalog: List<LineSummary>,
+        ): List<LineSummary> {
+            return mergeCatalogAndLive(
+                liveSummaries = liveSummaries,
+                catalogSummaries = staticCatalog,
+                resetCatalogCountsToZero = true,
+            )
+        }
+
+        private fun mergeCatalogAndLive(
+            liveSummaries: List<LineSummary>,
+            catalogSummaries: List<LineSummary>,
+            resetCatalogCountsToZero: Boolean,
+        ): List<LineSummary> {
+            val byCode = LinkedHashMap<String, LineSummary>(catalogSummaries.size + liveSummaries.size + 1)
+            byCode[GtfsRtProtobufParser.LINE_CODE_METRO] = METRO_LINE_SUMMARY
+
             for (entry in catalogSummaries) {
-                val key = entry.lineCode.trim().uppercase()
-                if (key.isEmpty()) continue
+                val key = GtfsRtProtobufParser.normalizeGttLineCode(entry.lineCode)
+                if (key.isEmpty() || key == "?") continue
                 val existing = byCode[key]
+                val count = if (resetCatalogCountsToZero) 0 else entry.activeVehicleCount
                 byCode[key] = if (existing == null) {
-                    entry.copy(lineCode = key)
+                    entry.copy(lineCode = key, activeVehicleCount = count)
                 } else {
                     existing.copy(
                         rawRouteIds = existing.rawRouteIds + entry.rawRouteIds,
-                        activeVehicleCount = maxOf(existing.activeVehicleCount, entry.activeVehicleCount),
+                        activeVehicleCount = if (resetCatalogCountsToZero) 0 else maxOf(existing.activeVehicleCount, count),
                     )
                 }
             }
+
+            // Cross-link any static catalog entry whose rawRouteIds (e.g. GTFS route_id = "13PU"
+            // paired with route_short_name = "13+") normalize to a live lineCode so mismatched
+            // route_id/shortName pairs in GTT feeds never spawn 0-vehicle duplicate entries.
+            val aliasToCatalogKey = HashMap<String, String>(byCode.size * 2)
+            for ((catalogKey, summary) in byCode) {
+                for (rawId in summary.rawRouteIds) {
+                    val normAlias = GtfsRtProtobufParser.normalizeGttLineCode(rawId)
+                    if (normAlias.isNotEmpty() && normAlias != "?" && normAlias != catalogKey && !byCode.containsKey(normAlias)) {
+                        aliasToCatalogKey.putIfAbsent(normAlias, catalogKey)
+                    }
+                }
+            }
+
             for (entry in liveSummaries) {
-                val key = entry.lineCode.trim().uppercase()
-                if (key.isEmpty()) continue
-                val existing = byCode[key]
+                val key = GtfsRtProtobufParser.normalizeGttLineCode(entry.lineCode)
+                if (key.isEmpty() || key == "?") continue
+                var existing = byCode[key]
+                if (existing == null) {
+                    val aliasedKey = aliasToCatalogKey[key]
+                        ?: entry.rawRouteIds.firstNotNullOfOrNull { raw ->
+                            val normRaw = GtfsRtProtobufParser.normalizeGttLineCode(raw)
+                            aliasToCatalogKey[normRaw]
+                        }
+                    if (aliasedKey != null && aliasedKey != GtfsRtProtobufParser.LINE_CODE_METRO) {
+                        val removed = byCode.remove(aliasedKey)
+                        if (removed != null) {
+                            existing = removed.copy(lineCode = key)
+                        }
+                    }
+                }
                 byCode[key] = if (existing == null) {
                     entry.copy(lineCode = key)
                 } else {
                     existing.copy(
                         rawRouteIds = existing.rawRouteIds + entry.rawRouteIds,
-                        activeVehicleCount = maxOf(existing.activeVehicleCount, entry.activeVehicleCount),
+                        activeVehicleCount = if (resetCatalogCountsToZero) {
+                            entry.activeVehicleCount
+                        } else {
+                            maxOf(existing.activeVehicleCount, entry.activeVehicleCount)
+                        },
                     )
                 }
             }

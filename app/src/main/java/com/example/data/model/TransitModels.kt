@@ -47,12 +47,35 @@ data class AlertTimeRange(
 )
 
 @Immutable
+enum class ServiceAlertCategory(
+    val id: String,
+    val label: String,
+    val priority: Int,
+) {
+    CRITICAL(id = "critical", label = "Disservizio", priority = 5),
+    DISRUPTION(id = "disruption", label = "Deviazione", priority = 4),
+    NOTICE(id = "notice", label = "Avviso", priority = 3),
+    POSITIVE(id = "positive", label = "Potenziamento", priority = 2),
+    INFO(id = "info", label = "Info", priority = 1);
+
+    companion object {
+        fun fromId(id: String?): ServiceAlertCategory =
+            entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: INFO
+    }
+}
+
+fun Collection<ServiceAlertInfo>.highestAlertCategory(): ServiceAlertCategory? =
+    maxByOrNull { it.classifyCategory().priority }?.classifyCategory()
+
+@Immutable
 data class ServiceAlertInfo(
     val id: String,
     val headerText: String,
     val descriptionText: String,
     val affectedLines: Set<String>,
     val activePeriods: List<AlertTimeRange> = emptyList(),
+    val gtfsCause: Int? = null,
+    val gtfsEffect: Int? = null,
 ) {
     /**
      * Keeps ONLY immediate, temporary, or upcoming GTT alerts (roadworks, temporary deviations,
@@ -208,6 +231,248 @@ data class ServiceAlertInfo(
         } else {
             null
         }
+    }
+
+    /**
+     * Classifies a GTT service alert into a clear semantic severity/positivity tier using both
+     * GTFS-RT cause/effect metadata (when present) and Italian GTT notice phrasing:
+     * - [ServiceAlertCategory.CRITICAL]: strikes, full line/service suspensions, station closures
+     * - [ServiceAlertCategory.DISRUPTION]: detours, roadworks, suppressed/moved stops, delays, replacement buses
+     * - [ServiceAlertCategory.NOTICE]: facility/accessibility issues (elevators, escalators, ticket machines, minor warnings)
+     * - [ServiceAlertCategory.POSITIVE]: extra buses/trains, service boosts, extended hours, reopenings
+     * - [ServiceAlertCategory.INFO]: general announcements, timetables, fares, informational notices
+     */
+    fun classifyCategory(): ServiceAlertCategory {
+        val text = "$headerText $descriptionText".lowercase(java.util.Locale.ITALY)
+
+        val isFacilityOrAccessibility = FACILITY_KEYWORDS.any { text.contains(it) }
+        val hasHardCritical = gtfsCause == GTFS_CAUSE_STRIKE ||
+            CRITICAL_KEYWORDS.any { text.contains(it) }
+        val hasDisruption = DISRUPTION_KEYWORDS.any { text.contains(it) }
+        val hasPositiveBoost = gtfsEffect == GTFS_EFFECT_ADDITIONAL_SERVICE ||
+            POSITIVE_BOOST_KEYWORDS.any { text.contains(it) }
+        val hasPositiveRestore = POSITIVE_RESTORE_KEYWORDS.any { text.contains(it) }
+        val hasNegativeFacilityPhrase = NEGATIVE_FACILITY_KEYWORDS.any { text.contains(it) }
+
+        // 1. Elevators, escalators, ticket machines, parking: highlight warmly in Amber (or Green on reopening),
+        //    never as a red line-outage alarm unless there is also an actual strike/line suspension.
+        if (isFacilityOrAccessibility && !hasHardCritical) {
+            return if (hasPositiveRestore && !hasNegativeFacilityPhrase) {
+                ServiceAlertCategory.POSITIVE
+            } else {
+                ServiceAlertCategory.NOTICE
+            }
+        }
+
+        // 2. Strikes, full line/station suspensions, severe service halts -> Red
+        if (hasHardCritical || (gtfsEffect == GTFS_EFFECT_NO_SERVICE && !hasPositiveBoost)) {
+            return ServiceAlertCategory.CRITICAL
+        }
+
+        // 3. Service boosts, extra buses/trains, extended hours (when not paired with a diversion/closure) -> Emerald
+        if (hasPositiveBoost && !hasDisruption) {
+            return ServiceAlertCategory.POSITIVE
+        }
+
+        // 4. Diversions, roadworks, moved/suppressed stops, replacement buses, delays -> Orange
+        if (hasDisruption ||
+            gtfsEffect == GTFS_EFFECT_DETOUR ||
+            gtfsEffect == GTFS_EFFECT_REDUCED_SERVICE ||
+            gtfsEffect == GTFS_EFFECT_SIGNIFICANT_DELAYS ||
+            gtfsEffect == GTFS_EFFECT_STOP_MOVED ||
+            gtfsEffect == GTFS_EFFECT_MODIFIED_SERVICE
+        ) {
+            return ServiceAlertCategory.DISRUPTION
+        }
+
+        // 5. Reopenings and restorations to normal service -> Emerald
+        if (hasPositiveRestore) {
+            return ServiceAlertCategory.POSITIVE
+        }
+
+        // 6. Accessibility issues or minor operational notices -> Amber
+        if (gtfsEffect == GTFS_EFFECT_ACCESSIBILITY_ISSUE ||
+            NOTICE_KEYWORDS.any { text.contains(it) }
+        ) {
+            return ServiceAlertCategory.NOTICE
+        }
+
+        // 7. General informational communications -> Cyan
+        return ServiceAlertCategory.INFO
+    }
+
+    companion object {
+        private const val GTFS_CAUSE_STRIKE = 3
+        private const val GTFS_EFFECT_NO_SERVICE = 1
+        private const val GTFS_EFFECT_REDUCED_SERVICE = 2
+        private const val GTFS_EFFECT_SIGNIFICANT_DELAYS = 3
+        private const val GTFS_EFFECT_DETOUR = 4
+        private const val GTFS_EFFECT_ADDITIONAL_SERVICE = 5
+        private const val GTFS_EFFECT_MODIFIED_SERVICE = 6
+        private const val GTFS_EFFECT_STOP_MOVED = 9
+        private const val GTFS_EFFECT_ACCESSIBILITY_ISSUE = 11
+
+        private val FACILITY_KEYWORDS = listOf(
+            "ascensor",
+            "scala mobile",
+            "scale mobili",
+            "montascale",
+            "accessibilit",
+            "emettitric",
+            "biglietteria",
+            "parcheggio",
+            "validatric",
+            "obliteratric",
+            "tornell",
+            "pedana",
+        )
+
+        private val NEGATIVE_FACILITY_KEYWORDS = listOf(
+            "fuori servizio",
+            "non funzionant",
+            "non disponibil",
+            "guast",
+            "chius",
+            "sospes",
+            "interrott",
+            "manutenzione",
+        )
+
+        private val CRITICAL_KEYWORDS = listOf(
+            "sciopero",
+            "interruzione del servizio",
+            "interruzione servizio",
+            "servizio interrotto",
+            "servizio sospeso",
+            "linea sospesa",
+            "linee sospese",
+            "circolazione sospesa",
+            "sospensione del servizio",
+            "sospensione servizio",
+            "sospensione linea",
+            "tratta interrotta",
+            "interruzione linea",
+            "blocco della circolazione",
+            "blocco circolazione",
+            "non circola",
+            "non effettua servizio",
+            "chiusura totale",
+            "stazione chiusa",
+            "stazioni chiuse",
+            "chiusura stazione",
+            "chiusura della stazione",
+            "chiusura anticipata della metro",
+            "chiusura anticipata metropolitana",
+        )
+
+        private val DISRUPTION_KEYWORDS = listOf(
+            "deviazion",
+            "deviat",
+            "percorso deviato",
+            "variazione di percorso",
+            "variazione percorso",
+            "modifica di percorso",
+            "modifica percorso",
+            "lavori",
+            "cantiere",
+            "cantieri",
+            "chiusura al traffico",
+            "chiusura stradale",
+            "strada chiusa",
+            "via chiusa",
+            "corso chiuso",
+            "piazza chiusa",
+            "fermata soppressa",
+            "fermate soppresse",
+            "fermata sospesa",
+            "fermate sospese",
+            "fermata spostata",
+            "fermate spostate",
+            "spostamento fermata",
+            "spostamento capolinea",
+            "capolinea spostato",
+            "soppressione fermata",
+            "servizio sostitutivo",
+            "bus sostitutiv",
+            "riduzione del servizio",
+            "rallentament",
+            "ritard",
+            "percorso limitato",
+            "limitata a ",
+            "limitato a ",
+            "non effettua la fermata",
+            "non effettua le fermate",
+            "salta la fermata",
+        )
+
+        private val POSITIVE_BOOST_KEYWORDS = listOf(
+            "potenziament",
+            "potenziat",
+            "intensificazion",
+            "intensificat",
+            "aumento delle corse",
+            "aumento corse",
+            "aumento dei mezzi",
+            "aumento dei bus",
+            "aumento dei pullman",
+            "più corse",
+            "piu corse",
+            "più bus",
+            "piu bus",
+            "più mezzi",
+            "piu mezzi",
+            "più pullman",
+            "piu pullman",
+            "più treni",
+            "piu treni",
+            "corse aggiuntive",
+            "corse straordinarie",
+            "corse supplementari",
+            "servizio potenziato",
+            "servizio straordinario",
+            "servizio rafforzato",
+            "rafforzamento",
+            "prolungamento orario",
+            "prolungamento dell'orario",
+            "orario prolungato",
+            "apertura straordinaria",
+            "navetta gratuita",
+            "navetta dedicata",
+            "nuova fermata",
+            "nuove fermate",
+            "nuovo collegamento",
+            "trasporto gratuito",
+            "viaggiare gratis",
+        )
+
+        private val POSITIVE_RESTORE_KEYWORDS = listOf(
+            "riapertura",
+            "riattivazione",
+            "riattivato",
+            "riattivata",
+            "torna regolare",
+            "torna in funzione",
+            "tornato in funzione",
+            "servizio regolare",
+            "ripristino del servizio",
+            "nuovamente attiva",
+            "nuovamente attivo",
+            "nuovamente funzionante",
+        )
+
+        private val NOTICE_KEYWORDS = listOf(
+            "fuori servizio",
+            "temporaneamente non disponibil",
+            "non funzionant",
+            "guast",
+            "manutenzione",
+            "uscita chiusa",
+            "ingresso chiuso",
+            "accesso chiuso",
+            "variazione orario",
+            "modifica orario",
+            "orario ridotto",
+        )
     }
 }
 
@@ -600,6 +865,27 @@ data class StopSearchEntry(
     )
 }
 
+enum class GttOutageKind(
+    val id: String,
+    val labelIt: String,
+) {
+    SERVERS_UNREACHABLE("servers_unreachable", "Server GTT irraggiungibili"),
+    CITYWIDE_STALE_FEED("citywide_stale_feed", "Dati GTT non aggiornati"),
+    CITYWIDE_FROZEN_FLEET("citywide_frozen_fleet", "GPS fermi su tutta la rete"),
+}
+
+@Immutable
+data class GttDataOutageReport(
+    val kind: GttOutageKind,
+    val title: String,
+    val detail: String,
+    val detectedAtMillis: Long,
+    val isSimulated: Boolean = false,
+) {
+    val stableKey: String
+        get() = "${kind.id}:${if (isSimulated) "sim" else "live"}"
+}
+
 data class LiveFeedSnapshot(
     val feedTimestampSeconds: Long,
     val fetchedAtMillis: Long,
@@ -607,6 +893,7 @@ data class LiveFeedSnapshot(
     val availableLines: List<LineSummary>,
     val sourceStatuses: List<DataSourceStatus> = emptyList(),
     val alerts: List<ServiceAlertInfo> = emptyList(),
+    val outageReport: GttDataOutageReport? = null,
 )
 
 enum class MapStyle(
@@ -768,6 +1055,7 @@ data class UserWidgetSettings(
     val livePollInterval: LivePollInterval = LivePollInterval.SEC_25,
     val keepScreenOn: Boolean = false,
     val showServiceAlerts: Boolean = true,
+    val notifyFavoriteLineAlerts: Boolean = false,
     val hideInactiveOnMap: Boolean = false,
 ) {
     val hasSelectedLine: Boolean

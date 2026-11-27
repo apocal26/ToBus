@@ -152,7 +152,8 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
         val wideIds = manager.getAppWidgetIds(ComponentName(context, BusMapWidgetProvider::class.java))
         val squareIds = manager.getAppWidgetIds(ComponentName(context, BusMapWidgetSquareProvider::class.java))
         val stopIds = manager.getAppWidgetIds(ComponentName(context, StopArrivalsWidgetProvider::class.java))
-        if (wideIds.isEmpty() && squareIds.isEmpty() && stopIds.isEmpty()) {
+        val alertIds = manager.getAppWidgetIds(ComponentName(context, FavoriteAlertsWidgetProvider::class.java))
+        if (wideIds.isEmpty() && squareIds.isEmpty() && stopIds.isEmpty() && alertIds.isEmpty()) {
             cancelPeriodicUpdates(context)
         }
     }
@@ -255,7 +256,8 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             val wideIds = manager.getAppWidgetIds(ComponentName(context, BusMapWidgetProvider::class.java))
             val squareIds = manager.getAppWidgetIds(ComponentName(context, BusMapWidgetSquareProvider::class.java))
             val stopIds = manager.getAppWidgetIds(ComponentName(context, StopArrivalsWidgetProvider::class.java))
-            if (wideIds.isEmpty() && squareIds.isEmpty() && stopIds.isEmpty()) return
+            val alertIds = manager.getAppWidgetIds(ComponentName(context, FavoriteAlertsWidgetProvider::class.java))
+            if (wideIds.isEmpty() && squareIds.isEmpty() && stopIds.isEmpty() && alertIds.isEmpty()) return
 
             if (showLoadingFeedback) {
                 wideIds.forEach { id ->
@@ -301,6 +303,18 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             if (stopIds.isNotEmpty()) {
                 StopArrivalsWidgetProvider.refreshAllStopWidgets(context, showLoading = showLoadingFeedback)
             }
+            if (alertIds.isNotEmpty()) {
+                val cachedAlerts = if (useCachedOnly) {
+                    GttRealtimeRepository.getInstance(context).getLastCachedSnapshot()?.alerts
+                } else {
+                    null
+                }
+                FavoriteAlertsWidgetProvider.refreshAllAlertWidgets(
+                    context = context,
+                    showLoading = showLoadingFeedback,
+                    preloadedAlerts = cachedAlerts,
+                )
+            }
         }
 
         fun schedulePeriodicUpdates(context: Context, interval: RefreshInterval) {
@@ -315,7 +329,8 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             val hasWide = manager.getAppWidgetIds(ComponentName(appContext, BusMapWidgetProvider::class.java)).isNotEmpty()
             val hasSquare = manager.getAppWidgetIds(ComponentName(appContext, BusMapWidgetSquareProvider::class.java)).isNotEmpty()
             val hasStops = manager.getAppWidgetIds(ComponentName(appContext, StopArrivalsWidgetProvider::class.java)).isNotEmpty()
-            if (!hasWide && !hasSquare && !hasStops) return
+            val hasAlerts = manager.getAppWidgetIds(ComponentName(appContext, FavoriteAlertsWidgetProvider::class.java)).isNotEmpty()
+            if (!hasWide && !hasSquare && !hasStops && !hasAlerts) return
 
             val intervalMillis = interval.minutes * 60_000L
             val triggerAtMillis = SystemClock.elapsedRealtime() + intervalMillis

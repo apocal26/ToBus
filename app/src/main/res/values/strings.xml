@@ -3,9 +3,11 @@
     <string name="widget_label_square">ToBus · Mappa 2×2</string>
     <string name="widget_label_wide">ToBus · Mappa 4×2</string>
     <string name="widget_label_stops">ToBus · Fermate Live</string>
+    <string name="widget_label_alerts">ToBus · Avvisi Preferite</string>
     <string name="widget_description">Mappa live della tua linea GTT di Torino in stile Dark Glass sulla Home.</string>
     <string name="widget_description_square">Widget quadrato 2×2 compatto con mappa live GTT Torino.</string>
     <string name="widget_description_stops">Passaggi in tempo reale alle tue fermate preferite GTT di Torino.</string>
+    <string name="widget_description_alerts">Avvisi e deviazioni GTT attivi sulle tue linee preferite di Torino.</string>
     <string name="tab_map">Mappa</string>
     <string name="tab_widget">Impostazioni</string>
     <string name="cd_refresh_map">Aggiorna posizione pullman</string>
@@ -19,9 +21,12 @@
     <string name="cd_sources_info">Stato fonti dati</string>
     <string name="cd_favorite_stop">Salva fermata nei preferiti</string>
     <string name="cd_close">Chiudi</string>
+    <string name="cd_scroll_more_lines">Scorri per vedere altre linee</string>
     <string name="cd_pin_widget">Aggiungi widget alla schermata Home</string>
     <string name="widget_tap_to_refresh">Aggiorna widget</string>
     <string name="widget_loading">Aggiorno…</string>
     <string name="widget_no_buses">Nessun mezzo</string>
     <string name="widget_error">Offline</string>
+    <string name="notification_channel_alerts_name">Avvisi linee preferite</string>
+    <string name="notification_channel_alerts_desc">Notifiche per nuovi avvisi e deviazioni GTT sulle tue linee preferite.</string>
 </resources>

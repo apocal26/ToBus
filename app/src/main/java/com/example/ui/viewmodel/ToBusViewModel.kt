@@ -20,6 +20,7 @@ import com.example.data.model.CameraState
 import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.FavoriteStop
+import com.example.data.model.GttDataOutageReport
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LineSummary
 import com.example.data.model.LivePollInterval
@@ -44,7 +45,10 @@ import com.example.data.network.UpdateInstallState
 import com.example.data.preferences.ToBusPreferences
 import com.example.map.TransitMapBitmapRenderer
 import com.example.map.WebMercator
+import com.example.notifications.FavoriteAlertNotifier
+import com.example.notifications.FavoriteAlertsScheduler
 import com.example.widget.BusMapWidgetProvider
+import com.example.widget.FavoriteAlertsWidgetProvider
 import com.example.widget.StopArrivalsWidgetProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -71,6 +75,7 @@ enum class WidgetPreviewSize(
     WIDE_4X2("4×2", 320, 168, false),
     TABLET_5X3("5×3", 380, 224, false),
     STOPS_LIVE("Fermate", 340, 178, false),
+    ALERTS_LIVE("Avvisi", 340, 178, false),
 }
 
 @androidx.compose.runtime.Immutable
@@ -137,6 +142,8 @@ data class ToBusUiState(
     val feedTimestampSeconds: Long = 0L,
     val nowMillis: Long = System.currentTimeMillis(),
     val errorMessage: String? = null,
+    val gttDataOutage: GttDataOutageReport? = null,
+    val isGttOutageDismissed: Boolean = false,
     val totalCityVehicles: Int = 0,
     val previewSize: WidgetPreviewSize = WidgetPreviewSize.SQUARE_2X2,
     val widgetPreviewBitmap: Bitmap? = null,
@@ -246,6 +253,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var lastPollElapsedMs: Long = 0L
     private var lastWidgetSyncMillis: Long = 0L
     private var cameraFlySeq: Long = 0L
+    private var dismissedOutageStableKey: String? = null
 
     private val locationManager: LocationManager? =
         appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
@@ -275,10 +283,33 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             delay(2_500L)
             repository.prefetchStaticGtfsInBackground()
+            val staticCatalog = runCatching { repository.getKnownStaticLineCatalog() }.getOrDefault(emptyList())
+            if (staticCatalog.isNotEmpty()) {
+                _uiState.update { state ->
+                    val merged = GttRealtimeRepository.mergeLiveSummariesWithStaticCatalog(
+                        liveSummaries = state.allActiveLines,
+                        staticCatalog = staticCatalog,
+                    )
+                    if (merged != state.allActiveLines) {
+                        state.copy(allActiveLines = merged)
+                    } else {
+                        state
+                    }
+                }
+                syncLinePickerState()
+            }
             runCatching { repository.getStopSearchIndex() }
             if (_uiState.value.allActiveLines.size <= 1) {
                 ensureLineCatalogLoaded()
             }
+        }
+        // Keep background favorite-line alerts JobScheduler synced with persisted opt-in state.
+        viewModelScope.launch(Dispatchers.IO) {
+            FavoriteAlertsScheduler.syncSchedule(
+                context = appContext,
+                enabled = initialSettings.notifyFavoriteLineAlerts,
+                hasFavoriteLines = preferences.currentFavoriteLines().isNotEmpty(),
+            )
         }
         // Clean up any previously downloaded update APKs automatically on startup, then run the
         // lightweight once-per-24h GitHub Releases check after cold boot settles.
@@ -698,7 +729,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 includeSecondaryFeeds = true,
                 focusLine = currentLine.takeIf { it.isNotEmpty() },
                 dataSourceMode = settingsBeforeFetch.dataSourceMode,
-                includeAlerts = settingsBeforeFetch.showServiceAlerts,
+                includeAlerts = settingsBeforeFetch.showServiceAlerts || settingsBeforeFetch.notifyFavoriteLineAlerts,
             )
             result.fold(
                 onSuccess = { snapshot ->
@@ -752,16 +783,25 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                         val keepSelected = state.selectedVehicleId?.takeIf { id ->
                             filtered.any { it.vehicleId == id } || updatedExternal?.vehicleId == id
                         }
-                        val nextActiveLines = if (
-                            snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1
-                        ) {
-                            GttRealtimeRepository.mergeLineSummariesWithCatalog(
-                                liveSummaries = snapshot.availableLines,
-                                catalogSummaries = state.allActiveLines,
-                            )
-                        } else {
-                            snapshot.availableLines
+                        val nextActiveLines = when {
+                            snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1 ->
+                                GttRealtimeRepository.mergeLineSummariesWithCatalog(
+                                    liveSummaries = snapshot.availableLines,
+                                    catalogSummaries = state.allActiveLines,
+                                )
+                            snapshot.availableLines.none { it.activeVehicleCount == 0 } &&
+                                state.allActiveLines.any { it.activeVehicleCount == 0 } ->
+                                GttRealtimeRepository.mergeLiveSummariesWithStaticCatalog(
+                                    liveSummaries = snapshot.availableLines,
+                                    staticCatalog = state.allActiveLines,
+                                )
+                            else -> snapshot.availableLines
                         }
+                        val nextOutage = snapshot.outageReport
+                        if (nextOutage == null) {
+                            dismissedOutageStableKey = null
+                        }
+                        val nextOutageDismissed = nextOutage != null && nextOutage.stableKey == dismissedOutageStableKey
                         state.copy(
                             lineVehicles = filtered,
                             allActiveLines = nextActiveLines,
@@ -781,6 +821,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             nowMillis = evalNowMillis,
                             totalCityVehicles = snapshot.allVehicles.size,
                             errorMessage = null,
+                            gttDataOutage = nextOutage,
+                            isGttOutageDismissed = nextOutageDismissed,
                         )
                     }
                     syncLinePickerState()
@@ -801,6 +843,19 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             BusMapWidgetProvider.syncWidgetsWithCachedSnapshot(appContext)
                         }
                     }
+                    if (currentSettings.notifyFavoriteLineAlerts && snapshot.alerts.isNotEmpty()) {
+                        viewModelScope.launch(Dispatchers.IO) {
+                            FavoriteAlertNotifier.processFetchedAlerts(
+                                context = appContext,
+                                alerts = snapshot.alerts,
+                                postNotifications = true,
+                                nowMillis = evalNowMillis,
+                            )
+                        }
+                    }
+                    if (snapshot.alerts.isNotEmpty() || currentSettings.showServiceAlerts) {
+                        FavoriteAlertsWidgetProvider.syncWithAlerts(appContext, snapshot.alerts)
+                    }
                     if (_uiState.value.selectedStop != null) {
                         refreshSelectedStopArrivals(silent = true)
                     }
@@ -808,6 +863,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 onFailure = { err ->
                     consecutivePollFailures++
                     val now = System.currentTimeMillis()
+                    val outageReport = repository.getCurrentOutageReport()
+                    if (outageReport == null) {
+                        dismissedOutageStableKey = null
+                    }
+                    val outageDismissed = outageReport != null && outageReport.stableKey == dismissedOutageStableKey
                     _uiState.update { state ->
                         val hasRecentLiveData = state.lastUpdatedMillis != null &&
                             (now - state.lastUpdatedMillis) < 95_000L &&
@@ -821,6 +881,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             } else {
                                 state.errorMessage
                             },
+                            gttDataOutage = outageReport,
+                            isGttOutageDismissed = outageDismissed,
                         )
                     }
                     regenerateWidgetPreview()
@@ -870,12 +932,16 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 val keepSelected = state.selectedVehicleId?.takeIf { id ->
                     filtered.any { it.vehicleId == id } || updatedExternal?.vehicleId == id
                 }
-                val nextActiveLines = if (
-                    snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1
-                ) {
-                    state.allActiveLines
-                } else {
-                    snapshot.availableLines
+                val nextActiveLines = when {
+                    snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1 ->
+                        state.allActiveLines
+                    snapshot.availableLines.none { it.activeVehicleCount == 0 } &&
+                        state.allActiveLines.any { it.activeVehicleCount == 0 } ->
+                        GttRealtimeRepository.mergeLiveSummariesWithStaticCatalog(
+                            liveSummaries = snapshot.availableLines,
+                            staticCatalog = state.allActiveLines,
+                        )
+                    else -> snapshot.availableLines
                 }
                 state.copy(
                     lineVehicles = filtered,
@@ -898,7 +964,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectLine(lineCode: String) {
-        val cleaned = lineCode.trim().uppercase().ifBlank { return }
+        val raw = lineCode.trim().uppercase().ifBlank { return }
+        val cleaned = com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(raw)
+            .takeIf { it.isNotBlank() && it != "?" } ?: raw
         val updated = preferences.updateSettings { it.copy(selectedLine = cleaned) }
         if (GttRealtimeRepository.shouldRunMatoStream(updated.dataSourceMode)) {
             repository.startMatoLiveStream(cleaned) { onMatoLivePush() }
@@ -1435,6 +1503,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private fun requestWidgetUpdatesAsync(
         includeMap: Boolean = true,
         includeStops: Boolean = false,
+        includeAlerts: Boolean = false,
         rescheduleInterval: RefreshInterval? = null,
     ) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -1446,6 +1515,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (includeStops) {
                 StopArrivalsWidgetProvider.requestUpdateAll(appContext)
+            }
+            if (includeAlerts) {
+                FavoriteAlertsWidgetProvider.requestUpdateAll(appContext)
             }
         }
     }
@@ -1491,8 +1563,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleFavoriteLine(lineCode: String) {
-        val cleaned = lineCode.trim().uppercase().ifBlank { return }
+        val raw = lineCode.trim().uppercase().ifBlank { return }
+        val cleaned = com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(raw)
+            .takeIf { it.isNotBlank() && it != "?" } ?: raw
         val (updated, added) = preferences.toggleFavoriteLine(cleaned)
+        val settingsNow = _uiState.value.settings
         _uiState.update {
             it.copy(
                 favoriteLines = updated,
@@ -1504,6 +1579,28 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         syncLinePickerState()
+        viewModelScope.launch(Dispatchers.IO) {
+            if (added && settingsNow.notifyFavoriteLineAlerts) {
+                val knownAlerts = _uiState.value.allAlerts.ifEmpty {
+                    repository.getLastCachedSnapshot()?.alerts.orEmpty()
+                }
+                if (knownAlerts.isNotEmpty()) {
+                    FavoriteAlertNotifier.markAlertsSeen(
+                        context = appContext,
+                        alerts = knownAlerts,
+                        favoriteLines = listOf(cleaned),
+                    )
+                }
+            }
+            FavoriteAlertsScheduler.syncSchedule(
+                context = appContext,
+                enabled = settingsNow.notifyFavoriteLineAlerts,
+                hasFavoriteLines = updated.isNotEmpty(),
+            )
+            val cachedAlerts = _uiState.value.allAlerts.takeIf { it.isNotEmpty() }
+                ?: repository.getLastCachedSnapshot()?.alerts
+            FavoriteAlertsWidgetProvider.syncWithAlerts(appContext, cachedAlerts)
+        }
     }
 
     fun openFavoriteStop(fav: FavoriteStop) {
@@ -1647,9 +1744,94 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setNotifyFavoriteLineAlerts(enabled: Boolean) {
+        val updated = preferences.updateSettings { it.copy(notifyFavoriteLineAlerts = enabled) }
+        val favorites = _uiState.value.favoriteLines
+        val toast = when {
+            !enabled -> "Notifiche avvisi disattivate"
+            favorites.isEmpty() -> "Notifiche attivate · aggiungi una linea ai preferiti (★)"
+            favorites.size == 1 -> "Notifiche attivate per la linea ${favorites.first()}"
+            else -> "Notifiche attivate per ${favorites.size} linee preferite"
+        }
+        _uiState.update { it.copy(settings = updated, statusToast = toast) }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            if (enabled) {
+                FavoriteAlertNotifier.ensureChannel(appContext)
+                // Seed currently active alerts as baseline so turning on notifications never
+                // spams old already-active notices (only brand-new alerts will notify).
+                val baselineAlerts = _uiState.value.allAlerts
+                    .ifEmpty { repository.getLastCachedSnapshot()?.alerts.orEmpty() }
+                    .ifEmpty { repository.fetchServiceAlertsNow().orEmpty() }
+                if (baselineAlerts.isNotEmpty()) {
+                    FavoriteAlertNotifier.markAlertsSeen(
+                        context = appContext,
+                        alerts = baselineAlerts,
+                        favoriteLines = favorites.ifEmpty { null },
+                    )
+                }
+                preferences.setAlertBaselineSeeded(true)
+            }
+            FavoriteAlertsScheduler.syncSchedule(
+                context = appContext,
+                enabled = enabled,
+                hasFavoriteLines = favorites.isNotEmpty(),
+            )
+        }
+    }
+
+    fun onNotificationPermissionDenied() {
+        val updated = preferences.updateSettings { it.copy(notifyFavoriteLineAlerts = false) }
+        _uiState.update {
+            it.copy(
+                settings = updated,
+                statusToast = "Permesso notifiche non concesso",
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            FavoriteAlertsScheduler.syncSchedule(
+                context = appContext,
+                enabled = false,
+                hasFavoriteLines = false,
+            )
+        }
+    }
+
+    fun markVisibleAlertsAsSeen() {
+        val alerts = _uiState.value.allAlerts
+        if (alerts.isEmpty()) return
+        val favorites = _uiState.value.favoriteLines
+        viewModelScope.launch(Dispatchers.IO) {
+            FavoriteAlertNotifier.markAlertsSeen(
+                context = appContext,
+                alerts = alerts,
+                favoriteLines = favorites.ifEmpty { null },
+            )
+        }
+    }
+
     fun setHideInactiveOnMap(hide: Boolean) {
         val updated = preferences.updateSettings { it.copy(hideInactiveOnMap = hide) }
         _uiState.update { it.copy(settings = updated) }
+    }
+
+    fun dismissGttOutageBanner() {
+        val current = _uiState.value.gttDataOutage ?: return
+        dismissedOutageStableKey = current.stableKey
+        _uiState.update { it.copy(isGttOutageDismissed = true) }
+    }
+
+    fun syncOutageStateFromRepository(resetDismissal: Boolean = true) {
+        val report = repository.getCurrentOutageReport()
+        if (resetDismissal || report == null) {
+            dismissedOutageStableKey = null
+        }
+        _uiState.update {
+            it.copy(
+                gttDataOutage = report,
+                isGttOutageDismissed = report != null && report.stableKey == dismissedOutageStableKey,
+            )
+        }
     }
 
     fun clearAppCaches() {
@@ -1671,10 +1853,28 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setPreviewSize(size: WidgetPreviewSize) {
         _uiState.update { it.copy(previewSize = size) }
-        if (size == WidgetPreviewSize.STOPS_LIVE) {
-            refreshStopWidgetPreview()
-        } else {
-            regenerateWidgetPreview()
+        when (size) {
+            WidgetPreviewSize.STOPS_LIVE -> refreshStopWidgetPreview()
+            WidgetPreviewSize.ALERTS_LIVE -> {
+                if (_uiState.value.allAlerts.isEmpty()) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        val alerts = repository.fetchServiceAlertsNow().orEmpty()
+                        if (alerts.isNotEmpty()) {
+                            val selected = _uiState.value.settings.selectedLine
+                            val forLine = if (selected.isNotEmpty()) {
+                                alerts.filter { alert ->
+                                    alert.isCurrentOrUpcoming() &&
+                                        alert.affectedLines.any { it.equals(selected, ignoreCase = true) }
+                                }
+                            } else {
+                                emptyList()
+                            }
+                            _uiState.update { it.copy(allAlerts = alerts, lineAlerts = forLine) }
+                        }
+                    }
+                }
+            }
+            else -> regenerateWidgetPreview()
         }
     }
 
@@ -1683,11 +1883,27 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun triggerHomeWidgetSync() {
-        requestWidgetUpdatesAsync(includeMap = true, includeStops = true)
-        if (_uiState.value.previewSize == WidgetPreviewSize.STOPS_LIVE) {
-            refreshStopWidgetPreview()
-        } else {
-            regenerateWidgetPreview()
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = true, includeAlerts = true)
+        when (_uiState.value.previewSize) {
+            WidgetPreviewSize.STOPS_LIVE -> refreshStopWidgetPreview()
+            WidgetPreviewSize.ALERTS_LIVE -> {
+                viewModelScope.launch(Dispatchers.IO) {
+                    val alerts = repository.fetchServiceAlertsNow()
+                    if (alerts != null) {
+                        val selected = _uiState.value.settings.selectedLine
+                        val forLine = if (selected.isNotEmpty()) {
+                            alerts.filter { alert ->
+                                alert.isCurrentOrUpcoming() &&
+                                    alert.affectedLines.any { it.equals(selected, ignoreCase = true) }
+                            }
+                        } else {
+                            emptyList()
+                        }
+                        _uiState.update { it.copy(allAlerts = alerts, lineAlerts = forLine) }
+                    }
+                }
+            }
+            else -> regenerateWidgetPreview()
         }
         _uiState.update { it.copy(statusToast = "Widget sulla Home aggiornati") }
     }
@@ -1745,6 +1961,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         previewDirty = false
         if (_uiState.value.previewSize == WidgetPreviewSize.STOPS_LIVE) {
             refreshStopWidgetPreview()
+            return
+        }
+        if (_uiState.value.previewSize == WidgetPreviewSize.ALERTS_LIVE) {
             return
         }
         previewRenderJob?.cancel()

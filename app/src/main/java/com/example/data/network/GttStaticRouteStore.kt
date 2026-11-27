@@ -73,6 +73,20 @@ class GttStaticRouteStore(context: Context) {
         return gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES
     }
 
+    fun getCacheDiagnosticSummary(): String {
+        val zipExists = gtfsZipFile.exists() && gtfsZipFile.length() > MIN_VALID_ZIP_BYTES
+        val zipInfo = if (zipExists) {
+            val mb = gtfsZipFile.length().toDouble() / (1024.0 * 1024.0)
+            val ageHours = ((System.currentTimeMillis() - gtfsZipFile.lastModified()).coerceAtLeast(0L)) / 3_600_000L
+            String.format(java.util.Locale.ITALY, "GTFS %.1fMB (%dh fa)", mb, ageHours)
+        } else {
+            "GTFS non scaricato"
+        }
+        val linesCount = cachedLineCatalog?.size ?: 0
+        val stopsCount = cachedStopSearchIndex?.size ?: 0
+        return "$zipInfo · lineeRAM=$linesCount · fermateRAM=$stopsCount"
+    }
+
     suspend fun prefetchGtfsZip() = withContext(Dispatchers.IO) {
         ensureGtfsZipReady()
     }
@@ -242,32 +256,44 @@ class GttStaticRouteStore(context: Context) {
         return try {
             BufferedReader(InputStreamReader(file.inputStream(), StandardCharsets.UTF_8), 16 * 1024).use { reader ->
                 val header = reader.readLine() ?: return null
-                if (!header.startsWith("#V1|")) return null
-                if (expectedStamp != null && header != "#V1|$expectedStamp") return null
-                val out = ArrayList<LineSummary>(140)
+                val headerStamp = when {
+                    header.startsWith("#V2|") -> header.removePrefix("#V2|")
+                    header.startsWith("#V1|") -> header.removePrefix("#V1|")
+                    else -> return null
+                }
+                if (expectedStamp != null && headerStamp != expectedStamp) return null
+                val rawIdsByLine = LinkedHashMap<String, LinkedHashSet<String>>(160)
                 var line = reader.readLine()
                 while (line != null) {
                     if (line.isNotEmpty()) {
                         val tab = line.indexOf('\t')
-                        val code = (if (tab >= 0) line.substring(0, tab) else line).trim()
+                        val rawCode = (if (tab >= 0) line.substring(0, tab) else line).trim()
                         val rawIds = if (tab >= 0) {
-                            splitPipeFast(line.substring(tab + 1)).filter { it.isNotEmpty() }.toSet()
+                            splitPipeFast(line.substring(tab + 1)).filter { it.isNotEmpty() }
                         } else {
-                            setOf(code)
+                            listOf(rawCode)
                         }
-                        if (code.isNotEmpty()) {
-                            out.add(
-                                LineSummary(
-                                    lineCode = code,
-                                    rawRouteIds = rawIds.ifEmpty { setOf(code) },
-                                    activeVehicleCount = 0,
-                                ),
-                            )
+                        if (rawCode.isNotEmpty()) {
+                            val normalized = GtfsRtProtobufParser.normalizeGttLineCode(rawCode)
+                            if (normalized.isNotBlank() && normalized != "?") {
+                                val set = rawIdsByLine.getOrPut(normalized) { LinkedHashSet(3) }
+                                set.addAll(rawIds)
+                                if (set.isEmpty()) set.add(normalized)
+                            }
                         }
                     }
                     line = reader.readLine()
                 }
-                out.takeIf { it.isNotEmpty() }
+                rawIdsByLine.entries
+                    .map { (lineCode, rawIds) ->
+                        LineSummary(
+                            lineCode = lineCode,
+                            rawRouteIds = rawIds.ifEmpty { setOf(lineCode) },
+                            activeVehicleCount = 0,
+                        )
+                    }
+                    .sortedWith(GtfsRtProtobufParser.lineCodeComparator)
+                    .takeIf { it.isNotEmpty() }
             }
         } catch (e: Exception) {
             Log.d(TAG, "Cache disco catalogo linee non leggibile: ${e.message}")
@@ -279,7 +305,7 @@ class GttStaticRouteStore(context: Context) {
         try {
             val tmp = File(gtfsDir, "static_lines_v1.tsv.tmp")
             tmp.bufferedWriter(StandardCharsets.UTF_8).use { writer ->
-                writer.write("#V1|")
+                writer.write("#V2|")
                 writer.write(stamp)
                 writer.newLine()
                 for (item in entries) {
@@ -321,6 +347,12 @@ class GttStaticRouteStore(context: Context) {
                             if (lat != null && lon != null) {
                                 val linesField = line.substring(t4 + 1, t5)
                                 val headsField = line.substring(t5 + 1)
+                                val normalizedLines = splitPipeFast(linesField)
+                                    .mapNotNull { raw ->
+                                        GtfsRtProtobufParser.normalizeGttLineCode(raw)
+                                            .takeIf { it.isNotBlank() && it != "?" }
+                                    }
+                                    .distinct()
                                 out.add(
                                     StopSearchEntry(
                                         stopId = line.substring(0, t0),
@@ -328,7 +360,7 @@ class GttStaticRouteStore(context: Context) {
                                         name = line.substring(t1 + 1, t2),
                                         lat = lat,
                                         lon = lon,
-                                        lines = splitPipeFast(linesField),
+                                        lines = normalizedLines,
                                         headsigns = splitPipeFast(headsField),
                                     ),
                                 )
@@ -1285,7 +1317,9 @@ class GttStaticRouteStore(context: Context) {
     }
 
     private fun normalizeLineKey(raw: String): String {
-        return raw.trim().uppercase().replace(" ", "")
+        val norm = GtfsRtProtobufParser.normalizeGttLineCode(raw)
+        val base = if (norm.isNotBlank() && norm != "?") norm else raw.trim().uppercase()
+        return base.replace(" ", "")
     }
 
     private fun parseCsvHeader(headerLine: String): Map<String, Int> {

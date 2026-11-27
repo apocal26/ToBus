@@ -3,6 +3,7 @@ package com.example.ui.components
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -36,6 +37,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
@@ -83,6 +85,7 @@ import com.example.R
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LineSummary
 import com.example.data.model.StopSearchEntry
+import com.example.data.network.GtfsRtProtobufParser
 import com.example.ui.glass.GlassCircleIconButton
 import com.example.ui.glass.glassInteractive
 import com.example.ui.glass.glassSpring
@@ -127,8 +130,10 @@ private val FavoriteTileFill = Color(0xFF231D14)
 private val FavoriteTileSelectedFill = Color(0xFF332814)
 private val RegularTileFill = Color(0xFF171C28)
 private val RegularTileSelectedFill = Color(0xFF23293A)
+private val InactiveTileFill = Color(0xFF121620)
 private val FavoriteTileBorder = Color(0x88FBBF24)
 private val RegularTileBorder = Color(0x22FFFFFF)
+private val InactiveTileBorder = Color(0x16FFFFFF)
 private val PickerSliderBrush = Brush.verticalGradient(
     colors = listOf(GlassSliderTop, GlassSliderMid, GlassSliderBottom),
 )
@@ -204,14 +209,16 @@ fun LinePickerSheet(
     var activeTab by remember { mutableStateOf(PickerTab.LINES) }
     var lineQuery by remember { mutableStateOf("") }
     var stopQuery by remember { mutableStateOf("") }
+    var showInactiveLines by remember { mutableStateOf(false) }
 
     // Freeze activeLines snapshot while the picker is open so background telemetry never causes
-    // grid recompositions mid-scroll; allow upgrade from empty, single-line, or 0-count fallback.
+    // grid recompositions mid-scroll; allow upgrade from empty, single-line, larger catalog, or 0-count fallback.
     var stableActiveLines by remember { mutableStateOf(activeLines) }
     LaunchedEffect(activeLines) {
         val shouldUpdate = when {
             stableActiveLines.isEmpty() && activeLines.isNotEmpty() -> true
             stableActiveLines.size <= 1 && activeLines.size > 1 -> true
+            activeLines.size > stableActiveLines.size -> true
             stableActiveLines.none { it.activeVehicleCount > 0 } && activeLines.any { it.activeVehicleCount > 0 } -> true
             else -> false
         }
@@ -227,16 +234,35 @@ fun LinePickerSheet(
     }
 
     val cleanedLineQuery = remember(lineQuery) { lineQuery.trim().uppercase() }
+    val normalizedLineQuery = remember(cleanedLineQuery) {
+        if (cleanedLineQuery.isEmpty()) {
+            ""
+        } else {
+            GtfsRtProtobufParser.normalizeGttLineCode(cleanedLineQuery)
+                .takeIf { it.isNotBlank() && it != "?" }
+                ?: cleanedLineQuery
+        }
+    }
+    val matchesLineQuery: (String) -> Boolean = remember(cleanedLineQuery, normalizedLineQuery) {
+        { code ->
+            cleanedLineQuery.isEmpty() ||
+                code.contains(cleanedLineQuery, ignoreCase = true) ||
+                (normalizedLineQuery.isNotEmpty() && code.contains(normalizedLineQuery, ignoreCase = true))
+        }
+    }
     val activeByCode = remember(stableActiveLines) {
         stableActiveLines.associateBy { it.lineCode.uppercase() }
     }
     val favoriteCodesNormalized = remember(favoriteLines) {
-        favoriteLines.map { it.trim().uppercase() }.filter { it.isNotEmpty() }.distinct()
+        favoriteLines.map {
+            val raw = it.trim().uppercase()
+            if (raw.isEmpty()) "" else GtfsRtProtobufParser.normalizeGttLineCode(raw).takeIf { c -> c.isNotBlank() && c != "?" } ?: raw
+        }.filter { it.isNotEmpty() }.distinct()
     }
     val favoriteSet = remember(favoriteCodesNormalized) { favoriteCodesNormalized.toSet() }
-    val favoriteSummaries = remember(favoriteCodesNormalized, activeByCode, cleanedLineQuery) {
+    val favoriteSummaries = remember(favoriteCodesNormalized, activeByCode, matchesLineQuery) {
         favoriteCodesNormalized
-            .filter { code -> cleanedLineQuery.isEmpty() || code.contains(cleanedLineQuery, ignoreCase = true) }
+            .filter { code -> matchesLineQuery(code) }
             .map { code ->
                 activeByCode[code] ?: LineSummary(
                     lineCode = code,
@@ -245,20 +271,44 @@ fun LinePickerSheet(
                 )
             }
     }
-    val filteredLines = remember(stableActiveLines, cleanedLineQuery) {
+    val filteredLines = remember(stableActiveLines, cleanedLineQuery, matchesLineQuery) {
         if (cleanedLineQuery.isEmpty()) {
             stableActiveLines
         } else {
-            stableActiveLines.filter { it.lineCode.contains(cleanedLineQuery, ignoreCase = true) }
+            stableActiveLines.filter { matchesLineQuery(it.lineCode) }
         }
     }
     val regularLines = remember(filteredLines, favoriteSet) {
         filteredLines.filterNot { favoriteSet.contains(it.lineCode.uppercase()) }
     }
-    val exactMatchExists = remember(filteredLines, favoriteSummaries, cleanedLineQuery) {
+    val activeRegularLines = remember(regularLines) {
+        regularLines.filter {
+            it.activeVehicleCount > 0 || GtfsRtProtobufParser.isNonLiveTrackedLine(it.lineCode)
+        }
+    }
+    val inactiveRegularLines = remember(regularLines) {
+        regularLines.filter {
+            it.activeVehicleCount == 0 && !GtfsRtProtobufParser.isNonLiveTrackedLine(it.lineCode)
+        }
+    }
+    // When live telemetry is active, keep 0-vehicle lines cleanly tucked in a dedicated bottom
+    // section (while keeping METRO always visible among active lines); when offline/catalog-only
+    // (0 live-tracked lines total), display the catalog directly.
+    val hasActiveAny = activeRegularLines.any { it.activeVehicleCount > 0 } ||
+        favoriteSummaries.any { it.activeVehicleCount > 0 }
+    val primaryRegularLines = if (hasActiveAny) activeRegularLines else regularLines
+    val bottomInactiveLines = if (hasActiveAny) inactiveRegularLines else emptyList()
+    val isInactiveExpanded = showInactiveLines || cleanedLineQuery.isNotEmpty()
+    val exactMatchExists = remember(filteredLines, favoriteSummaries, cleanedLineQuery, normalizedLineQuery) {
         cleanedLineQuery.isNotEmpty() &&
-            (filteredLines.any { it.lineCode.equals(cleanedLineQuery, ignoreCase = true) } ||
-                favoriteSummaries.any { it.lineCode.equals(cleanedLineQuery, ignoreCase = true) })
+            (filteredLines.any {
+                it.lineCode.equals(cleanedLineQuery, ignoreCase = true) ||
+                    it.lineCode.equals(normalizedLineQuery, ignoreCase = true)
+            } ||
+                favoriteSummaries.any {
+                    it.lineCode.equals(cleanedLineQuery, ignoreCase = true) ||
+                        it.lineCode.equals(normalizedLineQuery, ignoreCase = true)
+                })
     }
 
     val latestOnSelectLine by rememberUpdatedState(onSelectLine)
@@ -267,7 +317,9 @@ fun LinePickerSheet(
     val latestOnRetryLoadLines by rememberUpdatedState(onRetryLoadLines)
     val latestOnDismiss by rememberUpdatedState(onDismiss)
     val activeNowCount = remember(stableActiveLines) {
-        stableActiveLines.count { it.activeVehicleCount > 0 }
+        stableActiveLines.count {
+            it.activeVehicleCount > 0 || GtfsRtProtobufParser.isNonLiveTrackedLine(it.lineCode)
+        }
     }
 
     val sheetScope = rememberCoroutineScope()
@@ -504,7 +556,7 @@ fun LinePickerSheet(
                                 .fillMaxWidth()
                                 .height(48.dp)
                                 .glassInteractive(customInteraction) {
-                                    latestOnSelectLine(cleanedLineQuery)
+                                    latestOnSelectLine(normalizedLineQuery.ifEmpty { cleanedLineQuery })
                                     latestOnDismiss()
                                 }
                                 .testTag("select_custom_line_button"),
@@ -695,9 +747,18 @@ fun LinePickerSheet(
                                 LineRowItems(key = "fav_row_${row.first().lineCode}", items = row)
                             }
                         }
-                        val regularRows = remember(regularLines, columnCount) {
-                            regularLines.chunked(columnCount).map { row ->
+                        val regularRows = remember(primaryRegularLines, columnCount) {
+                            primaryRegularLines.chunked(columnCount).map { row ->
                                 LineRowItems(key = "reg_row_${row.first().lineCode}", items = row)
+                            }
+                        }
+                        val inactiveRows = remember(bottomInactiveLines, columnCount, isInactiveExpanded) {
+                            if (!isInactiveExpanded) {
+                                emptyList()
+                            } else {
+                                bottomInactiveLines.chunked(columnCount).map { row ->
+                                    LineRowItems(key = "inact_row_${row.first().lineCode}", items = row)
+                                }
                             }
                         }
                         val selectAndDismiss = remember {
@@ -742,6 +803,7 @@ fun LinePickerSheet(
                                         columnCount = columnCount,
                                         selectedLine = selectedLine,
                                         isFavoriteRow = true,
+                                        isInactiveRow = false,
                                         starPath = sharedStarPath,
                                         starOutlineStroke = sharedStarOutlineStroke,
                                         onSelectLine = selectAndDismiss,
@@ -754,8 +816,8 @@ fun LinePickerSheet(
                                         contentType = "section_header",
                                     ) {
                                         LineSectionHeader(
-                                            title = "Tutte le linee attive",
-                                            count = regularLines.size,
+                                            title = if (hasActiveAny) "Tutte le linee attive" else "Tutte le linee",
+                                            count = primaryRegularLines.size,
                                             isFavoriteHeader = false,
                                             modifier = Modifier.padding(top = 6.dp),
                                         )
@@ -773,11 +835,47 @@ fun LinePickerSheet(
                                     columnCount = columnCount,
                                     selectedLine = selectedLine,
                                     isFavoriteRow = false,
+                                    isInactiveRow = false,
                                     starPath = sharedStarPath,
                                     starOutlineStroke = sharedStarOutlineStroke,
                                     onSelectLine = selectAndDismiss,
                                     onToggleFavorite = toggleFavoriteStable,
                                 )
+                            }
+
+                            if (bottomInactiveLines.isNotEmpty()) {
+                                item(
+                                    key = "header_inactive_lines",
+                                    contentType = "inactive_section_toggle",
+                                ) {
+                                    InactiveLinesSectionHeader(
+                                        count = bottomInactiveLines.size,
+                                        expanded = isInactiveExpanded,
+                                        onToggle = { showInactiveLines = !isInactiveExpanded },
+                                        modifier = Modifier
+                                            .padding(top = if (regularRows.isNotEmpty() || favoriteRows.isNotEmpty()) 10.dp else 2.dp)
+                                            .testTag("inactive_lines_section_toggle"),
+                                    )
+                                }
+                                if (inactiveRows.isNotEmpty()) {
+                                    items(
+                                        items = inactiveRows,
+                                        key = { it.key },
+                                        contentType = { "inactive_line_row" },
+                                    ) { rowData ->
+                                        LineTileRow(
+                                            row = rowData,
+                                            columnCount = columnCount,
+                                            selectedLine = selectedLine,
+                                            isFavoriteRow = false,
+                                            isInactiveRow = true,
+                                            starPath = sharedStarPath,
+                                            starOutlineStroke = sharedStarOutlineStroke,
+                                            onSelectLine = selectAndDismiss,
+                                            onToggleFavorite = toggleFavoriteStable,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -1137,11 +1235,77 @@ private fun LineSectionHeader(
 }
 
 @Composable
+private fun InactiveLinesSectionHeader(
+    count: Int,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        label = "inactive_lines_chevron",
+    )
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .drawBehind {
+                val r = 14.dp.toPx()
+                val cr = CornerRadius(r, r)
+                drawRoundRect(color = InactiveTileFill, cornerRadius = cr)
+                drawRoundRect(color = InactiveTileBorder, cornerRadius = cr, style = Stroke(width = 1.dp.toPx()))
+            }
+            .clickable(
+                interactionSource = null,
+                indication = null,
+                role = Role.Button,
+                onClick = onToggle,
+            )
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "Linee senza mezzi ora",
+            style = MaterialTheme.typography.labelLarge,
+            color = TextSubtitle,
+            modifier = Modifier.weight(1f),
+        )
+        Box(
+            modifier = Modifier
+                .background(Color(0x14FFFFFF), PillShape)
+                .border(0.8.dp, InactiveTileBorder, PillShape)
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+            Text(
+                text = count.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = TextTertiary,
+            )
+        }
+        Text(
+            text = if (expanded) "Nascondi" else "Mostra",
+            style = MaterialTheme.typography.labelSmall,
+            color = TextTertiary,
+        )
+        Icon(
+            imageVector = Icons.Rounded.KeyboardArrowDown,
+            contentDescription = if (expanded) "Nascondi linee senza mezzi" else "Mostra linee senza mezzi",
+            tint = TextSubtitle,
+            modifier = Modifier
+                .size(18.dp)
+                .graphicsLayer { rotationZ = chevronRotation },
+        )
+    }
+}
+
+@Composable
 private fun LineTileRow(
     row: LineRowItems,
     columnCount: Int,
     selectedLine: String,
     isFavoriteRow: Boolean,
+    isInactiveRow: Boolean,
     starPath: Path,
     starOutlineStroke: Stroke,
     onSelectLine: (String) -> Unit,
@@ -1161,6 +1325,7 @@ private fun LineTileRow(
                     isSelected = isSelected,
                     isFavorite = isFavoriteRow,
                     highlightedFavorite = isFavoriteRow,
+                    isInactive = isInactiveRow,
                     starPath = starPath,
                     starOutlineStroke = starOutlineStroke,
                     onToggleFavorite = onToggleFavorite,
@@ -1186,31 +1351,46 @@ private fun GlassLineTile(
     isSelected: Boolean,
     isFavorite: Boolean,
     highlightedFavorite: Boolean,
+    isInactive: Boolean,
     starPath: Path,
     starOutlineStroke: Stroke,
     onToggleFavorite: (String) -> Unit,
     onSelectLine: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val countLabel = when (summary.activeVehicleCount) {
-        0 -> "Nessun bus"
-        1 -> "1 mezzo"
+    val isNonLiveLine = GtfsRtProtobufParser.isNonLiveTrackedLine(summary.lineCode) &&
+        summary.activeVehicleCount == 0
+    val countLabel = when {
+        isNonLiveLine -> "Orari stimati"
+        summary.activeVehicleCount == 0 -> "0 mezzi"
+        summary.activeVehicleCount == 1 -> "1 mezzo"
         else -> "${summary.activeVehicleCount} mezzi"
     }
     val fillColor = when {
         highlightedFavorite && isSelected -> FavoriteTileSelectedFill
         highlightedFavorite -> FavoriteTileFill
         isSelected -> RegularTileSelectedFill
+        isInactive -> InactiveTileFill
         else -> RegularTileFill
     }
     val borderColor = when {
         isSelected -> GlassRowActiveBorder
         highlightedFavorite -> FavoriteTileBorder
+        isInactive -> InactiveTileBorder
         else -> RegularTileBorder
     }
     val borderWidthDp = if (isSelected || highlightedFavorite) 1.2.dp else 1.dp
-    val dotColor = if (summary.activeVehicleCount > 0) AccentEmerald else TextTertiary
+    val dotColor = when {
+        summary.activeVehicleCount > 0 -> AccentEmerald
+        isNonLiveLine -> AccentCyan
+        else -> TextTertiary
+    }
     val titleText = if (isSelected) "${summary.lineCode} ✓" else summary.lineCode
+    val titleColor = when {
+        isSelected || highlightedFavorite -> AccentGold
+        isInactive -> TextBody
+        else -> TextPrimary
+    }
     val starContentDesc = if (isFavorite) {
         "Rimuovi linea ${summary.lineCode} dalle preferite"
     } else {
@@ -1247,7 +1427,7 @@ private fun GlassLineTile(
             Text(
                 text = titleText,
                 style = MaterialTheme.typography.titleLarge,
-                color = if (isSelected || highlightedFavorite) AccentGold else TextPrimary,
+                color = titleColor,
                 maxLines = 1,
                 softWrap = false,
             )

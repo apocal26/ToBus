@@ -102,19 +102,132 @@ object GtfsRtProtobufParser {
             .sortedWith(lineCodeComparator)
     }
 
+    const val LINE_CODE_METRO = "METRO"
+
+    fun isNonLiveTrackedLine(lineCode: String): Boolean {
+        return normalizeGttLineCode(lineCode) == LINE_CODE_METRO
+    }
+
+    private val MULTI_SPACE_REGEX = Regex("\\s+")
+    private val COMPACT_BARRATO_REGEX = Regex("^([0-9]+[A-Z]?)\\s*BARR(?:AT[OA])?$")
+    private val LEADING_ZERO_ALPHA_NUM_REGEX = Regex("^([A-Z])0+([1-9][0-9]*[A-Z/+]*)$")
+    private val SINGLE_ALPHA_SINGLE_DIGIT_REGEX = Regex("^([A-Z])([1-9])$")
+
+    /**
+     * Canonicalizes a Turin GTT route identifier or short name across every feed
+     * (GTFS Static `routes.txt`, GTFS-RT VehiclePositions/TripUpdates/Alerts, MaTO GraphQL,
+     * MaTO MQTT, GTT Palina):
+     * - Strips operator prefixes (`gtt:17BU` -> `17B`, `1:17/` -> `17B`)
+     * - Collapses GTT spacing variants (`17 /` -> `17B`, `13 +` -> `13+`, `STAR 1` -> `STAR1`,
+     *   `16 CS` -> `16CS`, `16 CD` -> `16CD`, `VE 1` -> `VE1`, `M1 S` -> `M1S`) while preserving
+     *   multi-word descriptive names (`VENARIA EXPRESS`, `DORA FLY`)
+     * - Unifies Turin Metro (`M1`, `M1U`, `M1F`, `METRO`, `METROPOLITANA` -> `METRO`, preserving `M1S`)
+     * - Strips GTT service suffixes (`UF` Urbano Festivo, `U` Urbano, `F` Festivo on numbered/variant
+     *   lines like `12F`/`17BF`/`10NF`/`13+F`/`16CSF`/`M1SF`/`STAR1F`, `E` Extraurbano/Estivo on
+     *   numeric/barrata/plus lines like `1510E`/`265E`/`12E`/`17BE`/`13+E`)
+     * - Unifies barrata notation (`17/`, `17/U`, `17/F`, `17 BARRATO`, `17BU`, `17BF` -> `17B`)
+     * - Drops redundant leading zeros on numeric (`04` -> `4`) and Night Buster (`W01` -> `W1`,
+     *   `S04` -> `S4`, `N04` -> `N4`) codes.
+     */
     fun normalizeGttLineCode(rawRouteId: String): String {
-        val trimmed = rawRouteId.trim().substringAfterLast(":").trim().uppercase()
-        if (trimmed.isEmpty()) return "?"
-        return when {
-            trimmed == "BLU" -> trimmed
-            trimmed.length >= 3 && trimmed.endsWith("UF") && trimmed.dropLast(2).all { it.isDigit() } ->
-                trimmed.dropLast(2)
-            trimmed.length >= 2 && trimmed.endsWith("U") ->
-                trimmed.dropLast(1)
-            trimmed.length >= 2 && trimmed.endsWith("F") && trimmed.dropLast(1).all { it.isDigit() } ->
-                trimmed.dropLast(1)
-            else -> trimmed
+        var s = rawRouteId.trim().substringAfterLast(":").trim().uppercase()
+        if (s.isEmpty()) return "?"
+
+        // Normalize internal spacing
+        if (s.contains(' ') || s.contains('\t')) {
+            s = MULTI_SPACE_REGEX.replace(s, " ")
+                .replace(" /", "/")
+                .replace("/ ", "/")
+                .replace(" +", "+")
+                .replace("+ ", "+")
         }
+
+        // Handle explicit "17 BARRATO" / "17 BARR" notation
+        COMPACT_BARRATO_REGEX.matchEntire(s)?.let { match ->
+            s = "${match.groupValues[1]}B"
+        }
+
+        // Collapse compact spaced alphanumeric GTT codes (e.g. "STAR 1", "16 CS", "M 1", "VE 1")
+        // without collapsing multi-word names that have no digits (e.g. "VENARIA EXPRESS").
+        if (s.contains(' ') && s.any { it.isDigit() }) {
+            val tokens = s.split(' ')
+            if (tokens.all { it.isNotEmpty() && it.length <= 4 }) {
+                s = tokens.joinToString("")
+            }
+        }
+
+        if (s == "M1" || s == "M1U" || s == "M1F" || s == "M1UF" ||
+            s == "METRO" || s == "METROPOLITANA"
+        ) {
+            return LINE_CODE_METRO
+        }
+        if (s == "BLU") return s
+
+        // Strip GTT service-type suffixes (UF, U, F, E)
+        s = when {
+            s.length >= 3 && s.endsWith("UF") && s.dropLast(2).any { it.isDigit() } ->
+                s.dropLast(2)
+            s.length >= 2 && s.endsWith("U") ->
+                s.dropLast(1)
+            s.length >= 2 && s.endsWith("F") && s.dropLast(1).any { it.isDigit() } ->
+                s.dropLast(1)
+            s.length >= 2 && s.endsWith("E") -> {
+                val prefix = s.dropLast(1)
+                val isStrippableE = prefix.all { it.isDigit() } ||
+                    (prefix.length >= 2 &&
+                        (prefix.endsWith("B") || prefix.endsWith("/") || prefix.endsWith("+")) &&
+                        prefix.dropLast(1).all { it.isDigit() })
+                if (isStrippableE) prefix else s
+            }
+            else -> s
+        }
+
+        // Convert trailing slash barrata notation (17/, 5/, 58/, 72/, N1/) to canonical B (17B, 5B...)
+        if (s.length >= 2 && s.endsWith("/") && s.dropLast(1).any { it.isDigit() }) {
+            s = s.dropLast(1) + "B"
+        }
+
+        // Normalize redundant leading zeros (04 -> 4, W01 -> W1, S04 -> S4, N04 -> N4, M01 -> METRO)
+        if (s.length > 1 && s.all { it.isDigit() } && s.startsWith('0')) {
+            s = s.trimStart('0').ifEmpty { "0" }
+        } else {
+            LEADING_ZERO_ALPHA_NUM_REGEX.matchEntire(s)?.let { match ->
+                s = "${match.groupValues[1]}${match.groupValues[2]}"
+            }
+        }
+
+        return if (s == "M1") LINE_CODE_METRO else s
+    }
+
+    /**
+     * Alternate feed query names to try when querying MaTO GraphQL, OpenStreetMap Overpass,
+     * or MaTO MQTT if the canonical code (e.g. `17B`, `METRO`, `STAR1`, `16CS`, `W1`) is
+     * indexed under its display/padded shortName (`17/`, `M1`, `STAR 1`, `16 CS`, `W01`).
+     */
+    fun alternateFeedQueryCodes(canonicalLineCode: String): List<String> {
+        val code = normalizeGttLineCode(canonicalLineCode)
+        if (code.isEmpty() || code == "?") return emptyList()
+        val alts = LinkedHashSet<String>(3)
+        if (code == LINE_CODE_METRO) {
+            alts.add("M1")
+        }
+        if (code.length >= 2 && code.endsWith("B") && code.dropLast(1).any { it.isDigit() }) {
+            alts.add(code.dropLast(1) + "/")
+        }
+        if (code.startsWith("STAR") && code.length > 4 && code.drop(4).all { it.isDigit() }) {
+            alts.add("STAR ${code.drop(4)}")
+        }
+        if ((code.endsWith("CS") || code.endsWith("CD")) &&
+            code.length >= 3 &&
+            code.dropLast(2).all { it.isDigit() }
+        ) {
+            alts.add("${code.dropLast(2)} ${code.takeLast(2)}")
+        }
+        SINGLE_ALPHA_SINGLE_DIGIT_REGEX.matchEntire(code)?.let { match ->
+            alts.add("${match.groupValues[1]}0${match.groupValues[2]}")
+        }
+        alts.remove(code)
+        return alts.toList()
     }
 
     /**
@@ -164,6 +277,10 @@ object GtfsRtProtobufParser {
     }
 
     fun compareLineCodes(a: String, b: String): Int {
+        val isMetroA = a.equals(LINE_CODE_METRO, ignoreCase = true)
+        val isMetroB = b.equals(LINE_CODE_METRO, ignoreCase = true)
+        if (isMetroA && !isMetroB) return -1
+        if (!isMetroA && isMetroB) return 1
         val numA = extractLeadingInt(a)
         val numB = extractLeadingInt(b)
         return when {
@@ -594,6 +711,8 @@ object GtfsRtProtobufParser {
         val lines = mutableSetOf<String>()
         var header = ""
         var desc = ""
+        var cause: Int? = null
+        var effect: Int? = null
 
         while (reader.hasRemaining()) {
             val tag = reader.readVarint32()
@@ -632,6 +751,8 @@ object GtfsRtProtobufParser {
                         }
                     }
                 }
+                fieldNumber == 6 && wireType == WIRE_VARINT -> cause = reader.readVarint32()
+                fieldNumber == 7 && wireType == WIRE_VARINT -> effect = reader.readVarint32()
                 fieldNumber == 10 && wireType == WIRE_LENGTH_DELIMITED -> header = parseTranslatedString(reader.readSubReader())
                 fieldNumber == 11 && wireType == WIRE_LENGTH_DELIMITED -> desc = parseTranslatedString(reader.readSubReader())
                 else -> reader.skipField(wireType)
@@ -645,6 +766,8 @@ object GtfsRtProtobufParser {
             descriptionText = desc,
             affectedLines = lines,
             activePeriods = periods,
+            gtfsCause = cause,
+            gtfsEffect = effect,
         )
     }
 

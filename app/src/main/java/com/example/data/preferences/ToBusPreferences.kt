@@ -38,8 +38,10 @@ class ToBusPreferences private constructor(context: Context) {
     fun currentFavoriteLines(): List<String> = _favoriteLines.value
 
     fun toggleFavoriteLine(lineCode: String): Pair<List<String>, Boolean> {
-        val cleaned = lineCode.trim().uppercase()
-        if (cleaned.isEmpty()) return _favoriteLines.value to false
+        val raw = lineCode.trim().uppercase()
+        if (raw.isEmpty()) return _favoriteLines.value to false
+        val cleaned = com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(raw)
+            .takeIf { it.isNotBlank() && it != "?" } ?: raw
         val current = _favoriteLines.value.toMutableList()
         val idx = current.indexOfFirst { it.equals(cleaned, ignoreCase = true) }
         val added: Boolean
@@ -155,9 +157,78 @@ class ToBusPreferences private constructor(context: Context) {
         prefs.edit().putString(KEY_DISMISSED_UPDATE_TAG, tag?.trim()).apply()
     }
 
+    fun isAlertBaselineSeeded(): Boolean = prefs.getBoolean(KEY_ALERT_BASELINE_SEEDED, false)
+
+    fun setAlertBaselineSeeded(seeded: Boolean) {
+        prefs.edit().putBoolean(KEY_ALERT_BASELINE_SEEDED, seeded).apply()
+    }
+
+    fun getSeenAlertFingerprints(nowMillis: Long = System.currentTimeMillis()): MutableMap<String, Long> {
+        val raw = prefs.getString(KEY_SEEN_ALERT_FINGERPRINTS, null) ?: return LinkedHashMap()
+        val cutoff = nowMillis - SEEN_ALERT_RETENTION_MS
+        return runCatching {
+            val obj = JSONObject(raw)
+            val result = LinkedHashMap<String, Long>(obj.length())
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val ts = obj.optLong(key, 0L)
+                if (key.isNotBlank() && ts >= cutoff) {
+                    result[key] = ts
+                }
+            }
+            result
+        }.getOrDefault(LinkedHashMap())
+    }
+
+    fun markAlertFingerprintsSeen(
+        fingerprints: Collection<String>,
+        nowMillis: Long = System.currentTimeMillis(),
+    ) {
+        if (fingerprints.isEmpty()) return
+        synchronized(seenAlertsLock) {
+            val map = getSeenAlertFingerprints(nowMillis)
+            for (fp in fingerprints) {
+                val clean = fp.trim()
+                if (clean.isNotEmpty()) {
+                    map[clean] = nowMillis
+                }
+            }
+            val pruned = if (map.size > MAX_SEEN_ALERT_FINGERPRINTS) {
+                map.entries
+                    .sortedByDescending { it.value }
+                    .take(MAX_SEEN_ALERT_FINGERPRINTS)
+                    .associateTo(LinkedHashMap()) { it.key to it.value }
+            } else {
+                map
+            }
+            val obj = JSONObject()
+            for ((k, v) in pruned) {
+                obj.put(k, v)
+            }
+            prefs.edit().putString(KEY_SEEN_ALERT_FINGERPRINTS, obj.toString()).apply()
+        }
+    }
+
+    fun clearSeenAlertFingerprints(keepBaselineSeeded: Boolean = true) {
+        synchronized(seenAlertsLock) {
+            prefs.edit()
+                .remove(KEY_SEEN_ALERT_FINGERPRINTS)
+                .putBoolean(KEY_ALERT_BASELINE_SEEDED, keepBaselineSeeded)
+                .apply()
+        }
+    }
+
     private fun readSettings(): UserWidgetSettings {
+        val rawSelected = prefs.getString(KEY_LINE, "")?.trim()?.uppercase().orEmpty()
+        val migratedSelected = if (rawSelected.isNotEmpty()) {
+            com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(rawSelected)
+                .takeIf { it.isNotBlank() && it != "?" } ?: rawSelected
+        } else {
+            ""
+        }
         return UserWidgetSettings(
-            selectedLine = prefs.getString(KEY_LINE, "")?.trim()?.uppercase().orEmpty(),
+            selectedLine = migratedSelected,
             mapStyle = MapStyle.fromId(prefs.getString(KEY_MAP_STYLE, MapStyle.DARK.id)),
             cameraMode = WidgetCameraMode.fromId(
                 prefs.getString(KEY_CAMERA_MODE, WidgetCameraMode.AUTO_FIT_BUSES.id),
@@ -182,6 +253,7 @@ class ToBusPreferences private constructor(context: Context) {
             livePollInterval = LivePollInterval.fromSeconds(prefs.getInt(KEY_LIVE_POLL_SEC, LivePollInterval.SEC_25.seconds)),
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, false),
             showServiceAlerts = prefs.getBoolean(KEY_SHOW_SERVICE_ALERTS, true),
+            notifyFavoriteLineAlerts = prefs.getBoolean(KEY_NOTIFY_FAVORITE_ALERTS, false),
             hideInactiveOnMap = prefs.getBoolean(KEY_HIDE_INACTIVE_MAP, false),
         )
     }
@@ -203,6 +275,7 @@ class ToBusPreferences private constructor(context: Context) {
             .putInt(KEY_LIVE_POLL_SEC, s.livePollInterval.seconds)
             .putBoolean(KEY_KEEP_SCREEN_ON, s.keepScreenOn)
             .putBoolean(KEY_SHOW_SERVICE_ALERTS, s.showServiceAlerts)
+            .putBoolean(KEY_NOTIFY_FAVORITE_ALERTS, s.notifyFavoriteLineAlerts)
             .putBoolean(KEY_HIDE_INACTIVE_MAP, s.hideInactiveOnMap)
             .apply()
     }
@@ -213,7 +286,13 @@ class ToBusPreferences private constructor(context: Context) {
             val arr = JSONArray(raw)
             val list = ArrayList<String>(arr.length())
             for (i in 0 until arr.length()) {
-                val code = arr.optString(i).trim().uppercase()
+                val rawCode = arr.optString(i).trim().uppercase()
+                val code = if (rawCode.isNotEmpty()) {
+                    com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(rawCode)
+                        .takeIf { it.isNotBlank() && it != "?" } ?: rawCode
+                } else {
+                    ""
+                }
                 if (code.isNotEmpty() && list.none { it.equals(code, ignoreCase = true) }) {
                     list.add(code)
                 }
@@ -237,6 +316,13 @@ class ToBusPreferences private constructor(context: Context) {
                 val obj = arr.optJSONObject(i) ?: continue
                 val stopId = obj.optString("id").trim()
                 if (stopId.isEmpty()) continue
+                val rawStopLine = obj.optString("line", "").trim()
+                val migratedStopLine = if (rawStopLine.isNotEmpty()) {
+                    com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(rawStopLine)
+                        .takeIf { it.isNotBlank() && it != "?" } ?: rawStopLine.uppercase()
+                } else {
+                    ""
+                }
                 list.add(
                     FavoriteStop(
                         stopId = stopId,
@@ -244,7 +330,7 @@ class ToBusPreferences private constructor(context: Context) {
                         name = obj.optString("name", "Fermata $stopId"),
                         lat = obj.optDouble("lat", CameraState.TURIN_CENTER_LAT),
                         lon = obj.optDouble("lon", CameraState.TURIN_CENTER_LON),
-                        lineCode = obj.optString("line", ""),
+                        lineCode = migratedStopLine,
                         directionId = obj.optInt("dir", 0),
                         terminusName = obj.optString("terminus", "").ifBlank { null },
                     ),
@@ -289,6 +375,9 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_LIVE_POLL_SEC = "live_poll_seconds"
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_SHOW_SERVICE_ALERTS = "show_service_alerts"
+        private const val KEY_NOTIFY_FAVORITE_ALERTS = "notify_favorite_line_alerts"
+        private const val KEY_SEEN_ALERT_FINGERPRINTS = "seen_alert_fingerprints_v1"
+        private const val KEY_ALERT_BASELINE_SEEDED = "alert_baseline_seeded_v1"
         private const val KEY_HIDE_INACTIVE_MAP = "hide_inactive_map"
         private const val KEY_FAVORITE_STOPS = "favorite_stops_v1"
         private const val KEY_FAVORITE_LINES = "favorite_lines_v1"
@@ -298,6 +387,9 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_DISMISSED_UPDATE_TAG = "github_dismissed_update_tag"
         private const val MAX_FAVORITES = 6
         private const val MAX_FAVORITE_LINES = 12
+        private const val MAX_SEEN_ALERT_FINGERPRINTS = 600
+        private const val SEEN_ALERT_RETENTION_MS = 90L * 24L * 60L * 60L * 1_000L
+        private val seenAlertsLock = Any()
 
         @Volatile
         private var instance: ToBusPreferences? = null

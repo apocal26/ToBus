@@ -64,6 +64,7 @@ val TextTertiary = Color(0x88FFFFFF)
 // Semantic Accents
 val AccentCyan = Color(0xFF38BDF8)
 val AccentRed = Color(0xFFEF4444)
+val AccentOrange = Color(0xFFF97316)
 val AccentGold = Color(0xFFFBBF24)
 val AccentEmerald = Color(0xFF10B981)
 val DarkInkOnAccent = Color(0xFF0B0D12)

@@ -1,8 +1,11 @@
 package com.example
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -11,6 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -105,6 +109,7 @@ import com.example.ui.theme.TextSubtitle
 import com.example.ui.theme.ToBusTheme
 import com.example.ui.viewmodel.ToBusViewModel
 
+import com.example.notifications.FavoriteAlertNotifier
 import com.example.widget.StopArrivalsWidgetProvider
 
 private enum class AppDestination(
@@ -119,10 +124,12 @@ private enum class AppDestination(
 
 class MainActivity : ComponentActivity() {
     private val pendingOpenStopId = mutableStateOf<String?>(null)
+    private val pendingOpenAlertsLine = mutableStateOf<String?>(null)
+    private val pendingOpenAlertsSeq = mutableLongStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        consumeWidgetStopIntent(intent)
+        consumeLaunchIntent(intent)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
@@ -132,6 +139,9 @@ class MainActivity : ComponentActivity() {
                 ToBusApp(
                     pendingOpenStopId = pendingOpenStopId.value,
                     onConsumedOpenStopId = { pendingOpenStopId.value = null },
+                    pendingOpenAlertsLine = pendingOpenAlertsLine.value,
+                    pendingOpenAlertsSeq = pendingOpenAlertsSeq.longValue,
+                    onConsumedOpenAlerts = { pendingOpenAlertsLine.value = null },
                 )
             }
         }
@@ -140,14 +150,21 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        consumeWidgetStopIntent(intent)
+        consumeLaunchIntent(intent)
     }
 
-    private fun consumeWidgetStopIntent(intent: Intent?) {
+    private fun consumeLaunchIntent(intent: Intent?) {
         val stopId = intent?.getStringExtra(StopArrivalsWidgetProvider.EXTRA_OPEN_STOP_ID)?.trim()
         if (!stopId.isNullOrEmpty()) {
             pendingOpenStopId.value = stopId
             intent.removeExtra(StopArrivalsWidgetProvider.EXTRA_OPEN_STOP_ID)
+        }
+        val openAlerts = intent?.getBooleanExtra(FavoriteAlertNotifier.EXTRA_OPEN_ALERTS_DIALOG, false) == true
+        if (openAlerts) {
+            pendingOpenAlertsLine.value = intent.getStringExtra(FavoriteAlertNotifier.EXTRA_OPEN_ALERTS_LINE)?.trim()
+            pendingOpenAlertsSeq.longValue += 1L
+            intent.removeExtra(FavoriteAlertNotifier.EXTRA_OPEN_ALERTS_DIALOG)
+            intent.removeExtra(FavoriteAlertNotifier.EXTRA_OPEN_ALERTS_LINE)
         }
     }
 }
@@ -157,14 +174,42 @@ fun ToBusApp(
     viewModel: ToBusViewModel = viewModel(),
     pendingOpenStopId: String? = null,
     onConsumedOpenStopId: () -> Unit = {},
+    pendingOpenAlertsLine: String? = null,
+    pendingOpenAlertsSeq: Long = 0L,
+    onConsumedOpenAlerts: () -> Unit = {},
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
+    val appContext = LocalContext.current
     var isForegroundActive by remember { mutableStateOf(true) }
     var currentTab by rememberSaveable { mutableStateOf(AppDestination.MAP) }
     var showLinePicker by rememberSaveable { mutableStateOf(!uiState.settings.hasSelectedLine) }
+    var openAlertsRequestSeq by rememberSaveable { mutableLongStateOf(0L) }
     val snackbarHostState = remember { SnackbarHostState() }
     val rootView = LocalView.current
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            viewModel.setNotifyFavoriteLineAlerts(true)
+        } else {
+            viewModel.onNotificationPermissionDenied()
+        }
+    }
+
+    val handleToggleNotifyFavoriteAlerts: (Boolean) -> Unit = { enabled ->
+        if (!enabled) {
+            viewModel.setNotifyFavoriteLineAlerts(false)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(appContext, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            viewModel.setNotifyFavoriteLineAlerts(true)
+        }
+    }
+
     val shouldKeepScreenOn = uiState.settings.keepScreenOn &&
         currentTab == AppDestination.MAP &&
         isForegroundActive &&
@@ -183,6 +228,21 @@ fun ToBusApp(
         showLinePicker = false
         viewModel.openFavoriteStopById(targetStopId)
         onConsumedOpenStopId()
+    }
+
+    LaunchedEffect(pendingOpenAlertsSeq) {
+        if (pendingOpenAlertsSeq <= 0L) return@LaunchedEffect
+        currentTab = AppDestination.MAP
+        showLinePicker = false
+        val line = pendingOpenAlertsLine?.trim().orEmpty()
+        if (line.isNotEmpty() && !line.equals(uiState.settings.selectedLine, ignoreCase = true)) {
+            viewModel.selectLine(line)
+        }
+        if (!uiState.settings.showServiceAlerts) {
+            viewModel.setShowServiceAlerts(true)
+        }
+        openAlertsRequestSeq += 1L
+        onConsumedOpenAlerts()
     }
 
     // Energy efficiency: stop polling, clocks & animations automatically when app goes to background
@@ -390,6 +450,9 @@ fun ToBusApp(
                             onFocusArrivalBus = viewModel::focusBusForArrival,
                             onSelectLine = viewModel::selectLine,
                             onSelectDataSourceMode = viewModel::setDataSourceMode,
+                            onDismissGttOutage = viewModel::dismissGttOutageBanner,
+                            openAlertsRequestSeq = openAlertsRequestSeq,
+                            onAlertsDialogOpened = viewModel::markVisibleAlertsAsSeen,
                         )
 
                         AppDestination.WIDGET -> WidgetStudioScreen(
@@ -406,6 +469,7 @@ fun ToBusApp(
                             onToggleHideInactiveInWidget = viewModel::setHideInactiveInWidget,
                             onToggleHideInactiveOnMap = viewModel::setHideInactiveOnMap,
                             onToggleShowServiceAlerts = viewModel::setShowServiceAlerts,
+                            onToggleNotifyFavoriteLineAlerts = handleToggleNotifyFavoriteAlerts,
                             onToggleKeepScreenOn = viewModel::setKeepScreenOn,
                             onSelectDataSourceMode = viewModel::setDataSourceMode,
                             onSelectLivePollInterval = viewModel::setLivePollInterval,
@@ -421,6 +485,7 @@ fun ToBusApp(
                             onCheckUpdates = viewModel::checkForUpdatesManually,
                             onSaveGithubRepo = viewModel::saveGithubRepoSlug,
                             onClearAppCaches = viewModel::clearAppCaches,
+                            onDebugStateChanged = viewModel::syncOutageStateFromRepository,
                         )
                     }
                 }

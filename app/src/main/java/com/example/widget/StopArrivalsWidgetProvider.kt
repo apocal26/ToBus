@@ -150,7 +150,8 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
         val hasWide = manager.getAppWidgetIds(ComponentName(context, BusMapWidgetProvider::class.java)).isNotEmpty()
         val hasSquare = manager.getAppWidgetIds(ComponentName(context, BusMapWidgetSquareProvider::class.java)).isNotEmpty()
         val hasStops = manager.getAppWidgetIds(ComponentName(context, StopArrivalsWidgetProvider::class.java)).isNotEmpty()
-        if (!hasWide && !hasSquare && !hasStops) {
+        val hasAlerts = manager.getAppWidgetIds(ComponentName(context, FavoriteAlertsWidgetProvider::class.java)).isNotEmpty()
+        if (!hasWide && !hasSquare && !hasStops && !hasAlerts) {
             BusMapWidgetProvider.cancelPeriodicUpdates(context)
         }
     }
@@ -320,6 +321,15 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
                     "Nessun passaggio imminente rilevato per ${shortTurinPlaceName(fav.name)}.",
                 )
 
+                val options = manager.getAppWidgetOptions(id)
+                val minHeightDp = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 160)
+                val visibleCapacity = ((minHeightDp - 66) / 64).coerceAtLeast(1)
+                val hasOverflowLines = groupedRows.size > visibleCapacity
+                views.setViewVisibility(
+                    R.id.stop_widget_scroll_hint,
+                    if (hasOverflowLines) View.VISIBLE else View.GONE,
+                )
+
                 // PendingIntent template for tapping any line row inside the ListView -> opens stop in ToBus
                 val rowClickTemplateIntent = Intent(context, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -427,6 +437,7 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
             views.setTextViewText(R.id.stop_widget_subtitle, "Nessuna fermata preferita")
             views.setViewVisibility(R.id.stop_widget_switch_btn, View.GONE)
             views.setViewVisibility(R.id.stop_widget_list, View.GONE)
+            views.setViewVisibility(R.id.stop_widget_scroll_hint, View.GONE)
             views.setViewVisibility(R.id.stop_widget_empty_text, View.VISIBLE)
             views.setTextViewText(
                 R.id.stop_widget_empty_text,

@@ -138,6 +138,39 @@ class MatoMqttLiveClient(
 
     fun lastPayloadPreview(): String? = lastPayloadPreview
 
+    fun focusedLineCode(): String = focusedLine
+
+    fun reconnectAttemptCount(): Int = reconnectAttempt
+
+    fun activeProfileLabel(): String {
+        val idx = if (workingProfileIdx in HANDSHAKE_PROFILES.indices) {
+            workingProfileIdx
+        } else {
+            reconnectAttempt % HANDSHAKE_PROFILES.size
+        }
+        return HANDSHAKE_PROFILES[idx].label
+    }
+
+    fun forceReconnect(lineCode: String? = null) {
+        val target = lineCode?.let { GtfsRtProtobufParser.normalizeGttLineCode(it) }
+            ?.takeIf { it.isNotEmpty() && it != "?" }
+        if (target != null) {
+            focusedLine = target
+        }
+        isActiveDesired.set(true)
+        reconnectAttempt = 0
+        rootWildcardDisallowed = false
+        ToBusDiagnosticsLog.record(
+            category = DiagCategory.MQTT,
+            message = "Riconnessione forzata stream MaTO MQTT",
+            detail = "linea=${focusedLine.ifBlank { "-" }} profilo=${activeProfileLabel()}",
+            severity = DiagSeverity.INFO,
+        )
+        scope.launch {
+            openSocket()
+        }
+    }
+
     fun start(lineCode: String, onFocusedUpdate: () -> Unit) {
         val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
         if (norm.isEmpty() || norm == "?") return
@@ -418,6 +451,12 @@ class MatoMqttLiveClient(
                                     reconnectAttempt = 0
                                     lastErrorDetail = null
                                     justConnected = true
+                                    ToBusDiagnosticsLog.record(
+                                        category = DiagCategory.MQTT,
+                                        message = "CONNACK OK [${profile.label}]",
+                                        detail = "linea=$focusedLine subProto=${profile.subProtocol ?: "none"}",
+                                        severity = DiagSeverity.OK,
+                                    )
                                     subscribeForLine(webSocket, focusedLine, includeSecondaryGroups = false)
                                     startKeepAliveLoop(webSocket, myGen)
                                     scheduleSilentTopicFallback(
@@ -428,6 +467,11 @@ class MatoMqttLiveClient(
                                     )
                                 } else {
                                     lastErrorDetail = "CONNACK ${pkt.returnCode}"
+                                    ToBusDiagnosticsLog.record(
+                                        category = DiagCategory.MQTT,
+                                        message = "CONNACK rifiutato (${pkt.returnCode}) [${profile.label}]",
+                                        severity = DiagSeverity.WARN,
+                                    )
                                     webSocket.close(1002, "CONNACK rejected")
                                 }
                             }
@@ -438,6 +482,12 @@ class MatoMqttLiveClient(
                                 if (rejected > 0) subAckRejectedCount.addAndGet(rejected)
                                 if (accepted == 0 && rejected > 0 && subAckAcceptedCount.get() == 0) {
                                     lastErrorDetail = "Topic rifiutati (SUBACK)"
+                                    ToBusDiagnosticsLog.record(
+                                        category = DiagCategory.MQTT,
+                                        message = "SUBACK: tutti i topic rifiutati ($rejected)",
+                                        detail = "linea=$focusedLine",
+                                        severity = DiagSeverity.WARN,
+                                    )
                                     onFocusedLineUpdate?.invoke()
                                 } else if (accepted > 0 && lastErrorDetail == "Topic rifiutati (SUBACK)") {
                                     lastErrorDetail = null
@@ -543,6 +593,12 @@ class MatoMqttLiveClient(
                         if (lastErrorDetail == null) {
                             lastErrorDetail = "Chiuso ($code)"
                         }
+                        ToBusDiagnosticsLog.record(
+                            category = DiagCategory.MQTT,
+                            message = "WS chiuso ($code) [${profile.label}]",
+                            detail = "raw=${rawPublishCount.get()} parsed=${parsedVehicleCount.get()} subOk=${subAckAcceptedCount.get()}/rej=${subAckRejectedCount.get()}",
+                            severity = DiagSeverity.WARN,
+                        )
                         onFocusedLineUpdate?.invoke()
                         scheduleReconnect()
                     }
@@ -561,6 +617,12 @@ class MatoMqttLiveClient(
                         val codePart = response?.code?.let { "HTTP $it · " }.orEmpty()
                         lastErrorDetail = (codePart + (t.message ?: "Errore WS")).take(44)
                         Log.d(TAG, "MaTO MQTT fail [${profile.label}]: $lastErrorDetail")
+                        ToBusDiagnosticsLog.record(
+                            category = DiagCategory.MQTT,
+                            message = "Errore WS [${profile.label}]: $lastErrorDetail",
+                            detail = "attempt=$reconnectAttempt",
+                            severity = DiagSeverity.ERROR,
+                        )
                         onFocusedLineUpdate?.invoke()
                         scheduleReconnect()
                     }
@@ -843,17 +905,18 @@ class MatoMqttLiveClient(
             val primaryVariants = linkedSetOf<String>().apply {
                 if (!base.endsWith("U")) add("${base}U")
                 add(base)
-                if (base.endsWith("/")) {
-                    val bForm = base.dropLast(1) + "B"
-                    add("${bForm}U")
-                    add(bForm)
-                } else if (base.endsWith("B") && base.dropLast(1).all { it.isDigit() }) {
-                    add(base.dropLast(1) + "/")
+                for (alt in GtfsRtProtobufParser.alternateFeedQueryCodes(base)) {
+                    if (!alt.contains(' ')) {
+                        if (!alt.endsWith("U") && !alt.endsWith("/")) add("${alt}U")
+                        add(alt)
+                    }
                 }
             }
             val allVariants = linkedSetOf<String>().apply {
                 addAll(primaryVariants)
-                if (base.all { it.isDigit() }) {
+                if (base.all { it.isDigit() } ||
+                    (base.length >= 2 && base.endsWith("B") && base.dropLast(1).all { it.isDigit() })
+                ) {
                     add("${base}F")
                     add("${base}E")
                 }

@@ -78,20 +78,30 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -108,13 +118,17 @@ import com.example.data.model.BusVehicle
 import com.example.data.model.CameraState
 import com.example.data.model.DataSourceMode
 import com.example.data.model.FavoriteStop
+import com.example.data.model.GttDataOutageReport
 import com.example.data.model.GttFleetAnalyzer
+import com.example.data.model.GttOutageKind
+import com.example.data.model.ServiceAlertCategory
 import com.example.data.model.ServiceAlertInfo
 import com.example.data.model.StopArrival
 import com.example.data.model.TransitStop
 import com.example.data.model.VehicleFreshness
 import com.example.data.model.VehicleHealthAssessment
 import com.example.data.model.formatTurinLabel
+import com.example.data.model.highestAlertCategory
 import com.example.data.model.shortTurinPlaceName
 import com.example.ui.components.InteractiveTurinMap
 import com.example.ui.glass.AccentIconBadge
@@ -136,8 +150,10 @@ import com.example.ui.glass.rememberGlassShimmerBrush
 import com.example.ui.theme.AccentCyan
 import com.example.ui.theme.AccentEmerald
 import com.example.ui.theme.AccentGold
+import com.example.ui.theme.AccentOrange
 import com.example.ui.theme.AccentRed
 import com.example.ui.theme.DarkInkOnAccent
+import com.example.ui.theme.visualStyle
 import com.example.ui.theme.GlassRowBorder
 import com.example.ui.theme.GlassRowFill
 import com.example.ui.theme.LightMapScrimBottom
@@ -189,11 +205,26 @@ fun MapScreen(
     onFocusArrivalBus: (StopArrival, Int) -> Unit,
     onSelectLine: (String) -> Unit,
     onSelectDataSourceMode: (DataSourceMode) -> Unit = {},
+    onDismissGttOutage: () -> Unit = {},
+    openAlertsRequestSeq: Long = 0L,
+    onAlertsDialogOpened: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val view = LocalView.current
     var showAlertsDialog by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(openAlertsRequestSeq) {
+        if (openAlertsRequestSeq > 0L) {
+            showAlertsDialog = true
+        }
+    }
+
+    LaunchedEffect(showAlertsDialog) {
+        if (showAlertsDialog) {
+            onAlertsDialogOpened()
+        }
+    }
 
     val latestSelectedVehicleId by rememberUpdatedState(uiState.selectedVehicleId)
     val latestSelectedStopId by rememberUpdatedState(uiState.selectedStop?.stopId)
@@ -539,8 +570,11 @@ fun MapScreen(
                 ) {
                     // Glowing Glass GTT Alerts Button (optional via Settings)
                     if (uiState.settings.showServiceAlerts) {
+                        val highestLineAlertCategory = remember(uiState.lineAlerts) {
+                            uiState.lineAlerts.highestAlertCategory()
+                        }
                         GttAlertsGlassButton(
-                            hasLineAlert = uiState.lineAlerts.isNotEmpty(),
+                            lineAlertCategory = highestLineAlertCategory,
                             hasGeneralAlerts = uiState.allAlerts.isNotEmpty(),
                             badgeCount = if (uiState.lineAlerts.isNotEmpty()) {
                                 uiState.lineAlerts.size
@@ -759,9 +793,117 @@ fun MapScreen(
             }
         }
 
+        val visibleOutage: GttDataOutageReport? = uiState.gttDataOutage?.takeUnless { uiState.isGttOutageDismissed }
+
+        val outageBannerContent: @Composable (Modifier) -> Unit = { cardModifier ->
+            AnimatedVisibility(
+                visible = visibleOutage != null,
+                enter = if (isWideScreen) {
+                    fadeIn() + slideInHorizontally(animationSpec = glassSpring()) { it / 2 }
+                } else {
+                    fadeIn() + slideInVertically { it / 2 }
+                },
+                exit = if (isWideScreen) {
+                    fadeOut() + slideOutHorizontally { it / 2 }
+                } else {
+                    fadeOut() + slideOutVertically { it / 2 }
+                },
+            ) {
+                val report = visibleOutage ?: return@AnimatedVisibility
+                val accent = when (report.kind) {
+                    GttOutageKind.SERVERS_UNREACHABLE -> AccentRed
+                    GttOutageKind.CITYWIDE_FROZEN_FLEET -> AccentOrange
+                    GttOutageKind.CITYWIDE_STALE_FEED -> AccentGold
+                }
+                LiquidGlassOverlaySurface(
+                    isLightBasemap = isLightBasemap,
+                    accentTint = accent,
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = cardModifier.testTag("gtt_outage_banner"),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 14.dp, end = 8.dp, top = 10.dp, bottom = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = ToBusIcons.WarningAmber,
+                                contentDescription = "Avviso disservizio dati GTT",
+                                tint = accent,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = report.title,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = TextHero,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (report.isSimulated) {
+                                Box(
+                                    modifier = Modifier
+                                        .background(AccentGold.copy(alpha = 0.22f), RoundedCornerShape(999.dp))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                                ) {
+                                    Text(
+                                        text = "TEST",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = AccentGold,
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            GlassCircleIconButton(
+                                icon = Icons.Rounded.Close,
+                                contentDescription = "Nascondi avviso disservizio GTT",
+                                onClick = onDismissGttOutage,
+                                modifier = Modifier.testTag("dismiss_gtt_outage_button"),
+                            )
+                        }
+                        Text(
+                            text = report.detail,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextBody,
+                            modifier = Modifier.padding(end = 6.dp),
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = "Rete dispositivo verificata · problema lato server GTT",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSubtitle,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(
+                                onClick = onRefresh,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("retry_gtt_outage_button"),
+                            ) {
+                                Text("Riprova", color = AccentCyan)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         val errorCardContent: @Composable (Modifier) -> Unit = { cardModifier ->
             AnimatedVisibility(
-                visible = uiState.errorMessage != null,
+                visible = uiState.errorMessage != null && visibleOutage == null,
                 enter = if (isWideScreen) {
                     fadeIn() + slideInHorizontally(animationSpec = glassSpring()) { it / 2 }
                 } else {
@@ -965,7 +1107,10 @@ fun MapScreen(
                     }
                 }
             } else if (uiState.settings.hasSelectedLine && !uiState.isLoadingFeed && uiState.errorMessage == null) {
-                val isFixedMato = uiState.settings.dataSourceMode == DataSourceMode.MATO_LIVE
+                val isNonLiveLine = com.example.data.network.GtfsRtProtobufParser.isNonLiveTrackedLine(
+                    uiState.settings.selectedLine,
+                )
+                val isFixedMato = !isNonLiveLine && uiState.settings.dataSourceMode == DataSourceMode.MATO_LIVE
                 val matoStatusDetail = if (isFixedMato) {
                     uiState.sourceStatuses.firstOrNull { it.id == "mato_live" }?.detail
                 } else {
@@ -982,13 +1127,15 @@ fun MapScreen(
                         Icon(
                             imageVector = ToBusIcons.DirectionsBus,
                             contentDescription = null,
-                            tint = AccentGold,
+                            tint = if (isNonLiveLine) AccentCyan else AccentGold,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Column(modifier = Modifier.weight(1f, fill = false)) {
                             Text(
                                 text = when {
+                                    isNonLiveLine ->
+                                        "La linea ${uiState.settings.selectedLine} non viene tracciata in tempo reale"
                                     uiState.settings.hideInactiveOnMap && uiState.lineVehicles.isNotEmpty() ->
                                         "${uiState.lineVehicles.size} mezzi in deposito o fermi nascosti"
                                     isFixedMato ->
@@ -999,9 +1146,14 @@ fun MapScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = TextBody,
                             )
-                            if (!matoStatusDetail.isNullOrBlank()) {
+                            val secondaryLine = when {
+                                isNonLiveLine -> "Fermate, arrivi stimati e avvisi GTT disponibili"
+                                !matoStatusDetail.isNullOrBlank() -> matoStatusDetail
+                                else -> null
+                            }
+                            if (secondaryLine != null) {
                                 Text(
-                                    text = matoStatusDetail,
+                                    text = secondaryLine,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = TextBody.copy(alpha = 0.75f),
                                     maxLines = 2,
@@ -1046,6 +1198,7 @@ fun MapScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 horizontalAlignment = Alignment.End,
             ) {
+                outageBannerContent(Modifier.fillMaxWidth())
                 errorCardContent(Modifier.fillMaxWidth())
                 inspectorCardSlot(Modifier.fillMaxWidth(), 356.dp)
             }
@@ -1075,6 +1228,7 @@ fun MapScreen(
                     .padding(horizontal = 16.dp)
                     .widthIn(max = 560.dp)
                     .fillMaxWidth()
+                outageBannerContent(compactCardModifier)
                 errorCardContent(compactCardModifier)
                 inspectorCardSlot(compactCardModifier, 332.dp)
                 AnimatedVisibility(
@@ -1469,38 +1623,35 @@ private fun ActiveBusDirectionGlassPill(
 
 @Composable
 private fun GttAlertsGlassButton(
-    hasLineAlert: Boolean,
+    lineAlertCategory: ServiceAlertCategory?,
     hasGeneralAlerts: Boolean,
     badgeCount: Int,
     isLightBasemap: Boolean = false,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val hasLineAlert = lineAlertCategory != null
+    val lineStyle = remember(lineAlertCategory) { lineAlertCategory?.visualStyle() }
     val interaction = remember { MutableInteractionSource() }
-    val bgBrush = remember(hasLineAlert, hasGeneralAlerts, isLightBasemap) {
+    val bgBrush = remember(lineStyle, isLightBasemap) {
         val neutralFill = if (isLightBasemap) OverlayPillLightMapFill else OverlayPillFill
-        when {
-            hasLineAlert -> Brush.verticalGradient(
-                listOf(Color(0xEE5C1420), Color(0xEB2F0A11)),
-            )
-            hasGeneralAlerts -> Brush.verticalGradient(
-                listOf(Color(0xEE4A3712), Color(0xEB241B08)),
-            )
-            else -> Brush.verticalGradient(
-                listOf(neutralFill, neutralFill),
-            )
+        if (lineStyle != null) {
+            Brush.verticalGradient(listOf(lineStyle.bellGradientTop, lineStyle.bellGradientBottom))
+        } else {
+            // Keep general (non-current-line) alerts calm smoked glass so active-line alerts stand out unmistakably.
+            Brush.verticalGradient(listOf(neutralFill, neutralFill))
         }
     }
-    val borderBrush = remember(hasLineAlert, hasGeneralAlerts) {
+    val borderBrush = remember(lineStyle, hasGeneralAlerts) {
         when {
-            hasLineAlert -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), AccentRed))
-            hasGeneralAlerts -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), AccentGold.copy(alpha = 0.80f)))
+            lineStyle != null -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.45f), lineStyle.accent))
+            hasGeneralAlerts -> liquidGlassRimBrush(topAlpha = 0.56f, midAlpha = 0.22f, bottomAlpha = 0.36f)
             else -> liquidGlassRimBrush(topAlpha = 0.46f, midAlpha = 0.15f, bottomAlpha = 0.26f)
         }
     }
     val iconTint = when {
-        hasLineAlert -> Color(0xFFFF7A7A)
-        hasGeneralAlerts -> AccentGold
+        lineStyle != null -> lineStyle.softText
+        hasGeneralAlerts -> TextPrimary.copy(alpha = 0.90f)
         else -> TextSubtitle
     }
 
@@ -1516,7 +1667,7 @@ private fun GttAlertsGlassButton(
                 .size(44.dp)
                 .background(bgBrush, CircleShape)
                 .border(
-                    width = if (hasLineAlert || hasGeneralAlerts) 1.4.dp else 1.dp,
+                    width = if (hasLineAlert) 1.5.dp else 1.dp,
                     brush = borderBrush,
                     shape = CircleShape,
                 ),
@@ -1535,20 +1686,25 @@ private fun GttAlertsGlassButton(
         }
 
         if (hasLineAlert || hasGeneralAlerts) {
-            val dotColor = if (hasLineAlert) AccentRed else AccentGold
+            val dotColor = lineStyle?.accent ?: Color(0xFF334155)
+            val badgeTextColor = lineStyle?.onAccentInk ?: Color(0xFFE2E8F0)
             Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(top = 2.dp, end = 2.dp)
                     .background(dotColor, CircleShape)
-                    .border(1.dp, Color(0xFF0A0A0E), CircleShape)
+                    .border(
+                        width = 1.dp,
+                        color = if (hasLineAlert) Color(0xFF0A0A0E) else Color(0x66FFFFFF),
+                        shape = CircleShape,
+                    )
                     .padding(horizontal = if (badgeCount > 9) 4.dp else 5.dp, vertical = 1.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
                     text = if (badgeCount > 9) "9+" else "$badgeCount",
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (hasLineAlert) Color.White else DarkInkOnAccent,
+                    color = badgeTextColor,
                 )
             }
         }
@@ -1780,15 +1936,26 @@ private fun GttAlertsDialog(
     onDismiss: () -> Unit,
 ) {
     val nowSec = remember { System.currentTimeMillis() / 1000L }
-    val lineAlertIds = remember(lineAlerts) { lineAlerts.map { it.id }.toHashSet() }
-    val otherAlerts = remember(allAlerts, lineAlertIds) {
-        allAlerts.filterNot { it.id in lineAlertIds }
+    val sortedLineAlerts = remember(lineAlerts, nowSec) {
+        lineAlerts.sortedWith(
+            compareByDescending<ServiceAlertInfo> { it.isActiveNow(nowSec) }
+                .thenByDescending { it.classifyCategory().priority },
+        )
     }
-    val headerAccent = when {
-        lineAlerts.isNotEmpty() -> AccentRed
-        allAlerts.isNotEmpty() -> AccentGold
-        else -> AccentCyan
+    val lineAlertIds = remember(sortedLineAlerts) { sortedLineAlerts.map { it.id }.toHashSet() }
+    val otherAlerts = remember(allAlerts, lineAlertIds, nowSec) {
+        allAlerts
+            .filterNot { it.id in lineAlertIds }
+            .sortedWith(
+                compareByDescending<ServiceAlertInfo> { it.isActiveNow(nowSec) }
+                    .thenByDescending { it.classifyCategory().priority },
+            )
     }
+    val highestLineStyle = remember(sortedLineAlerts) {
+        sortedLineAlerts.highestAlertCategory()?.visualStyle()
+    }
+    val headerAccent = highestLineStyle?.accent ?: AccentCyan
+    val headerSubtitleColor = highestLineStyle?.softText ?: TextSubtitle
 
     GlassModalDialog(
         onDismissRequest = onDismiss,
@@ -1818,12 +1985,12 @@ private fun GttAlertsDialog(
                 )
                 Text(
                     text = when {
-                        lineAlerts.isNotEmpty() -> "${lineAlerts.size} per Linea $selectedLine · ${allAlerts.size} recenti"
-                        allAlerts.isNotEmpty() -> "${allAlerts.size} eventi, lavori e deviazioni recenti"
+                        sortedLineAlerts.isNotEmpty() -> "${sortedLineAlerts.size} per Linea $selectedLine · ${allAlerts.size} recenti"
+                        allAlerts.isNotEmpty() -> "${allAlerts.size} eventi, lavori e avvisi recenti"
                         else -> "Nessun avviso recente o nei prossimi 7 gg"
                     },
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (lineAlerts.isNotEmpty()) Color(0xFFFF8A8A) else TextSubtitle,
+                    color = headerSubtitleColor,
                 )
             }
             GlassCircleIconButton(
@@ -1858,15 +2025,41 @@ private fun GttAlertsDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                if (lineAlerts.isNotEmpty()) {
-                    Text(
-                        text = "LINEA $selectedLine",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color(0xFFFF8A8A),
-                    )
-                    lineAlerts.forEach { alert ->
+                if (sortedLineAlerts.isNotEmpty()) {
+                    val lineSectionColor = highestLineStyle?.softText ?: AccentCyan
+                    val lineSectionAccent = highestLineStyle?.accent ?: AccentCyan
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .background(lineSectionAccent, CircleShape),
+                        )
+                        Text(
+                            text = "LINEA $selectedLine",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = lineSectionColor,
+                        )
+                        Box(
+                            modifier = Modifier
+                                .background(lineSectionAccent.copy(alpha = 0.18f), RoundedCornerShape(999.dp))
+                                .border(1.dp, lineSectionAccent.copy(alpha = 0.45f), RoundedCornerShape(999.dp))
+                                .padding(horizontal = 7.dp, vertical = 1.dp),
+                        ) {
+                            Text(
+                                text = "Linea attiva",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = lineSectionColor,
+                            )
+                        }
+                    }
+                    sortedLineAlerts.forEach { alert ->
                         AlertItemCard(
                             alert = alert,
+                            selectedLine = selectedLine,
                             nowSec = nowSec,
                             highlightForLine = true,
                         )
@@ -1874,17 +2067,18 @@ private fun GttAlertsDialog(
                 }
 
                 if (otherAlerts.isNotEmpty()) {
-                    if (lineAlerts.isNotEmpty()) {
+                    if (sortedLineAlerts.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = "ALTRI AVVISI ATTUALI",
                             style = MaterialTheme.typography.labelMedium,
-                            color = AccentGold,
+                            color = TextSubtitle,
                         )
                     }
                     otherAlerts.forEach { alert ->
                         AlertItemCard(
                             alert = alert,
+                            selectedLine = selectedLine,
                             nowSec = nowSec,
                             highlightForLine = false,
                         )
@@ -1898,67 +2092,123 @@ private fun GttAlertsDialog(
 @Composable
 private fun AlertItemCard(
     alert: ServiceAlertInfo,
+    selectedLine: String,
     nowSec: Long,
     highlightForLine: Boolean,
 ) {
-    val bgColor = if (highlightForLine) Color(0x28F87171) else GlassRowFill
-    val borderColor = if (highlightForLine) AccentRed.copy(alpha = 0.60f) else GlassRowBorder
-    val chipAccent = if (highlightForLine) AccentRed else AccentGold
+    val category = remember(alert) { alert.classifyCategory() }
+    val style = remember(category) { category.visualStyle() }
+    val cardShape = remember { RoundedCornerShape(16.dp) }
+    val bgColor = if (highlightForLine) style.accent.copy(alpha = 0.16f) else GlassRowFill
+    val borderColor = if (highlightForLine) style.accent.copy(alpha = 0.56f) else GlassRowBorder
     val validity = remember(alert, nowSec) { alert.validityLabel(nowSec) }
     val activeNow = remember(alert, nowSec) { alert.isActiveNow(nowSec) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(bgColor, RoundedCornerShape(16.dp))
-            .border(1.dp, borderColor, RoundedCornerShape(16.dp))
-            .padding(12.dp),
+            .clip(cardShape)
+            .background(bgColor, cardShape)
+            .drawBehind {
+                val barWidth = (if (highlightForLine) 4.dp else 2.5.dp).toPx()
+                drawRect(
+                    color = style.accent.copy(alpha = if (highlightForLine) 0.95f else 0.72f),
+                    size = androidx.compose.ui.geometry.Size(width = barWidth, height = size.height),
+                )
+            }
+            .border(1.dp, borderColor, cardShape)
+            .padding(start = 15.dp, end = 12.dp, top = 11.dp, bottom = 11.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        if (alert.affectedLines.isNotEmpty() || validity != null) {
+        // Row 1: Semantic category pill + validity status
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .background(
+                        style.accent.copy(alpha = if (highlightForLine) 0.24f else 0.16f),
+                        RoundedCornerShape(999.dp),
+                    )
+                    .border(
+                        1.dp,
+                        style.accent.copy(alpha = if (highlightForLine) 0.58f else 0.42f),
+                        RoundedCornerShape(999.dp),
+                    )
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                if (validity != null) {
-                    val vColor = if (activeNow) AccentEmerald else AccentCyan
+                Icon(
+                    imageVector = style.icon,
+                    contentDescription = null,
+                    tint = style.softText,
+                    modifier = Modifier.size(12.dp),
+                )
+                Text(
+                    text = category.label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = style.softText,
+                )
+            }
+
+            if (validity != null) {
+                val vColor = if (activeNow) TextPrimary.copy(alpha = 0.88f) else TextSubtitle
+                Box(
+                    modifier = Modifier
+                        .background(Color(0x1CFFFFFF), RoundedCornerShape(999.dp))
+                        .border(1.dp, Color(0x2EFFFFFF), RoundedCornerShape(999.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                ) {
+                    Text(
+                        text = validity,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = vColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+
+        // Row 2: Affected line chips (highlighting the currently viewed line clearly)
+        if (alert.affectedLines.isNotEmpty()) {
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                items(
+                    alert.affectedLines.toList().sortedWith(
+                        compareByDescending<String> { it.equals(selectedLine, ignoreCase = true) }
+                            .thenBy { it },
+                    ),
+                ) { line ->
+                    val isSelectedLineChip = highlightForLine && line.equals(selectedLine, ignoreCase = true)
                     Box(
                         modifier = Modifier
-                            .background(vColor.copy(alpha = 0.16f), RoundedCornerShape(999.dp))
-                            .border(1.dp, vColor.copy(alpha = 0.45f), RoundedCornerShape(999.dp))
+                            .background(
+                                if (isSelectedLineChip) style.accent else Color(0x18FFFFFF),
+                                RoundedCornerShape(999.dp),
+                            )
+                            .border(
+                                1.dp,
+                                if (isSelectedLineChip) style.accent else Color(0x30FFFFFF),
+                                RoundedCornerShape(999.dp),
+                            )
                             .padding(horizontal = 8.dp, vertical = 2.dp),
                     ) {
                         Text(
-                            text = validity,
+                            text = "Linea $line",
                             style = MaterialTheme.typography.labelSmall,
-                            color = vColor,
+                            color = if (isSelectedLineChip) style.onAccentInk else TextSubtitle,
                         )
-                    }
-                }
-                if (alert.affectedLines.isNotEmpty()) {
-                    LazyRow(
-                        modifier = Modifier.weight(1f),
-                        horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    ) {
-                        items(alert.affectedLines.toList().sorted()) { line ->
-                            Box(
-                                modifier = Modifier
-                                    .background(chipAccent.copy(alpha = 0.20f), RoundedCornerShape(999.dp))
-                                    .border(1.dp, chipAccent.copy(alpha = 0.48f), RoundedCornerShape(999.dp))
-                                    .padding(horizontal = 8.dp, vertical = 2.dp),
-                            ) {
-                                Text(
-                                    text = "Linea $line",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (highlightForLine) Color(0xFFFFB4B4) else AccentGold,
-                                )
-                            }
-                        }
                     }
                 }
             }
         }
+
         if (alert.headerText.isNotBlank()) {
             Text(
                 text = alert.headerText,
@@ -2512,166 +2762,308 @@ private fun SelectedStopArrivalsCard(
                 }
 
                 else -> {
-                    Column(
+                    val scrollState = rememberScrollState()
+                    val scrollScope = rememberCoroutineScope()
+                    LaunchedEffect(stop.displayCode) {
+                        scrollState.scrollTo(0)
+                    }
+                    val isScrollable by remember(scrollState) {
+                        derivedStateOf { scrollState.maxValue > 0 }
+                    }
+                    val canScrollDown by remember(scrollState) {
+                        derivedStateOf { scrollState.canScrollForward }
+                    }
+                    val canScrollUp by remember(scrollState) {
+                        derivedStateOf { scrollState.canScrollBackward }
+                    }
+                    val chevronTransition = rememberInfiniteTransition(label = "stop_scroll_chevron")
+                    val chevronBobDp by chevronTransition.animateFloat(
+                        initialValue = -1.2f,
+                        targetValue = 1.6f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 1250, easing = FastOutSlowInEasing),
+                            repeatMode = RepeatMode.Reverse,
+                        ),
+                        label = "stop_scroll_chevron_bob",
+                    )
+
+                    Text(
+                        text = "Tocca un arrivo Live · mirino = posizione GPS attiva",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSubtitle,
+                    )
+
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(max = maxScrollHeight)
-                            .verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text(
-                            text = "Tocca un arrivo Live · mirino = posizione GPS attiva",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextSubtitle,
-                        )
-                        groupedLines.forEach { (lineCode, lineArrivals) ->
-                            val isTrackedLine = lineCode.equals(selectedLine, ignoreCase = true)
-                            val headsign = lineArrivals
-                                .firstOrNull { !com.example.data.model.isGenericDirectionLabel(it.headsign) }
-                                ?.headsign
-                                ?.let(::shortTurinPlaceName)
-                                ?: (if (isTrackedLine) shortTerminus else null)
-                                ?: lineArrivals
-                                    .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
-                                    ?.headsign
-                                    ?.let(::shortTurinPlaceName)
-
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(if (isTrackedLine) Color(0x1EFFFFFF) else GlassRowFill, RoundedCornerShape(16.dp))
-                                    .border(
-                                        width = 1.dp,
-                                        color = if (isTrackedLine) badgeAccent.copy(alpha = 0.45f) else GlassRowBorder,
-                                        shape = RoundedCornerShape(16.dp),
+                            .drawWithContent {
+                                drawContent()
+                                val maxScroll = scrollState.maxValue
+                                if (maxScroll > 0 && size.height > 24f) {
+                                    val barWidth = 2.75.dp.toPx()
+                                    val vPad = 6.dp.toPx()
+                                    val trackHeight = (size.height - vPad * 2f).coerceAtLeast(16f)
+                                    val totalContentHeight = size.height + maxScroll.toFloat()
+                                    val thumbFraction = (size.height / totalContentHeight).coerceIn(0.18f, 0.82f)
+                                    val thumbHeight = (trackHeight * thumbFraction)
+                                        .coerceAtLeast(24.dp.toPx())
+                                        .coerceAtMost(trackHeight)
+                                    val progress = (scrollState.value.toFloat() / maxScroll.toFloat()).coerceIn(0f, 1f)
+                                    val thumbY = vPad + (trackHeight - thumbHeight) * progress
+                                    val barX = size.width - barWidth
+                                    val radius = CornerRadius(barWidth / 2f, barWidth / 2f)
+                                    drawRoundRect(
+                                        color = Color.White.copy(alpha = 0.10f),
+                                        topLeft = Offset(barX, vPad),
+                                        size = Size(barWidth, trackHeight),
+                                        cornerRadius = radius,
                                     )
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                // Line header row
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .background(
-                                                color = if (isTrackedLine) badgeAccent else Color(0x28FFFFFF),
-                                                shape = RoundedCornerShape(999.dp),
-                                            )
-                                            .padding(horizontal = 10.dp, vertical = 3.dp),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text(
-                                            text = lineCode,
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = if (isTrackedLine) DarkInkOnAccent else TextPrimary,
+                                    drawRoundRect(
+                                        color = badgeAccent.copy(alpha = 0.72f),
+                                        topLeft = Offset(barX, thumbY),
+                                        size = Size(barWidth, thumbHeight),
+                                        cornerRadius = radius,
+                                    )
+                                }
+                            },
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
+                                .drawWithContent {
+                                    drawContent()
+                                    val topFadePx = 18.dp.toPx().coerceAtMost(size.height * 0.25f)
+                                    val bottomFadePx = 38.dp.toPx().coerceAtMost(size.height * 0.35f)
+                                    if (canScrollUp && topFadePx > 0f) {
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                colors = listOf(Color.Transparent, Color.Black),
+                                                startY = 0f,
+                                                endY = topFadePx,
+                                            ),
+                                            topLeft = Offset.Zero,
+                                            size = Size(size.width, topFadePx),
+                                            blendMode = BlendMode.DstIn,
                                         )
                                     }
-                                    if (!headsign.isNullOrBlank()) {
-                                        Text(
-                                            text = "→ $headsign",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            color = TextBody,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            modifier = Modifier.weight(1f),
+                                    if (canScrollDown && bottomFadePx > 0f) {
+                                        drawRect(
+                                            brush = Brush.verticalGradient(
+                                                colors = listOf(Color.Black, Color.Transparent),
+                                                startY = size.height - bottomFadePx,
+                                                endY = size.height,
+                                            ),
+                                            topLeft = Offset(0f, size.height - bottomFadePx),
+                                            size = Size(size.width, bottomFadePx),
+                                            blendMode = BlendMode.DstIn,
                                         )
                                     }
                                 }
+                                .verticalScroll(scrollState)
+                                .padding(
+                                    end = if (isScrollable) 8.dp else 0.dp,
+                                    bottom = if (isScrollable) 26.dp else 0.dp,
+                                ),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            groupedLines.forEach { (lineCode, lineArrivals) ->
+                                val isTrackedLine = lineCode.equals(selectedLine, ignoreCase = true)
+                                val headsign = lineArrivals
+                                    .firstOrNull { !com.example.data.model.isGenericDirectionLabel(it.headsign) }
+                                    ?.headsign
+                                    ?.let(::shortTurinPlaceName)
+                                    ?: (if (isTrackedLine) shortTerminus else null)
+                                    ?: lineArrivals
+                                        .firstOrNull { it.headsign.isNotBlank() && !it.headsign.startsWith("Linea ", true) }
+                                        ?.headsign
+                                        ?.let(::shortTurinPlaceName)
 
-                                // Horizontal clickable chips: Minutes + Exact Clock + Live / Stimato -> tap to locate bus!
-                                Row(
+                                Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                        .background(if (isTrackedLine) Color(0x1EFFFFFF) else GlassRowFill, RoundedCornerShape(16.dp))
+                                        .border(
+                                            width = 1.dp,
+                                            color = if (isTrackedLine) badgeAccent.copy(alpha = 0.45f) else GlassRowBorder,
+                                            shape = RoundedCornerShape(16.dp),
+                                        )
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    lineArrivals.forEachIndexed { indexInLine, arrival ->
-                                        val mins = arrival.minutesUntil(nowMillis).coerceAtLeast(0)
-                                        val countdownText = when {
-                                            mins <= 0 -> "Ora"
-                                            mins == 1 -> "1 min"
-                                            else -> "$mins min"
-                                        }
-                                        val clockText = remember(arrival.arrivalEpochSeconds, clockFormat) {
-                                            clockFormat.format(Date(arrival.arrivalEpochSeconds * 1000L))
-                                        }
-                                        val chipBg = if (arrival.isRealtime) {
-                                            AccentEmerald.copy(alpha = 0.14f)
-                                        } else {
-                                            Color(0x14FFFFFF)
-                                        }
-                                        val chipBorder = if (arrival.isRealtime) {
-                                            AccentEmerald.copy(alpha = 0.48f)
-                                        } else {
-                                            GlassRowBorder
-                                        }
-                                        val chipInteraction = remember { MutableInteractionSource() }
-
-                                        Column(
+                                    // Line header row
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Box(
                                             modifier = Modifier
-                                                .heightIn(min = 48.dp)
-                                                .glassInteractive(chipInteraction) {
-                                                    onArrivalTap(arrival, indexInLine)
-                                                }
-                                                .background(chipBg, RoundedCornerShape(12.dp))
-                                                .border(1.dp, chipBorder, RoundedCornerShape(12.dp))
-                                                .padding(horizontal = 10.dp, vertical = 7.dp)
-                                                .testTag("arrival_chip_${lineCode}_$indexInLine"),
-                                            verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
+                                                .background(
+                                                    color = if (isTrackedLine) badgeAccent else Color(0x28FFFFFF),
+                                                    shape = RoundedCornerShape(999.dp),
+                                                )
+                                                .padding(horizontal = 10.dp, vertical = 3.dp),
+                                            contentAlignment = Alignment.Center,
                                         ) {
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                            ) {
-                                                Text(
-                                                    text = countdownText,
-                                                    style = MaterialTheme.typography.labelLarge,
-                                                    color = if (mins <= 2) AccentEmerald else TextPrimary,
-                                                )
-                                                Text(
-                                                    text = clockText,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = TextSubtitle,
-                                                )
+                                            Text(
+                                                text = lineCode,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = if (isTrackedLine) DarkInkOnAccent else TextPrimary,
+                                            )
+                                        }
+                                        if (!headsign.isNullOrBlank()) {
+                                            Text(
+                                                text = "→ $headsign",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = TextBody,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                        }
+                                    }
+
+                                    // Horizontal clickable chips: Minutes + Exact Clock + Live / Stimato -> tap to locate bus!
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .horizontalScroll(rememberScrollState()),
+                                        horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                    ) {
+                                        lineArrivals.forEachIndexed { indexInLine, arrival ->
+                                            val mins = arrival.minutesUntil(nowMillis).coerceAtLeast(0)
+                                            val countdownText = when {
+                                                mins <= 0 -> "Ora"
+                                                mins == 1 -> "1 min"
+                                                else -> "$mins min"
                                             }
-                                            val linkedVid = arrival.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
-                                            val canLocateLive = arrival.isRealtime && linkedVid != null
-                                            val statusLabel = when {
-                                                arrival.isRealtime && linkedVid != null -> "Live · #$linkedVid"
-                                                arrival.isRealtime -> "Live"
-                                                else -> "Stimato"
+                                            val clockText = remember(arrival.arrivalEpochSeconds, clockFormat) {
+                                                clockFormat.format(Date(arrival.arrivalEpochSeconds * 1000L))
                                             }
-                                            Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                            val chipBg = if (arrival.isRealtime) {
+                                                AccentEmerald.copy(alpha = 0.14f)
+                                            } else {
+                                                Color(0x14FFFFFF)
+                                            }
+                                            val chipBorder = if (arrival.isRealtime) {
+                                                AccentEmerald.copy(alpha = 0.48f)
+                                            } else {
+                                                GlassRowBorder
+                                            }
+                                            val chipInteraction = remember { MutableInteractionSource() }
+
+                                            Column(
+                                                modifier = Modifier
+                                                    .heightIn(min = 48.dp)
+                                                    .glassInteractive(chipInteraction) {
+                                                        onArrivalTap(arrival, indexInLine)
+                                                    }
+                                                    .background(chipBg, RoundedCornerShape(12.dp))
+                                                    .border(1.dp, chipBorder, RoundedCornerShape(12.dp))
+                                                    .padding(horizontal = 10.dp, vertical = 7.dp)
+                                                    .testTag("arrival_chip_${lineCode}_$indexInLine"),
+                                                verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
                                             ) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .size(5.dp)
-                                                        .background(
-                                                            color = if (arrival.isRealtime) AccentEmerald else TextSubtitle,
-                                                            shape = CircleShape,
-                                                        ),
-                                                )
-                                                Text(
-                                                    text = statusLabel,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = if (arrival.isRealtime) AccentEmerald else TextSubtitle,
-                                                )
-                                                if (canLocateLive) {
-                                                    Icon(
-                                                        imageVector = ToBusIcons.MyLocation,
-                                                        contentDescription = "Mostra pullman sulla mappa",
-                                                        tint = AccentEmerald.copy(alpha = 0.85f),
-                                                        modifier = Modifier.size(11.dp),
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                                ) {
+                                                    Text(
+                                                        text = countdownText,
+                                                        style = MaterialTheme.typography.labelLarge,
+                                                        color = if (mins <= 2) AccentEmerald else TextPrimary,
                                                     )
+                                                    Text(
+                                                        text = clockText,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = TextSubtitle,
+                                                    )
+                                                }
+                                                val linkedVid = arrival.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
+                                                val canLocateLive = arrival.isRealtime && linkedVid != null
+                                                val statusLabel = when {
+                                                    arrival.isRealtime && linkedVid != null -> "Live · #$linkedVid"
+                                                    arrival.isRealtime -> "Live"
+                                                    else -> "Stimato"
+                                                }
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(5.dp)
+                                                            .background(
+                                                                color = if (arrival.isRealtime) AccentEmerald else TextSubtitle,
+                                                                shape = CircleShape,
+                                                            ),
+                                                    )
+                                                    Text(
+                                                        text = statusLabel,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = if (arrival.isRealtime) AccentEmerald else TextSubtitle,
+                                                    )
+                                                    if (canLocateLive) {
+                                                        Icon(
+                                                            imageVector = ToBusIcons.MyLocation,
+                                                            contentDescription = "Mostra pullman sulla mappa",
+                                                            tint = AccentEmerald.copy(alpha = 0.85f),
+                                                            modifier = Modifier.size(11.dp),
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        // Minimal floating frosted chevron micro-pill (zero text; auto-hides at bottom)
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = canScrollDown,
+                            enter = fadeIn(tween(180)),
+                            exit = fadeOut(tween(150)),
+                            modifier = Modifier.align(Alignment.BottomCenter),
+                        ) {
+                            val scrollMoreInteraction = remember { MutableInteractionSource() }
+                            val view = LocalView.current
+                            Box(
+                                modifier = Modifier
+                                    .size(width = 56.dp, height = 48.dp)
+                                    .clickable(
+                                        interactionSource = scrollMoreInteraction,
+                                        indication = null,
+                                    ) {
+                                        performLightHaptic(view, LightHapticKind.SWITCH_STOP)
+                                        scrollScope.launch {
+                                            val nextTarget = (scrollState.value + 240)
+                                                .coerceAtMost(scrollState.maxValue)
+                                            scrollState.animateScrollTo(nextTarget)
+                                        }
+                                    }
+                                    .testTag("stop_arrivals_scroll_more_hint"),
+                                contentAlignment = Alignment.BottomCenter,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(width = 32.dp, height = 17.dp)
+                                        .background(Color(0xD8141A26), CircleShape)
+                                        .border(1.dp, badgeAccent.copy(alpha = 0.45f), CircleShape),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.KeyboardArrowDown,
+                                        contentDescription = stringResource(R.string.cd_scroll_more_lines),
+                                        tint = badgeAccent,
+                                        modifier = Modifier
+                                            .size(15.dp)
+                                            .graphicsLayer {
+                                                translationY = chevronBobDp.dp.toPx()
+                                            },
+                                    )
                                 }
                             }
                         }
