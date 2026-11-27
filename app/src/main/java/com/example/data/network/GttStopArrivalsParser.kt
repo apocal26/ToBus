@@ -10,6 +10,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.Calendar
 import java.util.TimeZone
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 /**
@@ -23,6 +24,10 @@ internal object GttStopArrivalsParser {
 
     private const val TAG = "GttStopArrivalsParser"
     const val STOP_ARRIVAL_HORIZON_SEC = 50L * 60L
+
+    private val preferredMatoEndpointIdx = AtomicInteger(0)
+    private val preferredMatoPrefixIdx = AtomicInteger(0)
+    private val preferredMatoQueryIdx = AtomicInteger(0)
 
     /**
      * Queries GTT Official AVM Palina API (`palina.getTransitiOld`) trying stop code and stop ID.
@@ -77,11 +82,22 @@ internal object GttStopArrivalsParser {
             .map { it.trim().substringAfterLast(":") }
             .filter { it.isNotEmpty() }
             .distinct()
-        val candidateIds = buildList {
-            for (code in rawIds) add("gtt:$code")
-            for (code in rawIds) add("GTT:$code")
-            for (code in rawIds) add(code)
-        }.distinct()
+        val prefixTemplates = listOf(
+            { code: String -> "gtt:$code" },
+            { code: String -> "GTT:$code" },
+            { code: String -> code },
+        )
+        val prefPrefix = preferredMatoPrefixIdx.get().coerceIn(0, prefixTemplates.lastIndex)
+        val orderedPrefixes = listOf(prefPrefix) + prefixTemplates.indices.filter { it != prefPrefix }
+
+        val candidatePairs = buildList {
+            for (pIdx in orderedPrefixes) {
+                val buildId = prefixTemplates[pIdx]
+                for (code in rawIds) {
+                    add(pIdx to buildId(code))
+                }
+            }
+        }.distinctBy { it.second }.take(4)
 
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val nowSec = nowMillis / 1000L
@@ -94,8 +110,13 @@ internal object GttStopArrivalsParser {
             set(Calendar.MILLISECOND, 0)
         }.timeInMillis / 1000L
 
-        for (endpoint in endpoints) {
-            for (gtfsStopId in candidateIds.take(4)) {
+        if (endpoints.isEmpty()) return emptyList()
+        val prefEp = preferredMatoEndpointIdx.get().coerceIn(0, endpoints.lastIndex)
+        val orderedEndpointIndices = listOf(prefEp) + endpoints.indices.filter { it != prefEp }
+
+        for (epIdx in orderedEndpointIndices) {
+            val endpoint = endpoints[epIdx]
+            for ((prefixIdx, gtfsStopId) in candidatePairs) {
                 val escapedId = gtfsStopId.replace("\"", "")
                 val queries = listOf(
                     """
@@ -188,7 +209,10 @@ internal object GttStopArrivalsParser {
                     """.trimIndent(),
                 )
 
-                for (query in queries) {
+                val prefQ = preferredMatoQueryIdx.get().coerceIn(0, queries.lastIndex)
+                val orderedQueryIndices = listOf(prefQ) + queries.indices.filter { it != prefQ }
+                for (qIdx in orderedQueryIndices) {
+                    val query = queries[qIdx]
                     try {
                         val payload = JSONObject().put("query", query).toString()
                         val request = Request.Builder()
@@ -203,9 +227,19 @@ internal object GttStopArrivalsParser {
                             if (!resp.isSuccessful) continue
                             val body = resp.body?.string() ?: continue
                             val root = JSONObject(body)
-                            val stopObj = root.optJSONObject("data")?.optJSONObject("stop") ?: continue
+                            val dataObj = root.optJSONObject("data")
+                            if (dataObj != null && dataObj.isNull("stop")) {
+                                // Stop ID prefix does not exist on this endpoint — skip remaining query shapes
+                                break
+                            }
+                            val stopObj = dataObj?.optJSONObject("stop") ?: continue
                             val parsed = parseMatoStopTimes(stopObj, nowSec, todayStartSec)
-                            if (parsed.isNotEmpty()) return parsed
+                            if (parsed.isNotEmpty()) {
+                                preferredMatoEndpointIdx.set(epIdx)
+                                preferredMatoPrefixIdx.set(prefixIdx)
+                                preferredMatoQueryIdx.set(qIdx)
+                                return parsed
+                            }
                         }
                     } catch (e: Exception) {
                         Log.d(TAG, "MATO stop arrivals skip ($endpoint, $gtfsStopId): ${e.message}")

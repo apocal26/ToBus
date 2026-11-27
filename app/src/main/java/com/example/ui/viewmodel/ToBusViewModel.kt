@@ -70,6 +70,7 @@ data class UserLocationState(
 data class CameraFlyRequest(
     val target: CameraState,
     val id: Long,
+    val instant: Boolean = false,
 )
 
 @androidx.compose.runtime.Immutable
@@ -89,6 +90,7 @@ data class ToBusUiState(
     val settings: UserWidgetSettings = UserWidgetSettings(),
     val camera: CameraState = CameraState(),
     val cameraFlyRequest: CameraFlyRequest? = null,
+    val lineSelectionEpoch: Long = 0L,
     val userLocation: UserLocationState? = null,
     val isUserLocationEnabled: Boolean = false,
     val isLocatingUser: Boolean = false,
@@ -210,14 +212,19 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var hasAutoCenteredCurrentLine = false
     private var needsRouteRefit = true
     private var hasVerifiedLiveRouteForLine: String? = null
+    private var hasRealViewportSize = false
+    private var pendingViewportRouteRefit = false
     @Volatile
     private var isLinePickerOpen = false
     @Volatile
     private var pendingMatoSyncOnPickerClose = false
     private var consecutivePollFailures = 0
-    private var lastViewportPx: Pair<Int, Int> = 1000 to 1400
+    private var lastViewportDp: Pair<Int, Int> = 390 to 820
     private var routeLoadJob: Job? = null
     private var routeLoadSeq: Long = 0L
+    private var lineSwitchEpoch: Long = 0L
+    private var refreshLiveJob: Job? = null
+    private var liveRefreshSeq: Long = 0L
     private var lineCatalogJob: Job? = null
     private var stopArrivalsJob: Job? = null
     private var focusArrivalJob: Job? = null
@@ -470,186 +477,213 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun computeInteractiveRouteCamera(
+        vehicles: List<BusVehicle>,
+        patterns: List<RoutePattern>,
+    ): CameraState = WebMercator.computeAutoFitCamera(
+        vehicles = vehicles,
+        patterns = patterns,
+        viewportWidthPx = lastViewportDp.first,
+        viewportHeightPx = lastViewportDp.second,
+        paddingFraction = 0.09,
+        maxZoom = 15.0,
+        topPaddingFraction = 0.19,
+        bottomPaddingFraction = 0.15,
+        includeNearbyVehicles = false,
+    )
+
     fun refreshLiveData(isInitial: Boolean = false) {
-        viewModelScope.launch {
-            _pollProgress.value = 0f
-            _uiState.update {
-                it.copy(
-                    isLoadingFeed = isInitial && it.lastUpdatedMillis == null,
-                    isRefreshing = true,
+        val refreshSeq = ++liveRefreshSeq
+        val epochAtStart = lineSwitchEpoch
+        refreshLiveJob?.cancel()
+        refreshLiveJob = viewModelScope.launch {
+            try {
+                _pollProgress.value = 0f
+                _uiState.update {
+                    it.copy(
+                        isLoadingFeed = isInitial && it.lastUpdatedMillis == null,
+                        isRefreshing = true,
+                    )
+                }
+
+                // Ensure route geometry retries automatically if initial fetch hadn't completed yet
+                val settingsBeforeFetch = _uiState.value.settings
+                val currentLine = settingsBeforeFetch.selectedLine.trim().uppercase()
+                if (currentLine.isNotEmpty() && _uiState.value.routePatterns.isEmpty() && routeLoadJob?.isActive != true) {
+                    loadRouteGeometry(currentLine)
+                }
+
+                val result = repository.fetchLiveVehicles(
+                    includeSecondaryFeeds = true,
+                    focusLine = currentLine.takeIf { it.isNotEmpty() },
+                    dataSourceMode = settingsBeforeFetch.dataSourceMode,
+                    includeAlerts = settingsBeforeFetch.showServiceAlerts || settingsBeforeFetch.notifyFavoriteLineAlerts,
                 )
-            }
-
-            // Ensure route geometry retries automatically if initial fetch hadn't completed yet
-            val settingsBeforeFetch = _uiState.value.settings
-            val currentLine = settingsBeforeFetch.selectedLine.trim().uppercase()
-            if (currentLine.isNotEmpty() && _uiState.value.routePatterns.isEmpty() && routeLoadJob?.isActive != true) {
-                loadRouteGeometry(currentLine)
-            }
-
-            val result = repository.fetchLiveVehicles(
-                includeSecondaryFeeds = true,
-                focusLine = currentLine.takeIf { it.isNotEmpty() },
-                dataSourceMode = settingsBeforeFetch.dataSourceMode,
-                includeAlerts = settingsBeforeFetch.showServiceAlerts || settingsBeforeFetch.notifyFavoriteLineAlerts,
-            )
-            result.fold(
-                onSuccess = { snapshot ->
-                    val currentSettings = _uiState.value.settings
-                    val line = currentSettings.selectedLine.trim().uppercase()
-                    val evalNowMillis = System.currentTimeMillis()
-                    val currentPatterns = _uiState.value.routePatterns
-                    val filtered = if (line.isEmpty()) {
-                        emptyList()
-                    } else {
-                        val rawLineVehicles = snapshot.allVehicles
-                            .filter {
-                                it.lineCode.equals(line, ignoreCase = true) ||
-                                    it.rawRouteId.equals(line, ignoreCase = true)
-                            }
-                            .sortedBy { it.vehicleId }
-                        GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
-                            vehicles = rawLineVehicles,
-                            routePatterns = currentPatterns,
-                            nowMillis = evalNowMillis,
-                        )
-                    }
-
-                    val effectiveAlerts = if (currentSettings.showServiceAlerts) snapshot.alerts else emptyList()
-                    val lineAlerts = if (line.isEmpty() || !currentSettings.showServiceAlerts) {
-                        emptyList()
-                    } else {
-                        filterAlertsForLine(effectiveAlerts, line)
-                    }
-
-                    val nextCamera = if (!hasAutoCenteredCurrentLine && filtered.isNotEmpty()) {
-                        hasAutoCenteredCurrentLine = true
-                        if (currentSettings.cameraMode == WidgetCameraMode.FIXED_AREA) {
-                            currentSettings.fixedCamera
+                if (liveRefreshSeq != refreshSeq || lineSwitchEpoch != epochAtStart) {
+                    return@launch
+                }
+                result.fold(
+                    onSuccess = { snapshot ->
+                        val currentSettings = _uiState.value.settings
+                        val line = currentSettings.selectedLine.trim().uppercase()
+                        val evalNowMillis = System.currentTimeMillis()
+                        val currentPatterns = _uiState.value.routePatterns
+                        val filtered = if (line.isEmpty()) {
+                            emptyList()
                         } else {
-                            WebMercator.computeAutoFitCamera(
-                                vehicles = filtered,
-                                patterns = _uiState.value.routePatterns,
-                                viewportWidthPx = lastViewportPx.first,
-                                viewportHeightPx = lastViewportPx.second,
-                            )
-                        }
-                    } else {
-                        _uiState.value.camera
-                    }
-
-                    _uiState.update { state ->
-                        val updatedExternal = state.focusedExternalVehicle?.let { ext ->
-                            snapshot.allVehicles.firstOrNull { it.vehicleId == ext.vehicleId } ?: ext
-                        }
-                        val keepSelected = state.selectedVehicleId?.takeIf { id ->
-                            filtered.any { it.vehicleId == id } || updatedExternal?.vehicleId == id
-                        }
-                        val nextActiveLines = when {
-                            snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1 ->
-                                GttRealtimeRepository.mergeLineSummariesWithCatalog(
-                                    liveSummaries = snapshot.availableLines,
-                                    catalogSummaries = state.allActiveLines,
-                                )
-                            snapshot.availableLines.none { it.activeVehicleCount == 0 } &&
-                                state.allActiveLines.any { it.activeVehicleCount == 0 } ->
-                                GttRealtimeRepository.mergeLiveSummariesWithStaticCatalog(
-                                    liveSummaries = snapshot.availableLines,
-                                    staticCatalog = state.allActiveLines,
-                                )
-                            else -> snapshot.availableLines
-                        }
-                        val nextOutage = snapshot.outageReport
-                        if (nextOutage == null) {
-                            dismissedOutageStableKey = null
-                        }
-                        val nextOutageDismissed = nextOutage != null && nextOutage.stableKey == dismissedOutageStableKey
-                        state.copy(
-                            lineVehicles = filtered,
-                            allActiveLines = nextActiveLines,
-                            isLoadingLines = if (nextActiveLines.size > 1) false else state.isLoadingLines,
-                            lineCatalogError = if (nextActiveLines.isNotEmpty()) null else state.lineCatalogError,
-                            sourceStatuses = snapshot.sourceStatuses,
-                            allAlerts = effectiveAlerts,
-                            lineAlerts = lineAlerts,
-                            camera = nextCamera,
-                            selectedVehicleId = keepSelected,
-                            focusedExternalVehicle = if (keepSelected != null && updatedExternal?.vehicleId == keepSelected) updatedExternal else null,
-                            focusedExternalTerminus = if (keepSelected != null && updatedExternal?.vehicleId == keepSelected) state.focusedExternalTerminus else null,
-                            isLoadingFeed = false,
-                            isRefreshing = false,
-                            lastUpdatedMillis = snapshot.fetchedAtMillis,
-                            feedTimestampSeconds = snapshot.feedTimestampSeconds,
-                            nowMillis = evalNowMillis,
-                            totalCityVehicles = snapshot.allVehicles.size,
-                            errorMessage = null,
-                            gttDataOutage = nextOutage,
-                            isGttOutageDismissed = nextOutageDismissed,
-                        )
-                    }
-                    syncLinePickerState()
-                    resolveMissingVehicleStopNames(filtered)
-                    // Once live vehicles with tripIds arrive on this line, verify route geometry against
-                    // the live tripIds so active Sunday/holiday detours match the street immediately!
-                    val liveTripIds = filtered.mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }.toSet()
-                    if (line.isNotEmpty() && liveTripIds.isNotEmpty() && hasVerifiedLiveRouteForLine != line && routeLoadJob?.isActive != true) {
-                        hasVerifiedLiveRouteForLine = line
-                        loadRouteGeometry(line, activeTripIds = liveTripIds, forceRefresh = true)
-                    }
-                    regenerateWidgetPreview()
-                    consecutivePollFailures = 0
-                    val nowSync = System.currentTimeMillis()
-                    if (nowSync - lastWidgetSyncMillis >= 60_000L) {
-                        lastWidgetSyncMillis = nowSync
-                        viewModelScope.launch(Dispatchers.IO) {
-                            BusMapWidgetProvider.syncWidgetsWithCachedSnapshot(appContext)
-                        }
-                    }
-                    if (currentSettings.notifyFavoriteLineAlerts && snapshot.alerts.isNotEmpty()) {
-                        viewModelScope.launch(Dispatchers.IO) {
-                            FavoriteAlertNotifier.processFetchedAlerts(
-                                context = appContext,
-                                alerts = snapshot.alerts,
-                                postNotifications = true,
+                            val rawLineVehicles = snapshot.allVehicles
+                                .filter {
+                                    it.lineCode.equals(line, ignoreCase = true) ||
+                                        it.rawRouteId.equals(line, ignoreCase = true)
+                                }
+                                .sortedBy { it.vehicleId }
+                            GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
+                                vehicles = rawLineVehicles,
+                                routePatterns = currentPatterns,
                                 nowMillis = evalNowMillis,
                             )
                         }
-                    }
-                    if (snapshot.alerts.isNotEmpty() || currentSettings.showServiceAlerts) {
-                        FavoriteAlertsWidgetProvider.syncWithAlerts(appContext, snapshot.alerts)
-                    }
-                    if (_uiState.value.selectedStop != null) {
-                        refreshSelectedStopArrivals(silent = true)
-                    }
-                },
-                onFailure = { err ->
-                    consecutivePollFailures++
-                    val now = System.currentTimeMillis()
-                    val outageReport = repository.getCurrentOutageReport()
-                    if (outageReport == null) {
-                        dismissedOutageStableKey = null
-                    }
-                    val outageDismissed = outageReport != null && outageReport.stableKey == dismissedOutageStableKey
-                    _uiState.update { state ->
-                        val hasRecentLiveData = state.lastUpdatedMillis != null &&
-                            (now - state.lastUpdatedMillis) < 95_000L &&
-                            (state.lineVehicles.isNotEmpty() || state.totalCityVehicles > 0)
-                        val showOfflineBanner = !hasRecentLiveData || consecutivePollFailures >= 2
-                        state.copy(
-                            isLoadingFeed = false,
-                            isRefreshing = false,
-                            errorMessage = if (showOfflineBanner) {
-                                err.message ?: "Errore di connessione ai feed GTT"
-                            } else {
-                                state.errorMessage
-                            },
-                            gttDataOutage = outageReport,
-                            isGttOutageDismissed = outageDismissed,
-                        )
-                    }
-                    regenerateWidgetPreview()
-                },
-            )
+
+                        val effectiveAlerts = if (currentSettings.showServiceAlerts) snapshot.alerts else emptyList()
+                        val lineAlerts = if (line.isEmpty() || !currentSettings.showServiceAlerts) {
+                            emptyList()
+                        } else {
+                            filterAlertsForLine(effectiveAlerts, line)
+                        }
+
+                        var pollFlyReq: CameraFlyRequest? = null
+                        val nextCamera = if (!hasAutoCenteredCurrentLine && (filtered.isNotEmpty() || currentPatterns.isNotEmpty())) {
+                            if (currentPatterns.isNotEmpty()) {
+                                hasAutoCenteredCurrentLine = true
+                            }
+                            pendingViewportRouteRefit = !hasRealViewportSize
+                            val fitted = computeInteractiveRouteCamera(filtered, currentPatterns)
+                            pollFlyReq = CameraFlyRequest(target = fitted, id = ++cameraFlySeq, instant = false)
+                            fitted
+                        } else {
+                            _uiState.value.camera
+                        }
+
+                        _uiState.update { state ->
+                            if (state.lineSelectionEpoch != epochAtStart) return@update state
+                            val updatedExternal = state.focusedExternalVehicle?.let { ext ->
+                                snapshot.allVehicles.firstOrNull { it.vehicleId == ext.vehicleId } ?: ext
+                            }
+                            val keepSelected = state.selectedVehicleId?.takeIf { id ->
+                                filtered.any { it.vehicleId == id } || updatedExternal?.vehicleId == id
+                            }
+                            val nextActiveLines = when {
+                                snapshot.availableLines.size <= 1 && state.allActiveLines.size > 1 ->
+                                    GttRealtimeRepository.mergeLineSummariesWithCatalog(
+                                        liveSummaries = snapshot.availableLines,
+                                        catalogSummaries = state.allActiveLines,
+                                    )
+                                snapshot.availableLines.none { it.activeVehicleCount == 0 } &&
+                                    state.allActiveLines.any { it.activeVehicleCount == 0 } ->
+                                    GttRealtimeRepository.mergeLiveSummariesWithStaticCatalog(
+                                        liveSummaries = snapshot.availableLines,
+                                        staticCatalog = state.allActiveLines,
+                                    )
+                                else -> snapshot.availableLines
+                            }
+                            val nextOutage = snapshot.outageReport
+                            if (nextOutage == null) {
+                                dismissedOutageStableKey = null
+                            }
+                            val nextOutageDismissed = nextOutage != null && nextOutage.stableKey == dismissedOutageStableKey
+                            state.copy(
+                                lineVehicles = filtered,
+                                allActiveLines = nextActiveLines,
+                                isLoadingLines = if (nextActiveLines.size > 1) false else state.isLoadingLines,
+                                lineCatalogError = if (nextActiveLines.isNotEmpty()) null else state.lineCatalogError,
+                                sourceStatuses = snapshot.sourceStatuses,
+                                allAlerts = effectiveAlerts,
+                                lineAlerts = lineAlerts,
+                                camera = nextCamera,
+                                cameraFlyRequest = pollFlyReq ?: state.cameraFlyRequest,
+                                selectedVehicleId = keepSelected,
+                                focusedExternalVehicle = if (keepSelected != null && updatedExternal?.vehicleId == keepSelected) updatedExternal else null,
+                                focusedExternalTerminus = if (keepSelected != null && updatedExternal?.vehicleId == keepSelected) state.focusedExternalTerminus else null,
+                                isLoadingFeed = false,
+                                isRefreshing = false,
+                                lastUpdatedMillis = snapshot.fetchedAtMillis,
+                                feedTimestampSeconds = snapshot.feedTimestampSeconds,
+                                nowMillis = evalNowMillis,
+                                totalCityVehicles = snapshot.allVehicles.size,
+                                errorMessage = null,
+                                gttDataOutage = nextOutage,
+                                isGttOutageDismissed = nextOutageDismissed,
+                            )
+                        }
+                        syncLinePickerState()
+                        resolveMissingVehicleStopNames(filtered)
+                        // Once live vehicles with tripIds arrive on this line, verify route geometry against
+                        // the live tripIds so active Sunday/holiday detours match the street immediately!
+                        val liveTripIds = filtered.mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }.toSet()
+                        if (line.isNotEmpty() && liveTripIds.isNotEmpty() && hasVerifiedLiveRouteForLine != line && routeLoadJob?.isActive != true) {
+                            hasVerifiedLiveRouteForLine = line
+                            loadRouteGeometry(line, activeTripIds = liveTripIds, forceRefresh = true)
+                        }
+                        regenerateWidgetPreview()
+                        consecutivePollFailures = 0
+                        val nowSync = System.currentTimeMillis()
+                        if (nowSync - lastWidgetSyncMillis >= 60_000L) {
+                            lastWidgetSyncMillis = nowSync
+                            viewModelScope.launch(Dispatchers.IO) {
+                                BusMapWidgetProvider.syncWidgetsWithCachedSnapshot(appContext)
+                            }
+                        }
+                        if (currentSettings.notifyFavoriteLineAlerts && snapshot.alerts.isNotEmpty()) {
+                            viewModelScope.launch(Dispatchers.IO) {
+                                FavoriteAlertNotifier.processFetchedAlerts(
+                                    context = appContext,
+                                    alerts = snapshot.alerts,
+                                    postNotifications = true,
+                                    nowMillis = evalNowMillis,
+                                )
+                            }
+                        }
+                        if (snapshot.alerts.isNotEmpty() || currentSettings.showServiceAlerts) {
+                            FavoriteAlertsWidgetProvider.syncWithAlerts(appContext, snapshot.alerts)
+                        }
+                        if (_uiState.value.selectedStop != null) {
+                            refreshSelectedStopArrivals(silent = true)
+                        }
+                    },
+                    onFailure = { err ->
+                        consecutivePollFailures++
+                        val now = System.currentTimeMillis()
+                        val outageReport = repository.getCurrentOutageReport()
+                        if (outageReport == null) {
+                            dismissedOutageStableKey = null
+                        }
+                        val outageDismissed = outageReport != null && outageReport.stableKey == dismissedOutageStableKey
+                        _uiState.update { state ->
+                            if (state.lineSelectionEpoch != epochAtStart) return@update state
+                            val hasRecentLiveData = state.lastUpdatedMillis != null &&
+                                (now - state.lastUpdatedMillis) < 95_000L &&
+                                (state.lineVehicles.isNotEmpty() || state.totalCityVehicles > 0)
+                            val showOfflineBanner = !hasRecentLiveData || consecutivePollFailures >= 2
+                            state.copy(
+                                isLoadingFeed = false,
+                                isRefreshing = false,
+                                errorMessage = if (showOfflineBanner) {
+                                    err.message ?: "Errore di connessione ai feed GTT"
+                                } else {
+                                    state.errorMessage
+                                },
+                                gttDataOutage = outageReport,
+                                isGttOutageDismissed = outageDismissed,
+                            )
+                        }
+                        regenerateWidgetPreview()
+                    },
+                )
+            } finally {
+                if (liveRefreshSeq == refreshSeq) {
+                    _uiState.update { it.copy(isRefreshing = false, isLoadingFeed = false) }
+                }
+            }
         }
     }
 
@@ -664,10 +698,14 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             pendingMatoSyncOnPickerClose = true
             return
         }
+        val epochAtStart = lineSwitchEpoch
+        val modeAtStart = currentSettingsBefore.dataSourceMode
         viewModelScope.launch(Dispatchers.Default) {
+            if (lineSwitchEpoch != epochAtStart) return@launch
             val currentSettings = _uiState.value.settings
             if (!GttRealtimeRepository.shouldRunMatoStream(currentSettings.dataSourceMode)) return@launch
             val snapshot = repository.getLiveMatoOverlaySnapshot(currentSettings.dataSourceMode) ?: return@launch
+            if (lineSwitchEpoch != epochAtStart) return@launch
             val line = currentSettings.selectedLine.trim().uppercase()
             if (line.isEmpty()) return@launch
             val evalNowMillis = System.currentTimeMillis()
@@ -678,7 +716,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                         it.rawRouteId.equals(line, ignoreCase = true)
                 }
                 .sortedBy { it.vehicleId }
-            val filtered = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+            val filtered = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
                 vehicles = rawLineVehicles,
                 routePatterns = currentPatterns,
                 nowMillis = evalNowMillis,
@@ -688,6 +726,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 consecutivePollFailures = 0
             }
             _uiState.update { state ->
+                if (state.lineSelectionEpoch != epochAtStart || state.settings.dataSourceMode != modeAtStart) {
+                    return@update state
+                }
                 val updatedExternal = state.focusedExternalVehicle?.let { ext ->
                     snapshot.allVehicles.firstOrNull { it.vehicleId == ext.vehicleId } ?: ext
                 }
@@ -736,9 +777,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             repository.stopMatoLiveStream()
         }
+        val nextEpoch = ++lineSwitchEpoch
         hasAutoCenteredCurrentLine = false
         needsRouteRefit = true
         hasVerifiedLiveRouteForLine = null
+        pendingViewportRouteRefit = !hasRealViewportSize
 
         val cachedSnapshot = repository.getLastCachedSnapshot()
         val previousState = _uiState.value
@@ -752,7 +795,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             ?.sortedBy { it.vehicleId }
             .orEmpty()
         val filtered = if (isSameLoadedLine) {
-            GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+            GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
                 vehicles = rawFiltered,
                 routePatterns = previousState.routePatterns,
                 nowMillis = System.currentTimeMillis(),
@@ -764,21 +807,23 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         val allAlerts = if (updated.showServiceAlerts) cachedSnapshot?.alerts.orEmpty() else emptyList()
         val lineAlerts = if (updated.showServiceAlerts) filterAlertsForLine(allAlerts, cleaned) else emptyList()
 
-        val nextCamera = if (filtered.isNotEmpty()) {
-            hasAutoCenteredCurrentLine = true
-            WebMercator.computeAutoFitCamera(
-                vehicles = filtered,
-                patterns = if (isSameLoadedLine) previousState.routePatterns else emptyList(),
-                viewportWidthPx = lastViewportPx.first,
-                viewportHeightPx = lastViewportPx.second,
-            )
-        } else {
-            previousState.camera
+        var selectFlyReq: CameraFlyRequest? = null
+        val nextCamera = when {
+            isSameLoadedLine -> {
+                hasAutoCenteredCurrentLine = true
+                needsRouteRefit = false
+                val fitted = computeInteractiveRouteCamera(filtered, previousState.routePatterns)
+                selectFlyReq = CameraFlyRequest(target = fitted, id = ++cameraFlySeq, instant = false)
+                fitted
+            }
+            filtered.isNotEmpty() -> computeInteractiveRouteCamera(filtered, emptyList())
+            else -> previousState.camera
         }
 
         _uiState.update {
             it.copy(
                 settings = updated,
+                lineSelectionEpoch = nextEpoch,
                 lineVehicles = filtered,
                 allAlerts = allAlerts,
                 lineAlerts = lineAlerts,
@@ -792,6 +837,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 stopArrivals = emptyList(),
                 isLoadingStopArrivals = false,
                 camera = nextCamera,
+                cameraFlyRequest = selectFlyReq ?: it.cameraFlyRequest,
                 statusToast = "Linea $cleaned attiva",
             )
         }
@@ -856,6 +902,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         routeLoadJob?.cancel()
         val currentSeq = ++routeLoadSeq
+        val epochAtStart = lineSwitchEpoch
         routeLoadJob = viewModelScope.launch {
             try {
                 val patterns = repository.fetchRoutePatterns(
@@ -863,29 +910,35 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     activeTripIds = activeTripIds,
                     forceRefresh = forceRefresh,
                 )
-                if (patterns.isNotEmpty() && _uiState.value.settings.selectedLine.equals(lineCode, ignoreCase = true)) {
-                    val shouldRefit = needsRouteRefit && _uiState.value.selectedStop == null && _uiState.value.selectedVehicleId == null
+                if (lineSwitchEpoch != epochAtStart ||
+                    !_uiState.value.settings.selectedLine.equals(lineCode, ignoreCase = true)
+                ) {
+                    return@launch
+                }
+                if (patterns.isNotEmpty()) {
+                    val shouldRefit = needsRouteRefit &&
+                        _uiState.value.selectedStop == null &&
+                        _uiState.value.selectedVehicleId == null
                     needsRouteRefit = false
+                    var fittedTarget: CameraState? = null
                     val refitFly = if (shouldRefit) {
                         hasAutoCenteredCurrentLine = true
-                        val target = if (_uiState.value.settings.cameraMode == WidgetCameraMode.FIXED_AREA) {
-                            _uiState.value.settings.fixedCamera
-                        } else {
-                            WebMercator.computeAutoFitCamera(
-                                vehicles = _uiState.value.lineVehicles,
-                                patterns = patterns,
-                                viewportWidthPx = lastViewportPx.first,
-                                viewportHeightPx = lastViewportPx.second,
-                            )
-                        }
+                        pendingViewportRouteRefit = !hasRealViewportSize
+                        val target = computeInteractiveRouteCamera(_uiState.value.lineVehicles, patterns)
+                        fittedTarget = target
                         cameraFlySeq++
-                        CameraFlyRequest(target = target, id = cameraFlySeq)
+                        CameraFlyRequest(
+                            target = target,
+                            id = cameraFlySeq,
+                            instant = false,
+                        )
                     } else {
                         null
                     }
                     _uiState.update { state ->
+                        if (state.lineSelectionEpoch != epochAtStart) return@update state
                         val evalNow = System.currentTimeMillis()
-                        val cleanedVehicles = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                        val cleanedVehicles = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
                             vehicles = state.lineVehicles,
                             routePatterns = patterns,
                             nowMillis = evalNow,
@@ -900,6 +953,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             selectedVehicleId = keepSel,
                             nowMillis = evalNow,
                             isLoadingInitialRoute = false,
+                            camera = fittedTarget ?: state.camera,
                             cameraFlyRequest = refitFly ?: state.cameraFlyRequest,
                         )
                     }
@@ -907,7 +961,10 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     requestWidgetUpdatesAsync(includeStops = false)
                 }
             } finally {
-                if (routeLoadSeq == currentSeq && (isInitialRouteLoad || _uiState.value.isLoadingInitialRoute)) {
+                if (routeLoadSeq == currentSeq &&
+                    lineSwitchEpoch == epochAtStart &&
+                    (isInitialRouteLoad || _uiState.value.isLoadingInitialRoute)
+                ) {
                     _uiState.update { it.copy(isLoadingInitialRoute = false) }
                 }
             }
@@ -918,21 +975,49 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(camera = camera) }
     }
 
-    fun updateViewportSize(widthPx: Int, heightPx: Int) {
-        if (widthPx > 0 && heightPx > 0) {
-            lastViewportPx = widthPx to heightPx
+    fun updateViewportSize(widthDp: Int, heightDp: Int) {
+        if (widthDp > 0 && heightDp > 0) {
+            val sizeChangedSignificantly = kotlin.math.abs(lastViewportDp.first - widthDp) > 16 ||
+                kotlin.math.abs(lastViewportDp.second - heightDp) > 16
+            val firstReal = !hasRealViewportSize
+            hasRealViewportSize = true
+            lastViewportDp = widthDp to heightDp
+            val state = _uiState.value
+            if ((firstReal || (pendingViewportRouteRefit && sizeChangedSignificantly)) &&
+                state.routePatterns.isNotEmpty() &&
+                state.selectedStop == null &&
+                state.selectedVehicleId == null
+            ) {
+                pendingViewportRouteRefit = false
+                hasAutoCenteredCurrentLine = true
+                val fitted = computeInteractiveRouteCamera(state.lineVehicles, state.routePatterns)
+                val flyReq = CameraFlyRequest(target = fitted, id = ++cameraFlySeq, instant = false)
+                _uiState.update { current ->
+                    if (current.routePatterns.isEmpty() || current.selectedStop != null || current.selectedVehicleId != null) {
+                        current
+                    } else {
+                        current.copy(camera = fitted, cameraFlyRequest = flyReq)
+                    }
+                }
+            }
+        }
+    }
+
+    fun consumeCameraFlyRequest(flyId: Long) {
+        _uiState.update { state ->
+            if (state.cameraFlyRequest?.id == flyId) {
+                state.copy(cameraFlyRequest = null)
+            } else {
+                state
+            }
         }
     }
 
     fun fitLineInView() {
         val state = _uiState.value
-        val next = WebMercator.computeAutoFitCamera(
-            vehicles = state.lineVehicles,
-            patterns = state.routePatterns,
-            viewportWidthPx = lastViewportPx.first,
-            viewportHeightPx = lastViewportPx.second,
-        )
-        _uiState.update { it.copy(camera = next) }
+        val next = computeInteractiveRouteCamera(state.lineVehicles, state.routePatterns)
+        val fly = CameraFlyRequest(target = next, id = ++cameraFlySeq, instant = false)
+        _uiState.update { it.copy(camera = next, cameraFlyRequest = fly) }
     }
 
     fun zoomBy(delta: Double) {
@@ -1239,6 +1324,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 preferredLine = line,
                 liveVehicles = liveVehicles,
                 routePatterns = routePatterns,
+                forceRefresh = !silent,
             )
             if (_uiState.value.selectedStop?.stopId == stop.stopId) {
                 _uiState.update {

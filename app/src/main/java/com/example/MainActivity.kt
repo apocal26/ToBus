@@ -312,28 +312,63 @@ fun ToBusApp(
 
     val isLightMapVisible = currentTab == AppDestination.MAP && !uiState.settings.mapStyle.isDark && !showLinePicker
 
+    var isMapStyleReady by remember { mutableStateOf(false) }
+    var hasCompletedInitialMapReady by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(isMapStyleReady) {
+        if (isMapStyleReady) {
+            hasCompletedInitialMapReady = true
+        }
+    }
+
     val selectedLineKey = uiState.settings.selectedLine.trim().uppercase()
+    val overlayKey = "${uiState.lineSelectionEpoch}:$selectedLineKey"
+    val isRoutePending = uiState.isLoadingInitialRoute && uiState.routePatterns.isEmpty()
+    val isFeedPending = uiState.isLoadingFeed && uiState.lastUpdatedMillis == null
     val needsBlockingLoadOverlay = uiState.settings.hasSelectedLine &&
-        ((uiState.isLoadingInitialRoute && uiState.routePatterns.isEmpty()) ||
-            (uiState.isLoadingFeed && uiState.lastUpdatedMillis == null))
+        (isRoutePending || isFeedPending || !isMapStyleReady)
 
-    var overlayTimedOutForKey by rememberSaveable(selectedLineKey) { mutableStateOf(false) }
-    var overlayGraceElapsed by remember(selectedLineKey) { mutableStateOf(false) }
+    var overlayTimedOutForKey by rememberSaveable(overlayKey) { mutableStateOf(false) }
+    var overlayGraceElapsed by remember(overlayKey) { mutableStateOf(false) }
+    var overlayMinDwellActive by remember(overlayKey) { mutableStateOf(false) }
+    var overlayShownAtMillis by remember(overlayKey) { mutableLongStateOf(0L) }
 
-    LaunchedEffect(selectedLineKey, needsBlockingLoadOverlay) {
+    LaunchedEffect(overlayKey, needsBlockingLoadOverlay) {
         if (!needsBlockingLoadOverlay) {
+            val shownAt = overlayShownAtMillis
+            if (shownAt > 0L && overlayGraceElapsed && !overlayTimedOutForKey) {
+                val elapsed = android.os.SystemClock.elapsedRealtime() - shownAt
+                val remaining = 220L - elapsed
+                if (remaining > 0L) {
+                    overlayMinDwellActive = true
+                    kotlinx.coroutines.delay(remaining)
+                    overlayMinDwellActive = false
+                }
+            }
             overlayGraceElapsed = false
+            overlayShownAtMillis = 0L
             return@LaunchedEffect
         }
         if (overlayTimedOutForKey) return@LaunchedEffect
-        overlayGraceElapsed = false
-        kotlinx.coroutines.delay(200L)
+
+        val graceDelayMs = when {
+            !hasCompletedInitialMapReady || uiState.lastUpdatedMillis == null -> 0L
+            isRoutePending || isFeedPending -> 65L
+            else -> 150L
+        }
+        if (graceDelayMs > 0L) {
+            overlayGraceElapsed = false
+            kotlinx.coroutines.delay(graceDelayMs)
+        }
         overlayGraceElapsed = true
+        if (overlayShownAtMillis == 0L) {
+            overlayShownAtMillis = android.os.SystemClock.elapsedRealtime()
+        }
         kotlinx.coroutines.delay(8_500L)
+        overlayMinDwellActive = false
         overlayTimedOutForKey = true
     }
 
-    val showStartupGlassOverlay = needsBlockingLoadOverlay &&
+    val showStartupGlassOverlay = (needsBlockingLoadOverlay || overlayMinDwellActive) &&
         overlayGraceElapsed &&
         !overlayTimedOutForKey &&
         currentTab == AppDestination.MAP &&
@@ -435,9 +470,12 @@ fun ToBusApp(
                             isForegroundActive = isForegroundActive && !showLinePicker,
                             isWideScreen = useNavigationRail,
                             showStartupOverlay = showStartupGlassOverlay,
+                            isMapReady = isMapStyleReady,
                             bottomNavClearance = bottomClearance,
                             onCameraChange = viewModel::updateCamera,
                             onViewportSizeChange = viewModel::updateViewportSize,
+                            onCameraFlyConsumed = viewModel::consumeCameraFlyRequest,
+                            onMapReadyChanged = { isMapStyleReady = it },
                             onOpenLinePicker = openLinePicker,
                             onRefresh = refreshLive,
                             onUserLocationClick = viewModel::onUserLocationButtonClicked,

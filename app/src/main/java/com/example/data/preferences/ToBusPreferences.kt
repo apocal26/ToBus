@@ -219,6 +219,13 @@ class ToBusPreferences private constructor(context: Context) {
         }
     }
 
+    fun getLastWidgetRefreshAttemptMillis(): Long =
+        prefs.getLong(KEY_LAST_WIDGET_REFRESH_MS, 0L)
+
+    fun setLastWidgetRefreshAttemptMillis(millis: Long) {
+        prefs.edit().putLong(KEY_LAST_WIDGET_REFRESH_MS, millis).apply()
+    }
+
     private fun readSettings(): UserWidgetSettings {
         val rawSelected = prefs.getString(KEY_LINE, "")?.trim()?.uppercase().orEmpty()
         val migratedSelected = if (rawSelected.isNotEmpty()) {
@@ -384,6 +391,7 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_STOP_WIDGET_IDX = "stop_widget_fav_idx"
         private const val KEY_GITHUB_REPO = "github_update_repo"
         private const val KEY_LAST_UPDATE_CHECK_MS = "github_last_update_check_ms"
+        private const val KEY_LAST_WIDGET_REFRESH_MS = "last_widget_refresh_attempt_ms"
         private const val KEY_DISMISSED_UPDATE_TAG = "github_dismissed_update_tag"
         private const val MAX_FAVORITES = 6
         private const val MAX_FAVORITE_LINES = 12

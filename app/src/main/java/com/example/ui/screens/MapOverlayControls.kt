@@ -94,6 +94,7 @@ internal fun StartupGlassLoadingOverlay(
     selectedLine: String,
     isRouteReady: Boolean,
     isFeedReady: Boolean,
+    isMapReady: Boolean = true,
 ) {
     val shimmerBrush = rememberGlassShimmerBrush()
     val backdropBrush = remember {
@@ -104,21 +105,27 @@ internal fun StartupGlassLoadingOverlay(
             ),
         )
     }
-    val stepProgressTarget = when {
-        isRouteReady && isFeedReady -> 1f
-        isRouteReady || isFeedReady -> 0.76f
-        else -> 0.40f
+    val readyStepsCount = (if (isRouteReady) 1 else 0) +
+        (if (isFeedReady) 1 else 0) +
+        (if (isMapReady) 1 else 0)
+    val stepProgressTarget = when (readyStepsCount) {
+        3 -> 1f
+        2 -> 0.82f
+        1 -> 0.56f
+        else -> 0.32f
     }
     val animatedProgress by animateFloatAsState(
         targetValue = stepProgressTarget,
-        animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+        animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
         label = "startup_glass_progress",
     )
     val cardShape = remember { RoundedCornerShape(28.dp) }
     val statusText = when {
         !isRouteReady && !isFeedReady -> "Caricamento percorso e fonti live…"
         !isRouteReady -> "Caricamento percorso e fermate…"
-        else -> "Sincronizzazione mezzi live…"
+        !isFeedReady -> "Sincronizzazione mezzi live…"
+        !isMapReady -> "Inizializzazione mappa…"
+        else -> "Mappa pronta"
     }
 
     Box(
@@ -139,7 +146,7 @@ internal fun StartupGlassLoadingOverlay(
             accentTint = AccentGold,
             shape = cardShape,
             modifier = Modifier
-                .widthIn(max = 316.dp)
+                .widthIn(max = 328.dp)
                 .fillMaxWidth(),
         ) {
             Box(
@@ -151,7 +158,7 @@ internal fun StartupGlassLoadingOverlay(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 22.dp, vertical = 22.dp),
+                        .padding(horizontal = 20.dp, vertical = 22.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
@@ -232,7 +239,7 @@ internal fun StartupGlassLoadingOverlay(
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         StartupStepChip(
                             label = "Percorso",
@@ -240,8 +247,13 @@ internal fun StartupGlassLoadingOverlay(
                             modifier = Modifier.weight(1f),
                         )
                         StartupStepChip(
-                            label = "Fonti live",
+                            label = "Fonti",
                             done = isFeedReady,
+                            modifier = Modifier.weight(1f),
+                        )
+                        StartupStepChip(
+                            label = "Mappa",
+                            done = isMapReady,
                             modifier = Modifier.weight(1f),
                         )
                     }

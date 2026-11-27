@@ -259,6 +259,75 @@ object GttFleetAnalyzer {
         }
     }
 
+    /**
+     * Returns true when ANY mid-route vehicle (even multi-source mirrored GTFS-RT) is provably dead:
+     * parked at the same anchor (<22m) for >= 7 minutes strictly outside depots and >160m away
+     * from any terminus, with zero/absent speed AND either stale GPS (>= 180s) or 8+ minutes
+     * completely frozen mid-route (catching feeds that keep advancing fake timestamps).
+     */
+    fun isConfirmedDeadGhostWithSpatial(
+        bus: BusVehicle,
+        spatial: VehicleSpatialStatus,
+        hasKnownRoutePatterns: Boolean,
+        nowMillis: Long,
+    ): Boolean {
+        if (!hasKnownRoutePatterns) return false
+        if (spatial.depotName != null ||
+            spatial.isNearTerminus ||
+            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
+        ) {
+            return false
+        }
+        val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
+        val hasStaleTimestamp = gpsAgeSec != null && gpsAgeSec >= 180L
+        if (gpsAgeSec != null && gpsAgeSec >= 600L) return true
+        val since = bus.stationarySinceMillis ?: return false
+        val statSec = ((nowMillis - since) / 1000L).coerceAtLeast(0L)
+        if (statSec < 420L) return false
+        val reportedSpeed = bus.speedKmh
+        val hasFreshLiveSpeed = !hasStaleTimestamp && reportedSpeed != null && reportedSpeed >= 3f
+        // If speed is fresh and >=3 km/h, still catch buses physically frozen within 22m for >= 9 min
+        if (hasFreshLiveSpeed && statSec < 540L) return false
+        return hasStaleTimestamp || statSec >= 480L
+    }
+
+    fun isConfirmedDeadGhost(
+        bus: BusVehicle,
+        routePatterns: List<RoutePattern>,
+        nowMillis: Long,
+    ): Boolean {
+        if (routePatterns.isEmpty()) return false
+        val spatial = assessSpatial(bus, routePatterns)
+        return isConfirmedDeadGhostWithSpatial(
+            bus = bus,
+            spatial = spatial,
+            hasKnownRoutePatterns = true,
+            nowMillis = nowMillis,
+        )
+    }
+
+    fun filterOutConfirmedPhantomsAndDeadGhosts(
+        vehicles: List<BusVehicle>,
+        routePatterns: List<RoutePattern>,
+        nowMillis: Long,
+    ): List<BusVehicle> {
+        if (routePatterns.isEmpty() || vehicles.isEmpty()) return vehicles
+        return vehicles.filterNot { bus ->
+            val spatial = assessSpatial(bus, routePatterns)
+            isConfirmedMatoPhantomWithSpatial(
+                bus = bus,
+                spatial = spatial,
+                hasKnownRoutePatterns = true,
+                nowMillis = nowMillis,
+            ) || isConfirmedDeadGhostWithSpatial(
+                bus = bus,
+                spatial = spatial,
+                hasKnownRoutePatterns = true,
+                nowMillis = nowMillis,
+            )
+        }
+    }
+
     fun findDepot(lat: Double, lon: Double): GttDepot? {
         for (depot in TURIN_DEPOTS) {
             if (haversineMeters(lat, lon, depot.lat, depot.lon) <= depot.radiusMeters) {

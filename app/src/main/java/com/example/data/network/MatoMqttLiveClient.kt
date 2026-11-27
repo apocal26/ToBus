@@ -59,6 +59,7 @@ class MatoMqttLiveClient(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val vehiclesById = ConcurrentHashMap<String, BusVehicle>()
+    private val pendingTeleportById = ConcurrentHashMap<String, BusVehicle>()
     private val packetIdGen = AtomicInteger(1)
     private val connectionGen = AtomicLong(0L)
     private val isActiveDesired = AtomicBoolean(false)
@@ -360,7 +361,14 @@ class MatoMqttLiveClient(
                 val isExistingPhysical = GtfsRtProtobufParser.isPhysicalFleetId(oldKey)
                 if (isIncomingPhysical && !isExistingPhysical) {
                     vehiclesById.remove(oldKey)
+                    pendingTeleportById.remove(oldKey)
                 } else if (!isIncomingPhysical && isExistingPhysical) {
+                    if (isRegressiveTimestamp(existing.timestampSeconds, normalizedBus.timestampSeconds)) {
+                        return
+                    }
+                    if (!acceptsKinematicUpdate(oldKey, existing, normalizedBus)) {
+                        return
+                    }
                     vehiclesById[oldKey] = existing.copy(
                         latitude = normalizedBus.latitude,
                         longitude = normalizedBus.longitude,
@@ -376,7 +384,51 @@ class MatoMqttLiveClient(
                 }
             }
         }
+        val existing = vehiclesById[canonId]
+        if (existing != null) {
+            if (isRegressiveTimestamp(existing.timestampSeconds, normalizedBus.timestampSeconds)) {
+                return
+            }
+            if (!acceptsKinematicUpdate(canonId, existing, normalizedBus)) {
+                return
+            }
+        } else {
+            pendingTeleportById.remove(canonId)
+        }
         vehiclesById[canonId] = normalizedBus
+    }
+
+    private fun acceptsKinematicUpdate(
+        key: String,
+        existing: BusVehicle,
+        incoming: BusVehicle,
+    ): Boolean {
+        val pending = pendingTeleportById[key]
+        if (acceptsKinematicUpdate(existing, incoming, pending)) {
+            pendingTeleportById.remove(key)
+            return true
+        }
+        pendingTeleportById[key] = incoming
+        val distM = GttVehicleMergeEngine.haversineMeters(
+            existing.latitude,
+            existing.longitude,
+            incoming.latitude,
+            incoming.longitude,
+        )
+        val dtSec = if (existing.timestampSeconds > 0L && incoming.timestampSeconds > existing.timestampSeconds) {
+            incoming.timestampSeconds - existing.timestampSeconds
+        } else {
+            ((incoming.fetchedAtMillis - existing.fetchedAtMillis) / 1000L).coerceAtLeast(1L)
+        }
+        if (distM > 500.0) {
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.MQTT,
+                message = "Scarto salto GPS #$key (${distM.toInt()}m in ${dtSec}s)",
+                detail = "linea=${incoming.lineCode} in attesa di conferma",
+                severity = DiagSeverity.WARN,
+            )
+        }
+        return false
     }
 
     private fun openSocket() {
@@ -1921,6 +1973,57 @@ class MatoMqttLiveClient(
                     ?.let { return it }
             }
             return nowSec
+        }
+
+        internal fun isRegressiveTimestamp(existingTsSec: Long, incomingTsSec: Long): Boolean {
+            return existingTsSec > 0L && incomingTsSec > 0L && incomingTsSec < existingTsSec - 5L
+        }
+
+        internal fun isRegressiveTimestamp(prev: BusVehicle, candidate: BusVehicle): Boolean {
+            return isRegressiveTimestamp(prev.timestampSeconds, candidate.timestampSeconds)
+        }
+
+        internal fun isImplausibleKinematicJump(prev: BusVehicle, candidate: BusVehicle): Boolean {
+            if (!prev.lineCode.equals(candidate.lineCode, ignoreCase = true)) {
+                return false
+            }
+            val distM = GttVehicleMergeEngine.haversineMeters(
+                prev.latitude,
+                prev.longitude,
+                candidate.latitude,
+                candidate.longitude,
+            )
+            val dtSec = if (prev.timestampSeconds > 0L && candidate.timestampSeconds > prev.timestampSeconds) {
+                candidate.timestampSeconds - prev.timestampSeconds
+            } else {
+                ((candidate.fetchedAtMillis - prev.fetchedAtMillis) / 1000L).coerceAtLeast(1L)
+            }
+            return dtSec in 1L..45L &&
+                distM > 380.0 &&
+                ((distM / dtSec.toDouble()) * 3.6) > 145.0
+        }
+
+        internal fun acceptsKinematicUpdate(
+            prev: BusVehicle,
+            candidate: BusVehicle,
+            pendingOutlier: BusVehicle?,
+        ): Boolean {
+            if (!isImplausibleKinematicJump(prev, candidate)) {
+                return true
+            }
+            if (pendingOutlier != null) {
+                val pendingDistM = GttVehicleMergeEngine.haversineMeters(
+                    pendingOutlier.latitude,
+                    pendingOutlier.longitude,
+                    candidate.latitude,
+                    candidate.longitude,
+                )
+                val ageSincePendingMs = candidate.fetchedAtMillis - pendingOutlier.fetchedAtMillis
+                if (pendingDistM <= 220.0 && ageSincePendingMs in 0L..90_000L) {
+                    return true
+                }
+            }
+            return false
         }
     }
 }

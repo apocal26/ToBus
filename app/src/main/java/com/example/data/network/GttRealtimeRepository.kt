@@ -105,10 +105,13 @@ class GttRealtimeRepository private constructor(context: Context) {
     }
 
     private data class MovementRecord(
-        val lat: Double,
-        val lon: Double,
+        val anchorLat: Double,
+        val anchorLon: Double,
+        val lastLat: Double,
+        val lastLon: Double,
         val lastMovedAtMillis: Long,
         val firstSeenAtPositionMillis: Long,
+        val lastObservedAtMillis: Long,
         val inferredBearing: Float? = null,
     )
 
@@ -117,12 +120,19 @@ class GttRealtimeRepository private constructor(context: Context) {
         val vehicles: List<BusVehicle>,
     )
 
+    private data class CachedStopArrivals(
+        val fetchedAtMillis: Long,
+        val arrivals: List<StopArrival>,
+    )
+
     private val movementTracker = ConcurrentHashMap<String, MovementRecord>()
+    private val kinematicTracker = ConcurrentHashMap<String, GttVehicleMergeEngine.VehicleKinematicPose>()
     private val sourceHealthTracker = SourceHealthTracker()
     private val outageDetector: GttServiceOutageDetector by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         GttServiceOutageDetector(appContext) { matoFastHttpClient }
     }
     private val singleLineLiveCache = ConcurrentHashMap<String, CachedSingleLineVehicles>()
+    private val stopArrivalsCache = ConcurrentHashMap<String, CachedStopArrivals>()
 
     @Volatile
     private var lastSnapshot: LiveFeedSnapshot? = null
@@ -225,6 +235,8 @@ class GttRealtimeRepository private constructor(context: Context) {
     fun resetHealthAndOutageTrackers() {
         sourceHealthTracker.reset()
         movementTracker.clear()
+        kinematicTracker.clear()
+        stopArrivalsCache.clear()
         outageDetector.reset()
         lastSourceReports = emptyMap()
         ToBusDiagnosticsLog.record(
@@ -501,8 +513,20 @@ class GttRealtimeRepository private constructor(context: Context) {
             nowMillis = nowMillis,
             focusLine = activeFocus,
             sourceReports = sourceReports,
+            previousPoses = kinematicTracker,
         )
-        val enriched = enrichWithTripUpdatesAndMovement(merged, lastTripUpdates, nowMillis)
+        val kinematicallySafe = GttVehicleMergeEngine.evaluateKinematicAnomalies(
+            vehicles = merged,
+            kinematicPoses = kinematicTracker,
+            nowMillis = nowMillis,
+        ) { bus, reason ->
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.SOURCE,
+                message = "Anomalia cinematica #${bus.label} (${bus.lineCode}): $reason",
+                severity = DiagSeverity.WARN,
+            )
+        }
+        val enriched = enrichWithTripUpdatesAndMovement(kinematicallySafe, lastTripUpdates, nowMillis)
 
         val anyGtfsFrozen = !isFixedMato && (
             sourceReports["GTT Ufficiale"]?.isFrozenForLine(activeFocus ?: "", activeFocus) == true ||
@@ -987,10 +1011,26 @@ class GttRealtimeRepository private constructor(context: Context) {
                     nowMillis = nowMillis,
                     focusLine = normFocus,
                     sourceReports = if (allowCrossSourceFallback) sourceReports else emptyMap(),
+                    previousPoses = if (widgetFastMode) emptyMap() else kinematicTracker,
                 )
+                val kinematicallySafe = if (widgetFastMode) {
+                    merged
+                } else {
+                    GttVehicleMergeEngine.evaluateKinematicAnomalies(
+                        vehicles = merged,
+                        kinematicPoses = kinematicTracker,
+                        nowMillis = nowMillis,
+                    ) { bus, reason ->
+                        ToBusDiagnosticsLog.record(
+                            category = DiagCategory.SOURCE,
+                            message = "Anomalia cinematica #${bus.label} (${bus.lineCode}): $reason",
+                            severity = DiagSeverity.WARN,
+                        )
+                    }
+                }
 
                 val activeTripUpdates = tripRes?.updates ?: lastTripUpdates
-                val enriched = enrichWithTripUpdatesAndMovement(merged, activeTripUpdates, nowMillis)
+                val enriched = enrichWithTripUpdatesAndMovement(kinematicallySafe, activeTripUpdates, nowMillis)
 
                 val matoMaxTs = matoCombined.maxOfOrNull { it.timestampSeconds } ?: 0L
                 val feedTs = maxOf(
@@ -1070,45 +1110,75 @@ class GttRealtimeRepository private constructor(context: Context) {
         val enriched = withDelays.map { bus ->
             val canonVid = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
             val prev = movementTracker[canonVid]
-            val movedDistMeters = if (prev != null) {
-                GttVehicleMergeEngine.haversineMeters(prev.lat, prev.lon, bus.latitude, bus.longitude)
+            val anchorDistMeters = if (prev != null) {
+                GttVehicleMergeEngine.haversineMeters(
+                    prev.anchorLat,
+                    prev.anchorLon,
+                    bus.latitude,
+                    bus.longitude,
+                )
             } else {
                 Double.POSITIVE_INFINITY
             }
-            val moved = prev == null || movedDistMeters >= 15.0
+            val stepDistMeters = if (prev != null) {
+                GttVehicleMergeEngine.haversineMeters(
+                    prev.lastLat,
+                    prev.lastLon,
+                    bus.latitude,
+                    bus.longitude,
+                )
+            } else {
+                Double.POSITIVE_INFINITY
+            }
+            // Anchor displacement (~22m) prevents 10-16m GPS jitter or cross-source offsets from
+            // resetting stationary timers and hiding truly dead/frozen buses.
+            val movedFromAnchor = prev == null || anchorDistMeters >= 22.0
 
             val computedBearing = when {
                 bus.bearing != null -> bus.bearing
-                prev != null && movedDistMeters in 18.0..1800.0 ->
-                    GttVehicleMergeEngine.initialBearingDeg(prev.lat, prev.lon, bus.latitude, bus.longitude).toFloat()
+                prev != null && stepDistMeters in 18.0..650.0 ->
+                    GttVehicleMergeEngine.initialBearingDeg(
+                        prev.lastLat,
+                        prev.lastLon,
+                        bus.latitude,
+                        bus.longitude,
+                    ).toFloat()
                 prev != null -> prev.inferredBearing
                 else -> null
             }
 
-            val record = if (prev == null || movedDistMeters >= 15.0) {
+            val record = if (movedFromAnchor) {
                 MovementRecord(
-                    lat = bus.latitude,
-                    lon = bus.longitude,
+                    anchorLat = bus.latitude,
+                    anchorLon = bus.longitude,
+                    lastLat = bus.latitude,
+                    lastLon = bus.longitude,
                     lastMovedAtMillis = nowMillis,
                     firstSeenAtPositionMillis = nowMillis,
+                    lastObservedAtMillis = nowMillis,
                     inferredBearing = computedBearing,
                 )
             } else {
-                prev.copy(inferredBearing = computedBearing ?: prev.inferredBearing)
+                prev.copy(
+                    lastLat = bus.latitude,
+                    lastLon = bus.longitude,
+                    lastObservedAtMillis = nowMillis,
+                    inferredBearing = computedBearing ?: prev.inferredBearing,
+                )
             }
             movementTracker[canonVid] = record
 
             bus.copy(
                 bearing = bus.bearing ?: record.inferredBearing,
                 lastMovedAtMillis = record.lastMovedAtMillis,
-                stationarySinceMillis = if (!moved) record.firstSeenAtPositionMillis else null,
+                stationarySinceMillis = if (!movedFromAnchor) record.firstSeenAtPositionMillis else null,
             )
         }
 
-        // Prune stale vehicle records older than 30 min so long-running sessions stay lean
+        // Prune stale vehicle records older than 30 min based on last observation
         if (movementTracker.size > 800) {
             val cutoff = nowMillis - 30 * 60_000L
-            movementTracker.entries.removeIf { it.value.lastMovedAtMillis < cutoff }
+            movementTracker.entries.removeIf { it.value.lastObservedAtMillis < cutoff }
         }
         return enriched
     }
@@ -1666,38 +1736,51 @@ class GttRealtimeRepository private constructor(context: Context) {
         preferredLine: String,
         liveVehicles: List<BusVehicle>,
         routePatterns: List<RoutePattern> = emptyList(),
+        forceRefresh: Boolean = false,
     ): List<StopArrival> = withContext(Dispatchers.IO) {
         val nowMillis = System.currentTimeMillis()
         val nowSec = nowMillis / 1000L
         val normPref = preferredLine.trim().uppercase()
+        val cacheKey = "${stop.stopId.trim().uppercase()}|$normPref"
+        if (!forceRefresh) {
+            val cached = stopArrivalsCache[cacheKey]
+            if (cached != null && (nowMillis - cached.fetchedAtMillis) <= STOP_ARRIVALS_CACHE_TTL_MS) {
+                return@withContext cached.arrivals
+            }
+        }
+
         val activePatterns = routePatterns.ifEmpty { routeGeometryService.getMemoryCachedPatterns(normPref) }
         val combined = mutableListOf<StopArrival>()
 
-        // 1. Query GTT Official Palina + MATO GraphQL in parallel for lowest latency and highest accuracy
+        // 1. Query GTT Official Palina + MATO GraphQL in parallel with strict bounded timeouts
         val (palinaArrivals, matoArrivals) = coroutineScope {
             val palinaDeferred = async {
-                GttStopArrivalsParser.queryGttPalinaStopArrivals(
-                    httpClient = matoFastHttpClient,
-                    userAgent = USER_AGENT,
-                    stop = stop,
-                    nowMillis = nowMillis,
-                )
+                withTimeoutOrNull(2_600L) {
+                    GttStopArrivalsParser.queryGttPalinaStopArrivals(
+                        httpClient = matoFastHttpClient,
+                        userAgent = USER_AGENT,
+                        stop = stop,
+                        nowMillis = nowMillis,
+                    )
+                }.orEmpty()
             }
             val matoDeferred = async {
-                GttStopArrivalsParser.queryMatoStopArrivals(
-                    httpClient = matoFastHttpClient,
-                    userAgent = USER_AGENT,
-                    endpoints = MATO_GRAPHQL_ENDPOINTS,
-                    stop = stop,
-                    nowMillis = nowMillis,
-                )
+                withTimeoutOrNull(2_600L) {
+                    GttStopArrivalsParser.queryMatoStopArrivals(
+                        httpClient = matoFastHttpClient,
+                        userAgent = USER_AGENT,
+                        endpoints = MATO_GRAPHQL_ENDPOINTS,
+                        stop = stop,
+                        nowMillis = nowMillis,
+                    )
+                }.orEmpty()
             }
             palinaDeferred.await() to matoDeferred.await()
         }
 
-        // 2. Live GTT GTFS-RT TripUpdates stop predictions (refresh if empty or older than 25s)
+        // 2. Live GTT GTFS-RT TripUpdates stop predictions (refresh if empty or older than 25s, capped cleanly)
         val tripUpdates = if (lastTripUpdates.isEmpty() || nowMillis - lastTripUpdatesFetchMillis > 25_000L) {
-            val fresh = fetchTripUpdatesSource().updates
+            val fresh = withTimeoutOrNull(2_200L) { fetchTripUpdatesSource().updates }.orEmpty()
             if (fresh.isNotEmpty()) {
                 lastTripUpdates = fresh
                 lastTripUpdatesFetchMillis = nowMillis
@@ -1835,31 +1918,38 @@ class GttRealtimeRepository private constructor(context: Context) {
                     add(normPref)
                 }
             }
-        }.distinct().take(8)
+        }.distinct().take(6)
 
-        val (otherLinePatterns, extraSingleLineVehicles) = coroutineScope {
-            val patternsDeferred = otherLineCodes.map { code ->
-                async {
-                    val lineTrips = allLivePool
-                        .asSequence()
-                        .filter { it.lineCode.equals(code, ignoreCase = true) }
-                        .mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }
-                        .toSet()
-                    code to getFastRoutePatternsForLine(code, lineTrips)
+        val partialPatterns = ConcurrentHashMap<String, List<RoutePattern>>()
+        val partialExtraVehicles = java.util.Collections.synchronizedList(mutableListOf<BusVehicle>())
+        withTimeoutOrNull(2_400L) {
+            coroutineScope {
+                otherLineCodes.forEach { code ->
+                    async {
+                        val lineTrips = allLivePool
+                            .asSequence()
+                            .filter { it.lineCode.equals(code, ignoreCase = true) }
+                            .mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }
+                            .toSet()
+                        val patterns = getFastRoutePatternsForLine(code, lineTrips)
+                        if (patterns.isNotEmpty()) {
+                            partialPatterns[code] = patterns
+                        }
+                    }
+                }
+                linesNeedingMatoLive.forEach { code ->
+                    async {
+                        val extra = fetchLiveVehiclesForSingleLine(code)
+                        if (extra.isNotEmpty()) {
+                            partialExtraVehicles.addAll(extra)
+                        }
+                    }
                 }
             }
-            val matoLinesDeferred = linesNeedingMatoLive.map { code ->
-                async {
-                    fetchLiveVehiclesForSingleLine(code)
-                }
-            }
-            val patternsMap = patternsDeferred
-                .map { it.await() }
-                .filter { it.second.isNotEmpty() }
-                .toMap()
-            val extraVehicles = matoLinesDeferred
-                .flatMap { it.await() }
-            patternsMap to extraVehicles
+        }
+        val otherLinePatterns: Map<String, List<RoutePattern>> = HashMap(partialPatterns)
+        val extraSingleLineVehicles: List<BusVehicle> = synchronized(partialExtraVehicles) {
+            partialExtraVehicles.toList()
         }
 
         val enrichedAllLivePool = if (extraSingleLineVehicles.isNotEmpty()) {
@@ -1952,6 +2042,13 @@ class GttRealtimeRepository private constructor(context: Context) {
             detail = "out=${finalArrivals.size} (RT=$rtCount GPS=$linkedGps) · Palina=${palinaArrivals.size} MaTO=${matoArrivals.size} extraBus=${extraSingleLineVehicles.size}",
             severity = if (finalArrivals.isNotEmpty()) DiagSeverity.OK else DiagSeverity.INFO,
         )
+        if (finalArrivals.isNotEmpty()) {
+            stopArrivalsCache[cacheKey] = CachedStopArrivals(nowMillis, finalArrivals)
+            if (stopArrivalsCache.size > 40) {
+                val cutoff = nowMillis - STOP_ARRIVALS_CACHE_TTL_MS * 3L
+                stopArrivalsCache.entries.removeIf { it.value.fetchedAtMillis < cutoff }
+            }
+        }
         finalArrivals
     }
 
@@ -1998,6 +2095,7 @@ class GttRealtimeRepository private constructor(context: Context) {
         internal const val OVERLAY_HTTP_CACHE_TTL_MS = GttVehicleMergeEngine.OVERLAY_HTTP_CACHE_TTL_MS
         private const val SINGLE_LINE_LIVE_CACHE_TTL_MS = 25_000L
         private const val SINGLE_LINE_EMPTY_CACHE_TTL_MS = 10_000L
+        private const val STOP_ARRIVALS_CACHE_TTL_MS = 12_000L
         private val METRO_LINE_SUMMARY = GttVehicleMergeEngine.METRO_LINE_SUMMARY
 
         @Volatile
@@ -2064,6 +2162,7 @@ class GttRealtimeRepository private constructor(context: Context) {
             nowMillis: Long,
             focusLine: String? = null,
             sourceReports: Map<String, SourceHealthReport> = emptyMap(),
+            previousPoses: Map<String, GttVehicleMergeEngine.VehicleKinematicPose> = emptyMap(),
         ): List<BusVehicle> = GttVehicleMergeEngine.mergeMultiSourceVehicles(
             matoVehicles = matoVehicles,
             gttVehicles = gttVehicles,
@@ -2071,6 +2170,7 @@ class GttRealtimeRepository private constructor(context: Context) {
             nowMillis = nowMillis,
             focusLine = focusLine,
             sourceReports = sourceReports,
+            previousPoses = previousPoses,
         )
 
         internal fun parseGttPalinaJson(

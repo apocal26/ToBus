@@ -50,10 +50,19 @@ object WebMercator {
         return sx to sy
     }
 
+    private fun GeoPoint.isValidCoord(): Boolean =
+        lat.isFinite() &&
+            lon.isFinite() &&
+            lat in -85.0..85.0 &&
+            lon in -180.0..180.0 &&
+            (kotlin.math.abs(lat) > 0.05 || kotlin.math.abs(lon) > 0.05)
+
     /**
-     * Computes a clean camera framing the full route geometry AND active on-route buses
-     * (ignoring far-away depot outliers when route geometry exists), so neither the route
-     * nor live buses get clipped on the widget or map.
+     * Computes a clean camera framing the full route geometry (and optionally nearby buses).
+     *
+     * Note on units: [viewportWidthPx] / [viewportHeightPx] must match the tile coordinate space of
+     * the target renderer (physical pixels for 256px-tile bitmap rendering, or logical `dp` for
+     * MapLibre Android where 512pt tiles scale by display density and `mlZoom = zoom - 1.0`).
      */
     fun computeAutoFitCamera(
         vehicles: List<BusVehicle>,
@@ -64,14 +73,17 @@ object WebMercator {
         maxZoom: Double = 14.8,
         topPaddingFraction: Double = paddingFraction,
         bottomPaddingFraction: Double = paddingFraction,
+        includeNearbyVehicles: Boolean = true,
     ): CameraState {
-        val routePoints = patterns.flatMap { it.points }
+        val routePoints = patterns.flatMap { pattern ->
+            pattern.points.ifEmpty { pattern.stops.map { GeoPoint(it.lat, it.lon) } }
+        }.filter { it.isValidCoord() }
         val nonDepotVehicles = vehicles.filter {
             com.example.data.model.GttFleetAnalyzer.findDepot(it.latitude, it.longitude) == null
         }
-        val activeVehiclePoints = (nonDepotVehicles.ifEmpty { vehicles }).map {
-            GeoPoint(it.latitude, it.longitude)
-        }
+        val activeVehiclePoints = (nonDepotVehicles.ifEmpty { vehicles })
+            .map { GeoPoint(it.latitude, it.longitude) }
+            .filter { it.isValidCoord() }
 
         val points = when {
             routePoints.isNotEmpty() -> routePoints
@@ -98,8 +110,8 @@ object WebMercator {
             maxLon = max(maxLon, p.lon)
         }
 
-        // Expand gently to include nearby active buses (within ~800m of route bounds)
-        if (routePoints.isNotEmpty() && activeVehiclePoints.isNotEmpty()) {
+        // Expand gently to include nearby active buses (within ~800m of route bounds) when requested (e.g. widget)
+        if (includeNearbyVehicles && routePoints.isNotEmpty() && activeVehiclePoints.isNotEmpty()) {
             val marginDeg = 0.008
             for (v in activeVehiclePoints) {
                 if (v.lat in (minLat - marginDeg)..(maxLat + marginDeg) &&

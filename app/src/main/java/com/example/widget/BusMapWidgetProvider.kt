@@ -118,14 +118,20 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
 
             ACTION_WIDGET_REFRESH -> {
                 val manual = intent.getBooleanExtra(EXTRA_MANUAL_TAP, false)
-                // Always re-arm the next self-rescheduling alarm first so a skipped or failed tick never breaks updates
-                val interval = ToBusPreferences.getInstance(appContext).currentSettings().refreshInterval
+                val prefs = ToBusPreferences.getInstance(appContext)
+                // Always re-arm the next self-rescheduling alarm + JobScheduler backup first
+                val interval = prefs.currentSettings().refreshInterval
                 schedulePeriodicUpdates(appContext, interval)
 
-                // Energy saving: skip automatic background alarm refresh if Battery Saver is active
+                // Battery Saver: throttle automatic background refreshes conservatively (>= max(2x, 15m))
+                // rather than starving widgets indefinitely.
                 if (!manual) {
                     val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
-                    if (pm?.isPowerSaveMode == true) return
+                    if (pm?.isPowerSaveMode == true) {
+                        val minPowerSaveGapMs = maxOf(interval.minutes * 2L, 15L) * 60_000L
+                        val elapsed = System.currentTimeMillis() - prefs.getLastWidgetRefreshAttemptMillis()
+                        if (elapsed < minPowerSaveGapMs) return
+                    }
                 }
 
                 val pendingResult = goAsync()
@@ -173,6 +179,27 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             val fetchFailed: Boolean,
             val patterns: List<RoutePattern>,
         )
+
+        fun hasAnyInstalledWidgets(context: Context): Boolean {
+            val appContext = context.applicationContext
+            val manager = AppWidgetManager.getInstance(appContext)
+            return manager.getAppWidgetIds(ComponentName(appContext, BusMapWidgetProvider::class.java)).isNotEmpty() ||
+                manager.getAppWidgetIds(ComponentName(appContext, BusMapWidgetSquareProvider::class.java)).isNotEmpty() ||
+                manager.getAppWidgetIds(ComponentName(appContext, StopArrivalsWidgetProvider::class.java)).isNotEmpty() ||
+                manager.getAppWidgetIds(ComponentName(appContext, FavoriteAlertsWidgetProvider::class.java)).isNotEmpty()
+        }
+
+        suspend fun refreshAllWidgetsSynchronously(
+            context: Context,
+            showLoadingFeedback: Boolean,
+            useCachedOnly: Boolean,
+        ) {
+            refreshAllInstalledWidgets(
+                context = context.applicationContext,
+                showLoadingFeedback = showLoadingFeedback,
+                useCachedOnly = useCachedOnly,
+            )
+        }
 
         fun requestUpdateAllWidgets(context: Context) {
             val appContext = context.applicationContext
@@ -259,6 +286,10 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
             val alertIds = manager.getAppWidgetIds(ComponentName(context, FavoriteAlertsWidgetProvider::class.java))
             if (wideIds.isEmpty() && squareIds.isEmpty() && stopIds.isEmpty() && alertIds.isEmpty()) return
 
+            if (!useCachedOnly) {
+                ToBusPreferences.getInstance(context).setLastWidgetRefreshAttemptMillis(System.currentTimeMillis())
+            }
+
             if (showLoadingFeedback) {
                 wideIds.forEach { id ->
                     val loading = RemoteViews(context.packageName, R.layout.widget_bus_map)
@@ -272,97 +303,142 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
                 }
             }
 
-            // Single shared fast fetch for all map widgets (well within Android's 10s BroadcastReceiver limit)
+            // Refresh Map, Stop Arrivals, and Favorite Alerts widgets IN PARALLEL inside Android's
+            // 10s BroadcastReceiver budget so a slow endpoint on one widget never starves the others.
             val hasMapWidgets = wideIds.isNotEmpty() || squareIds.isNotEmpty()
-            if (hasMapWidgets) {
-                val (snapshot, fetchFailed, patterns) = fetchWidgetDataFast(context, useCachedOnly = useCachedOnly)
-                for (id in wideIds) {
-                    updateSingleWidget(
-                        context = context,
-                        appWidgetManager = manager,
-                        appWidgetId = id,
-                        isSquare = false,
-                        preloadedSnapshot = snapshot,
-                        preloadedPatterns = patterns,
-                        fetchFailed = fetchFailed,
-                    )
-                }
-                for (id in squareIds) {
-                    updateSingleWidget(
-                        context = context,
-                        appWidgetManager = manager,
-                        appWidgetId = id,
-                        isSquare = true,
-                        preloadedSnapshot = snapshot,
-                        preloadedPatterns = patterns,
-                        fetchFailed = fetchFailed,
-                    )
+            withTimeoutOrNull(8_200L) {
+                coroutineScope {
+                    val mapJob = if (hasMapWidgets) {
+                        async {
+                            val (snapshot, fetchFailed, patterns) = fetchWidgetDataFast(
+                                context,
+                                useCachedOnly = useCachedOnly,
+                            )
+                            for (id in wideIds) {
+                                updateSingleWidget(
+                                    context = context,
+                                    appWidgetManager = manager,
+                                    appWidgetId = id,
+                                    isSquare = false,
+                                    preloadedSnapshot = snapshot,
+                                    preloadedPatterns = patterns,
+                                    fetchFailed = fetchFailed,
+                                )
+                            }
+                            for (id in squareIds) {
+                                updateSingleWidget(
+                                    context = context,
+                                    appWidgetManager = manager,
+                                    appWidgetId = id,
+                                    isSquare = true,
+                                    preloadedSnapshot = snapshot,
+                                    preloadedPatterns = patterns,
+                                    fetchFailed = fetchFailed,
+                                )
+                            }
+                        }
+                    } else {
+                        null
+                    }
+                    val stopsJob = if (stopIds.isNotEmpty()) {
+                        async {
+                            StopArrivalsWidgetProvider.refreshAllStopWidgets(
+                                context,
+                                showLoading = showLoadingFeedback,
+                            )
+                        }
+                    } else {
+                        null
+                    }
+                    val alertsJob = if (alertIds.isNotEmpty()) {
+                        async {
+                            val cachedAlerts = if (useCachedOnly) {
+                                GttRealtimeRepository.getInstance(context).getLastCachedSnapshot()?.alerts
+                            } else {
+                                null
+                            }
+                            FavoriteAlertsWidgetProvider.refreshAllAlertWidgets(
+                                context = context,
+                                showLoading = showLoadingFeedback,
+                                preloadedAlerts = cachedAlerts,
+                            )
+                        }
+                    } else {
+                        null
+                    }
+                    mapJob?.await()
+                    stopsJob?.await()
+                    alertsJob?.await()
                 }
             }
+        }
 
-            if (stopIds.isNotEmpty()) {
-                StopArrivalsWidgetProvider.refreshAllStopWidgets(context, showLoading = showLoadingFeedback)
+        fun ensurePeriodicAlarmScheduled(context: Context, interval: RefreshInterval) {
+            val appContext = context.applicationContext
+            if (interval == RefreshInterval.MANUAL || !hasAnyInstalledWidgets(appContext)) {
+                cancelPeriodicUpdates(appContext)
+                return
             }
-            if (alertIds.isNotEmpty()) {
-                val cachedAlerts = if (useCachedOnly) {
-                    GttRealtimeRepository.getInstance(context).getLastCachedSnapshot()?.alerts
-                } else {
-                    null
-                }
-                FavoriteAlertsWidgetProvider.refreshAllAlertWidgets(
-                    context = context,
-                    showLoading = showLoadingFeedback,
-                    preloadedAlerts = cachedAlerts,
-                )
+            val flags = PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            val existing = PendingIntent.getBroadcast(
+                appContext,
+                PERIODIC_REQUEST_CODE,
+                Intent(appContext, BusMapWidgetProvider::class.java).apply { action = ACTION_WIDGET_REFRESH },
+                flags,
+            )
+            if (existing == null) {
+                schedulePeriodicUpdates(appContext, interval)
             }
         }
 
         fun schedulePeriodicUpdates(context: Context, interval: RefreshInterval) {
             val appContext = context.applicationContext
-            val alarmManager = appContext.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val alarmManager = appContext.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
             val pi = buildPeriodicPendingIntent(appContext)
-            alarmManager.cancel(pi)
+            alarmManager?.cancel(pi)
 
-            if (interval == RefreshInterval.MANUAL) return
-
-            val manager = AppWidgetManager.getInstance(appContext)
-            val hasWide = manager.getAppWidgetIds(ComponentName(appContext, BusMapWidgetProvider::class.java)).isNotEmpty()
-            val hasSquare = manager.getAppWidgetIds(ComponentName(appContext, BusMapWidgetSquareProvider::class.java)).isNotEmpty()
-            val hasStops = manager.getAppWidgetIds(ComponentName(appContext, StopArrivalsWidgetProvider::class.java)).isNotEmpty()
-            val hasAlerts = manager.getAppWidgetIds(ComponentName(appContext, FavoriteAlertsWidgetProvider::class.java)).isNotEmpty()
-            if (!hasWide && !hasSquare && !hasStops && !hasAlerts) return
-
-            val intervalMillis = interval.minutes * 60_000L
-            val triggerAtMillis = SystemClock.elapsedRealtime() + intervalMillis
-
-            // Self-rescheduling non-wakeup alarm: never wakes a sleeping screen, requires no exact-alarm
-            // permission, and uses setAndAllowWhileIdle on Android M+ so Doze batching doesn't starve updates.
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    alarmManager.setAndAllowWhileIdle(
-                        AlarmManager.ELAPSED_REALTIME,
-                        triggerAtMillis,
-                        pi,
-                    )
-                } else {
-                    val windowMillis = (intervalMillis / 3L).coerceIn(15_000L, 60_000L)
-                    alarmManager.setWindow(
-                        AlarmManager.ELAPSED_REALTIME,
-                        triggerAtMillis,
-                        windowMillis,
-                        pi,
-                    )
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Fallback AlarmManager.set: ${e.message}")
-                alarmManager.set(AlarmManager.ELAPSED_REALTIME, triggerAtMillis, pi)
+            val hasWidgets = hasAnyInstalledWidgets(appContext)
+            if (interval == RefreshInterval.MANUAL || !hasWidgets) {
+                WidgetRefreshJobScheduler.syncSchedule(appContext, interval, hasInstalledWidgets = hasWidgets)
+                return
             }
+
+            if (alarmManager != null) {
+                val intervalMillis = interval.minutes * 60_000L
+                val triggerAtMillis = SystemClock.elapsedRealtime() + intervalMillis
+
+                // Self-rescheduling non-wakeup alarm: never wakes a sleeping screen, requires no exact-alarm
+                // permission, and uses setAndAllowWhileIdle on Android M+ so Doze batching doesn't starve updates.
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        alarmManager.setAndAllowWhileIdle(
+                            AlarmManager.ELAPSED_REALTIME,
+                            triggerAtMillis,
+                            pi,
+                        )
+                    } else {
+                        val windowMillis = (intervalMillis / 3L).coerceIn(15_000L, 60_000L)
+                        alarmManager.setWindow(
+                            AlarmManager.ELAPSED_REALTIME,
+                            triggerAtMillis,
+                            windowMillis,
+                            pi,
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Fallback AlarmManager.set: ${e.message}")
+                    alarmManager.set(AlarmManager.ELAPSED_REALTIME, triggerAtMillis, pi)
+                }
+            }
+
+            WidgetRefreshJobScheduler.syncSchedule(appContext, interval, hasInstalledWidgets = true)
         }
 
         fun cancelPeriodicUpdates(context: Context) {
             val appContext = context.applicationContext
-            val alarmManager = appContext.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-            alarmManager.cancel(buildPeriodicPendingIntent(appContext))
+            val alarmManager = appContext.getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+            alarmManager?.cancel(buildPeriodicPendingIntent(appContext))
+            WidgetRefreshJobScheduler.cancel(appContext)
         }
 
         private fun buildPeriodicPendingIntent(context: Context): PendingIntent {
@@ -495,7 +571,7 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
 
             val favorites = prefs.currentFavoriteStops()
             val nowMillis = System.currentTimeMillis()
-            vehicles = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(vehicles, patterns, nowMillis)
+            vehicles = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(vehicles, patterns, nowMillis)
             val displayedVehiclesCount = if (settings.hideInactiveInWidget) {
                 vehicles.count { bus ->
                     val health = GttFleetAnalyzer.assess(bus, patterns, nowMillis)

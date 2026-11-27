@@ -61,6 +61,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /**
  * MapLibre GL uses 512px vector tiles, whereas WebMercator/CameraState uses 256px scale:
@@ -118,6 +119,8 @@ fun InteractiveTurinMap(
     precomputedDirectionById: Map<String, Int?>? = null,
     onCameraChange: (CameraState) -> Unit,
     onViewportSizeChange: (Int, Int) -> Unit,
+    onCameraFlyConsumed: (Long) -> Unit = {},
+    onMapReadyChanged: (Boolean) -> Unit = {},
     onVehicleTap: (BusVehicle?) -> Unit,
     onStopTap: (TransitStop?) -> Unit,
     modifier: Modifier = Modifier,
@@ -219,7 +222,15 @@ fun InteractiveTurinMap(
     var mapLibreMap by remember { mutableStateOf<MapLibreMap?>(null) }
     var activeStyle by remember { mutableStateOf<Style?>(null) }
     var styleReadyTick by remember { mutableIntStateOf(0) }
+    var hasViewportLayout by remember { mutableStateOf(false) }
 
+    val latestRoutePatterns by rememberUpdatedState(routePatterns)
+    val latestFavoriteStopIds by rememberUpdatedState(favoriteStopIds)
+    val latestSelectedStopId by rememberUpdatedState(selectedStopId)
+    val latestHighlightedMainDirectionId by rememberUpdatedState(highlightedMainDirectionId)
+    val latestHasExternalRouteFocus by rememberUpdatedState(hasExternalRouteFocus)
+    val latestFocusedExternalRoutePatterns by rememberUpdatedState(focusedExternalRoutePatterns)
+    val latestUserLocation by rememberUpdatedState(userLocation)
     val latestVehicles by rememberUpdatedState(vehicles)
     val latestExternalBus by rememberUpdatedState(activeExternalBus)
     val latestSelectedVehicleId by rememberUpdatedState(selectedVehicleId)
@@ -231,6 +242,8 @@ fun InteractiveTurinMap(
     val latestFocusedDirectionFilter by rememberUpdatedState(focusedDirectionFilter)
     val latestVisibleStops by rememberUpdatedState(visibleStops)
     val latestOnCameraChange by rememberUpdatedState(onCameraChange)
+    val latestOnCameraFlyConsumed by rememberUpdatedState(onCameraFlyConsumed)
+    val latestOnMapReadyChanged by rememberUpdatedState(onMapReadyChanged)
     val latestOnVehicleTap by rememberUpdatedState(onVehicleTap)
     val latestOnStopTap by rememberUpdatedState(onStopTap)
 
@@ -377,6 +390,7 @@ fun InteractiveTurinMap(
         mapView.addOnDidFailLoadingMapListener(failListener)
 
         onDispose {
+            latestOnMapReadyChanged(false)
             mapView.removeOnDidFailLoadingMapListener(failListener)
             lifecycleOwner.lifecycle.removeObserver(observer)
             activeStyle = null
@@ -501,6 +515,7 @@ fun InteractiveTurinMap(
     LaunchedEffect(mapLibreMap, mapStyle) {
         val map = mapLibreMap ?: return@LaunchedEffect
         activeStyle = null
+        latestOnMapReadyChanged(false)
         val (styleJson, preRenderedLandmarks, preRenderedTransit) = withContext(Dispatchers.Default) {
             Triple(
                 TurinVectorStyleBuilder.buildStyleJson(mapStyle),
@@ -513,6 +528,61 @@ fun InteractiveTurinMap(
                 installMajorLandmarksLayer(style, mapStyle, density, preRenderedLandmarks = preRenderedLandmarks)
                 registerTransitSprites(style, density, preRendered = preRenderedTransit)
                 installTransitLayers(style, isDarkBasemap = mapStyle.isDark)
+
+                // Synchronously hydrate all sources & visibilities BEFORE exposing the ready map
+                val routeVis = if (latestShowRouteLine) Property.VISIBLE else Property.NONE
+                style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.ROUTE_SOURCE)?.setGeoJson(
+                    buildRoutesFeatureCollection(
+                        routePatterns = latestRoutePatterns,
+                        colorByDirection = latestColorByDirection,
+                        highlightedDirectionId = latestHighlightedMainDirectionId,
+                        dimAll = latestHasExternalRouteFocus,
+                    ),
+                )
+                style.getLayer(MapLibreTransitIds.ROUTE_CASING_LAYER)?.setProperties(PropertyFactory.visibility(routeVis))
+                style.getLayer(MapLibreTransitIds.ROUTE_GLOW_LAYER)?.setProperties(PropertyFactory.visibility(routeVis))
+                style.getLayer(MapLibreTransitIds.ROUTE_CORE_LAYER)?.setProperties(PropertyFactory.visibility(routeVis))
+                style.getLayer(MapLibreTransitIds.ROUTE_ARROWS_LAYER)?.setProperties(PropertyFactory.visibility(routeVis))
+
+                val extBus = latestExternalBus
+                val extPatterns = latestFocusedExternalRoutePatterns
+                style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.EXTERNAL_ROUTE_SOURCE)?.setGeoJson(
+                    buildExternalRouteFeatureCollection(extBus, extPatterns),
+                )
+                val extVis = if (extBus != null && extPatterns.isNotEmpty()) Property.VISIBLE else Property.NONE
+                style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_CASING_LAYER)?.setProperties(PropertyFactory.visibility(extVis))
+                style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_GLOW_LAYER)?.setProperties(PropertyFactory.visibility(extVis))
+                style.getLayer(MapLibreTransitIds.EXTERNAL_ROUTE_CORE_LAYER)?.setProperties(PropertyFactory.visibility(extVis))
+
+                val selStopId = latestSelectedStopId
+                style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.STOPS_SOURCE)?.setGeoJson(
+                    buildStopsFeatureCollection(
+                        stops = latestVisibleStops,
+                        routePatterns = latestRoutePatterns,
+                        favoriteStopIds = latestFavoriteStopIds,
+                        selectedStopId = selStopId,
+                        colorByDirection = latestColorByDirection,
+                        highlightedDirectionId = latestHighlightedMainDirectionId,
+                        dimAll = latestHasExternalRouteFocus,
+                    ),
+                )
+                val stopsVis = if (latestShowRouteLine || selStopId != null) Property.VISIBLE else Property.NONE
+                style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
+                style.getLayer(MapLibreTransitIds.STOPS_DOT_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
+                style.getLayer(MapLibreTransitIds.STOPS_FAV_STAR_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
+                style.getLayer(MapLibreTransitIds.STOPS_SELECTED_LABEL_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
+
+                val userLoc = latestUserLocation
+                style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.USER_SOURCE)?.setGeoJson(
+                    if (userLoc != null) {
+                        FeatureCollection.fromFeature(
+                            Feature.fromGeometry(Point.fromLngLat(userLoc.lon, userLoc.lat)),
+                        )
+                    } else {
+                        FeatureCollection.fromFeatures(emptyArray())
+                    },
+                )
+
                 pushLineBusesToStyle(style, busMotionProgress.value)
                 pushExternalBusToStyle(style, busMotionProgress.value)
             }.onFailure { err ->
@@ -520,13 +590,16 @@ fun InteractiveTurinMap(
             }
             activeStyle = style
             styleReadyTick++
+            latestOnMapReadyChanged(true)
         }
     }
 
     // Smooth GPU camera flight when centering on GPS, a bus, a favorite stop, or a newly selected line
-    LaunchedEffect(mapLibreMap, cameraFlyRequest?.id) {
+    LaunchedEffect(mapLibreMap, hasViewportLayout, isMapResumed, cameraFlyRequest?.id) {
         val map = mapLibreMap ?: return@LaunchedEffect
         val req = cameraFlyRequest ?: return@LaunchedEffect
+        if (!hasViewportLayout) return@LaunchedEffect
+        if (!req.instant && !isMapResumed) return@LaunchedEffect
         val mlZoom = (req.target.zoom - ML_ZOOM_OFFSET).coerceIn(MIN_ML_ZOOM, MAX_ML_ZOOM)
         // When a bottom glass inspector/stop sheet is open on compact screens, shift target gently south
         // so the focused bus/stop lands dead-center in the open map viewport ABOVE the card instead of hidden behind it.
@@ -552,10 +625,17 @@ fun InteractiveTurinMap(
             abs(currentTarget.longitude - req.target.centerLon) < 1e-6 &&
             abs(current.zoom - targetPos.zoom) < 0.02
         ) {
+            latestOnCameraFlyConsumed(req.id)
             return@LaunchedEffect
         }
         map.cancelTransitions()
-        map.animateCamera(CameraUpdateFactory.newCameraPosition(targetPos), 460)
+        if (req.instant) {
+            map.moveCamera(CameraUpdateFactory.newCameraPosition(targetPos))
+        } else {
+            val durationMs = if (selectedVehicleId != null || selectedStopId != null) 540 else 820
+            map.animateCamera(CameraUpdateFactory.newCameraPosition(targetPos), durationMs)
+        }
+        latestOnCameraFlyConsumed(req.id)
     }
 
     // Update Route Polylines & visibility (highlighting selected bus direction or dimming when inspecting external bus)
@@ -718,7 +798,7 @@ fun InteractiveTurinMap(
                 )
                 val bearingChanged = currentPose.bearing != null && nextPose.bearing != null &&
                     GttFleetAnalyzer.angleDiffDeg(currentPose.bearing.toDouble(), nextPose.bearing.toDouble()) > 3.0
-                if (distM in 2.0..2500.0 || (distM < 2500.0 && bearingChanged)) {
+                if (distM in 2.0..650.0 || (distM < 650.0 && bearingChanged)) {
                     fromPoseById[id] = currentPose
                     toPoseById[id] = nextPose
                     anyMoved = true
@@ -806,7 +886,11 @@ fun InteractiveTurinMap(
             .testTag("interactive_turin_map")
             .onSizeChanged { size ->
                 if (size.width > 0 && size.height > 0) {
-                    onViewportSizeChange(size.width, size.height)
+                    hasViewportLayout = true
+                    val safeDensity = density.coerceAtLeast(1f)
+                    val widthDp = (size.width / safeDensity).roundToInt().coerceAtLeast(1)
+                    val heightDp = (size.height / safeDensity).roundToInt().coerceAtLeast(1)
+                    onViewportSizeChange(widthDp, heightDp)
                 }
             },
     ) {

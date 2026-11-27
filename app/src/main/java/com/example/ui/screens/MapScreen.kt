@@ -132,9 +132,12 @@ fun MapScreen(
     isForegroundActive: Boolean,
     isWideScreen: Boolean = false,
     showStartupOverlay: Boolean = false,
+    isMapReady: Boolean = true,
     bottomNavClearance: Dp,
     onCameraChange: (CameraState) -> Unit,
     onViewportSizeChange: (Int, Int) -> Unit,
+    onCameraFlyConsumed: (Long) -> Unit = {},
+    onMapReadyChanged: (Boolean) -> Unit = {},
     onOpenLinePicker: () -> Unit,
     onRefresh: () -> Unit,
     onUserLocationClick: () -> Unit,
@@ -353,6 +356,8 @@ fun MapScreen(
             precomputedDirectionById = resolvedDirectionById,
             onCameraChange = onCameraChange,
             onViewportSizeChange = onViewportSizeChange,
+            onCameraFlyConsumed = onCameraFlyConsumed,
+            onMapReadyChanged = onMapReadyChanged,
             onVehicleTap = handleSelectVehicle,
             onStopTap = handleSelectStop,
             modifier = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && startupBlurDp > 0.5.dp) {
@@ -1185,16 +1190,17 @@ fun MapScreen(
 
         AnimatedVisibility(
             visible = showStartupOverlay,
-            enter = fadeIn(animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing)) +
-                scaleIn(initialScale = 0.96f, animationSpec = tween(durationMillis = 280, easing = FastOutSlowInEasing)),
-            exit = fadeOut(animationSpec = tween(durationMillis = 340, easing = FastOutSlowInEasing)) +
-                scaleOut(targetScale = 1.03f, animationSpec = tween(durationMillis = 340, easing = FastOutSlowInEasing)),
+            enter = fadeIn(animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing)) +
+                scaleIn(initialScale = 0.97f, animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)),
+            exit = fadeOut(animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing)) +
+                scaleOut(targetScale = 1.02f, animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing)),
             modifier = Modifier.fillMaxSize(),
         ) {
             StartupGlassLoadingOverlay(
                 selectedLine = uiState.settings.selectedLine,
                 isRouteReady = uiState.routePatterns.isNotEmpty() || !uiState.isLoadingInitialRoute,
                 isFeedReady = uiState.lastUpdatedMillis != null || !uiState.isLoadingFeed,
+                isMapReady = isMapReady,
             )
         }
     }
