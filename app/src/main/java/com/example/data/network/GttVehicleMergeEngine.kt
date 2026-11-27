@@ -411,9 +411,9 @@ internal object GttVehicleMergeEngine {
                 // Priority 1: Any non-frozen source beats a frozen source regardless of fake timestamps
                 existingFrozen && !vFrozen -> true
                 vFrozen && !existingFrozen -> false
-                // Priority 2: Confirmed real movement on this vehicle beats a stuck competitor
-                vMoving && existingStuck && coordsDiverge -> true
-                existingMoving && vStuck && coordsDiverge -> false
+                // Priority 2: Confirmed real movement or non-stuck source beats a stuck competitor
+                (vMoving || !vStuck) && existingStuck && coordsDiverge -> true
+                (existingMoving || !existingStuck) && vStuck && coordsDiverge -> false
                 // Priority 3: Healthy MaTO Live precedence window over healthy GTFS-RT/BusOne
                 isMato && !existingIsMato ->
                     existing.timestampSeconds <= 0L ||
@@ -433,10 +433,10 @@ internal object GttVehicleMergeEngine {
             val winner = if (incomingWins) v else existing
             val loser = if (incomingWins) existing else v
             val loserFrozen = if (incomingWins) existingFrozen else vFrozen
-            val winnerMoving = if (incomingWins) vMoving else existingMoving
+            val winnerMovingOrUnstuck = if (incomingWins) (vMoving || !vStuck) else (existingMoving || !existingStuck)
             val loserStuck = if (incomingWins) existingStuck else vStuck
             val loserImplausible = if (incomingWins) existingImplausible else vImplausible
-            val loserStaleDiverged = (loserFrozen || (winnerMoving && loserStuck) || loserImplausible) && coordsDiverge
+            val loserStaleDiverged = (loserFrozen || (winnerMovingOrUnstuck && loserStuck) || loserImplausible) && coordsDiverge
 
             // Prefer the real physical fleet matricola over a tripId fallback whenever both describe one bus
             val preferredPhysicalId = when {

@@ -794,15 +794,16 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             }
             ?.sortedBy { it.vehicleId }
             .orEmpty()
-        val filtered = if (isSameLoadedLine) {
-            GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
-                vehicles = rawFiltered,
-                routePatterns = previousState.routePatterns,
-                nowMillis = System.currentTimeMillis(),
-            )
+        val candidatePatterns = if (isSameLoadedLine) {
+            previousState.routePatterns
         } else {
-            rawFiltered
+            repository.getMemoryCachedRoutePatterns(cleaned)
         }
+        val filtered = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
+            vehicles = rawFiltered,
+            routePatterns = candidatePatterns,
+            nowMillis = System.currentTimeMillis(),
+        )
 
         val allAlerts = if (updated.showServiceAlerts) cachedSnapshot?.alerts.orEmpty() else emptyList()
         val lineAlerts = if (updated.showServiceAlerts) filterAlertsForLine(allAlerts, cleaned) else emptyList()

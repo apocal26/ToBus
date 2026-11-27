@@ -7,6 +7,7 @@ import com.example.data.model.BusVehicle
 import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.GttDataOutageReport
+import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LineSummary
 import com.example.data.model.LiveFeedSnapshot
 import com.example.data.model.RoutePattern
@@ -236,6 +237,7 @@ class GttRealtimeRepository private constructor(context: Context) {
         sourceHealthTracker.reset()
         movementTracker.clear()
         kinematicTracker.clear()
+        matoMqttClient.clearGhostHistory()
         stopArrivalsCache.clear()
         outageDetector.reset()
         lastSourceReports = emptyMap()
@@ -244,6 +246,53 @@ class GttRealtimeRepository private constructor(context: Context) {
             message = "Azzerati tracker GPS bloccati, movimento e rilevatore disservizi",
             severity = DiagSeverity.OK,
         )
+    }
+
+    private fun onMatoGraphQlTimestampObserved(
+        vehicleId: String,
+        lineCode: String,
+        lat: Double,
+        lon: Double,
+        timestampSeconds: Long,
+        isStale: Boolean,
+        nowMillis: Long,
+    ) {
+        matoMqttClient.recordGraphQlVehicleObservation(
+            vehicleId = vehicleId,
+            lineCode = lineCode,
+            lat = lat,
+            lon = lon,
+            timestampSeconds = timestampSeconds,
+            isStale = isStale,
+            nowMillis = nowMillis,
+        )
+        if (isStale && timestampSeconds > 1_600_000_000L) {
+            val canonVid = GtfsRtProtobufParser.canonicalFleetId(vehicleId).ifBlank { vehicleId.trim() }
+            if (canonVid.isNotEmpty()) {
+                val trueFixMillis = (timestampSeconds * 1000L).coerceAtMost(nowMillis)
+                val prev = movementTracker[canonVid]
+                if (prev == null) {
+                    movementTracker[canonVid] = MovementRecord(
+                        anchorLat = lat,
+                        anchorLon = lon,
+                        lastLat = lat,
+                        lastLon = lon,
+                        lastMovedAtMillis = trueFixMillis,
+                        firstSeenAtPositionMillis = trueFixMillis,
+                        lastObservedAtMillis = nowMillis,
+                    )
+                } else {
+                    val dist = GttVehicleMergeEngine.haversineMeters(prev.anchorLat, prev.anchorLon, lat, lon)
+                    if (dist < 25.0 && trueFixMillis < prev.firstSeenAtPositionMillis) {
+                        movementTracker[canonVid] = prev.copy(
+                            lastMovedAtMillis = minOf(prev.lastMovedAtMillis, trueFixMillis),
+                            firstSeenAtPositionMillis = trueFixMillis,
+                            lastObservedAtMillis = nowMillis,
+                        )
+                    }
+                }
+            }
+        }
     }
 
     fun getDebugRuntimeTelemetry(): DebugRuntimeTelemetry {
@@ -313,7 +362,11 @@ class GttRealtimeRepository private constructor(context: Context) {
             val matoGqlDef = async {
                 if (normLine != null) {
                     val t0 = SystemClock.elapsedRealtime()
-                    val v = runCatching { matoGraphQlClient.fetchVehiclePositions(normLine, nowMillis) }.getOrDefault(emptyList())
+                    val v = runCatching {
+                        matoGraphQlClient.fetchVehiclePositions(normLine, nowMillis) { vid, lc, lat, lon, ts, stale ->
+                            onMatoGraphQlTimestampObserved(vid, lc, lat, lon, ts, stale, nowMillis)
+                        }
+                    }.getOrDefault(emptyList())
                     v.size to (SystemClock.elapsedRealtime() - t0)
                 } else {
                     0 to 0L
@@ -526,7 +579,10 @@ class GttRealtimeRepository private constructor(context: Context) {
                 severity = DiagSeverity.WARN,
             )
         }
-        val enriched = enrichWithTripUpdatesAndMovement(kinematicallySafe, lastTripUpdates, nowMillis)
+        val enriched = filterOutConfirmedGhostsAndEvict(
+            enrichWithTripUpdatesAndMovement(kinematicallySafe, lastTripUpdates, nowMillis),
+            nowMillis,
+        )
 
         val anyGtfsFrozen = !isFixedMato && (
             sourceReports["GTT Ufficiale"]?.isFrozenForLine(activeFocus ?: "", activeFocus) == true ||
@@ -661,7 +717,9 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val matoGqlJob = if (useMato && !normFocus.isNullOrBlank()) {
                     async {
                         withTimeoutOrNull(matoGqlTimeoutMs) {
-                            matoGraphQlClient.fetchVehiclePositions(normFocus, nowMillis)
+                            matoGraphQlClient.fetchVehiclePositions(normFocus, nowMillis) { vid, lc, lat, lon, ts, stale ->
+                                onMatoGraphQlTimestampObserved(vid, lc, lat, lon, ts, stale, nowMillis)
+                            }
                         }.orEmpty()
                     }
                 } else {
@@ -792,7 +850,9 @@ class GttRealtimeRepository private constructor(context: Context) {
                         matoGraphQlClient.resetPreferredEndpoints()
                         async {
                             withTimeoutOrNull(3_500L) {
-                                matoGraphQlClient.fetchVehiclePositions(normFocus, nowMillis)
+                                matoGraphQlClient.fetchVehiclePositions(normFocus, nowMillis) { vid, lc, lat, lon, ts, stale ->
+                                    onMatoGraphQlTimestampObserved(vid, lc, lat, lon, ts, stale, nowMillis)
+                                }
                             }.orEmpty()
                         }
                     } else {
@@ -1030,7 +1090,10 @@ class GttRealtimeRepository private constructor(context: Context) {
                 }
 
                 val activeTripUpdates = tripRes?.updates ?: lastTripUpdates
-                val enriched = enrichWithTripUpdatesAndMovement(kinematicallySafe, activeTripUpdates, nowMillis)
+                val enriched = filterOutConfirmedGhostsAndEvict(
+                    enrichWithTripUpdatesAndMovement(kinematicallySafe, activeTripUpdates, nowMillis),
+                    nowMillis,
+                )
 
                 val matoMaxTs = matoCombined.maxOfOrNull { it.timestampSeconds } ?: 0L
                 val feedTs = maxOf(
@@ -1147,14 +1210,23 @@ class GttRealtimeRepository private constructor(context: Context) {
                 else -> null
             }
 
+            val gpsFixMillis = (bus.timestampSeconds * 1000L).takeIf {
+                bus.timestampSeconds > 1_600_000_000L && it <= nowMillis + 60_000L
+            }
+            val initialSeenMillis = if (gpsFixMillis != null && (nowMillis - gpsFixMillis) >= 35_000L) {
+                gpsFixMillis
+            } else {
+                nowMillis
+            }
+
             val record = if (movedFromAnchor) {
                 MovementRecord(
                     anchorLat = bus.latitude,
                     anchorLon = bus.longitude,
                     lastLat = bus.latitude,
                     lastLon = bus.longitude,
-                    lastMovedAtMillis = nowMillis,
-                    firstSeenAtPositionMillis = nowMillis,
+                    lastMovedAtMillis = initialSeenMillis,
+                    firstSeenAtPositionMillis = initialSeenMillis,
                     lastObservedAtMillis = nowMillis,
                     inferredBearing = computedBearing,
                 )
@@ -1168,19 +1240,102 @@ class GttRealtimeRepository private constructor(context: Context) {
             }
             movementTracker[canonVid] = record
 
+            val stationarySince = when {
+                !movedFromAnchor -> record.firstSeenAtPositionMillis
+                initialSeenMillis < nowMillis -> initialSeenMillis
+                else -> null
+            }
+            val stationaryDurationMs = if (!movedFromAnchor) {
+                (nowMillis - record.firstSeenAtPositionMillis).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            val isMatoOnly = GttFleetAnalyzer.isMatoOnlySource(bus)
+            // When a vehicle hasn't moved 22m for >= 60s, any non-zero speed reported by a frozen
+            // MaTO payload is stale telemetry from when the transponder froze — zero it out.
+            val effectiveSpeedKmh = if (!movedFromAnchor && stationaryDurationMs >= 60_000L && (bus.speedKmh ?: 0f) > 0f) {
+                0f
+            } else {
+                bus.speedKmh
+            }
+            // MaTO MQTT payloads do not carry an onboard GPS epoch timestamp (only synthesized download
+            // wall-clock time). If a MaTO-only vehicle hasn't moved 22m for >= 60s, clamp its timestamp
+            // and fetchedAtMillis to when it actually arrived at this anchor so it cannot display a fake
+            // "agg. 1m fa" while being "Fermo da 41m".
+            val effectiveTimestampSeconds = if (isMatoOnly && !movedFromAnchor && stationaryDurationMs >= 60_000L && bus.timestampSeconds > 0L) {
+                minOf(bus.timestampSeconds, record.firstSeenAtPositionMillis / 1000L)
+            } else {
+                bus.timestampSeconds
+            }
+            val effectiveFetchedAtMillis = when {
+                isMatoOnly && !movedFromAnchor && stationaryDurationMs >= 60_000L ->
+                    minOf(bus.fetchedAtMillis, record.firstSeenAtPositionMillis)
+                bus.timestampSeconds <= 0L && !movedFromAnchor ->
+                    minOf(bus.fetchedAtMillis, record.firstSeenAtPositionMillis)
+                else -> bus.fetchedAtMillis
+            }
+
             bus.copy(
                 bearing = bus.bearing ?: record.inferredBearing,
+                speedKmh = effectiveSpeedKmh,
+                timestampSeconds = effectiveTimestampSeconds,
                 lastMovedAtMillis = record.lastMovedAtMillis,
-                stationarySinceMillis = if (!movedFromAnchor) record.firstSeenAtPositionMillis else null,
+                stationarySinceMillis = stationarySince,
+                fetchedAtMillis = effectiveFetchedAtMillis,
             )
         }
 
-        // Prune stale vehicle records older than 30 min based on last observation
+        // Prune stale vehicle records older than 2 hours based on last observation
         if (movementTracker.size > 800) {
-            val cutoff = nowMillis - 30 * 60_000L
+            val cutoff = nowMillis - 120 * 60_000L
             movementTracker.entries.removeIf { it.value.lastObservedAtMillis < cutoff }
         }
         return enriched
+    }
+
+    private fun filterOutConfirmedGhostsAndEvict(
+        vehicles: List<BusVehicle>,
+        nowMillis: Long,
+    ): List<BusVehicle> {
+        if (vehicles.isEmpty()) return vehicles
+        var evictedAnyMato = false
+        val patternCache = HashMap<String, List<RoutePattern>>(4)
+        val filtered = vehicles.filter { bus ->
+            val normLine = GtfsRtProtobufParser.normalizeGttLineCode(bus.lineCode).ifBlank { bus.lineCode }
+            val patterns = patternCache.getOrPut(normLine) {
+                routeGeometryService.getMemoryCachedPatterns(normLine)
+            }
+            val spatial = GttFleetAnalyzer.assessSpatial(bus, patterns)
+            val hasPatterns = patterns.isNotEmpty()
+            val isPhantomOrGhost = GttFleetAnalyzer.isConfirmedMatoPhantomWithSpatial(
+                bus = bus,
+                spatial = spatial,
+                hasKnownRoutePatterns = hasPatterns,
+                nowMillis = nowMillis,
+            ) || GttFleetAnalyzer.isConfirmedDeadGhostWithSpatial(
+                bus = bus,
+                spatial = spatial,
+                hasKnownRoutePatterns = hasPatterns,
+                nowMillis = nowMillis,
+            )
+            if (isPhantomOrGhost) {
+                if ("MaTO Live" in bus.contributingSources || bus.sourceName == "MaTO Live") {
+                    matoMqttClient.evictGhostVehicle(bus.vehicleId, bus.latitude, bus.longitude, nowMillis)
+                    evictedAnyMato = true
+                }
+                false
+            } else {
+                true
+            }
+        }
+        if (evictedAnyMato && lastMatoGqlRawVehicles.isNotEmpty()) {
+            val survivingIds = filtered.map { GtfsRtProtobufParser.canonicalFleetId(it.vehicleId).ifBlank { it.vehicleId } }.toHashSet()
+            lastMatoGqlRawVehicles = lastMatoGqlRawVehicles.filter { raw ->
+                val cid = GtfsRtProtobufParser.canonicalFleetId(raw.vehicleId).ifBlank { raw.vehicleId }
+                cid in survivingIds
+            }
+        }
+        return filtered
     }
 
     /**
@@ -1215,10 +1370,15 @@ class GttRealtimeRepository private constructor(context: Context) {
             }
         }
         val fetched = withTimeoutOrNull(3_400L) {
-            matoGraphQlClient.fetchVehiclePositions(clean, nowMillis)
+            matoGraphQlClient.fetchVehiclePositions(clean, nowMillis) { vid, lc, lat, lon, ts, stale ->
+                onMatoGraphQlTimestampObserved(vid, lc, lat, lon, ts, stale, nowMillis)
+            }
         }.orEmpty()
         val enriched = if (fetched.isNotEmpty()) {
-            enrichWithTripUpdatesAndMovement(fetched, lastTripUpdates, nowMillis)
+            filterOutConfirmedGhostsAndEvict(
+                enrichWithTripUpdatesAndMovement(fetched, lastTripUpdates, nowMillis),
+                nowMillis,
+            )
         } else {
             emptyList()
         }
@@ -1722,6 +1882,12 @@ class GttRealtimeRepository private constructor(context: Context) {
         lineCode = lineCode,
         activeTripIds = activeTripIds,
     )
+
+    fun getMemoryCachedRoutePatterns(lineCode: String): List<RoutePattern> {
+        val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode).ifBlank { lineCode.trim().uppercase() }
+        if (norm.isEmpty() || norm == "?") return emptyList()
+        return routeGeometryService.getMemoryCachedPatterns(norm)
+    }
 
     /**
      * Fetches upcoming arrivals for a tapped stop on the route, combining:

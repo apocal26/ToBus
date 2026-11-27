@@ -80,10 +80,13 @@ object GttFleetAnalyzer {
 
     private const val STALE_GPS_SECONDS = 150L
     private const val STUCK_STATIONARY_SECONDS = 120L
-    private const val MATO_PHANTOM_STATIONARY_SECONDS = 240L
+    private const val MATO_PHANTOM_STATIONARY_SECONDS = 180L // 3 minutes mid-route for MaTO-only
+    private const val MATO_TERMINUS_PHANTOM_STATIONARY_SECONDS = 600L // 10 minutes at terminus for MaTO-only
+    private const val TERMINUS_MAX_LAYOVER_SECONDS = 600L // 10 minutes max normal terminus layover
+    private const val DEAD_TERMINUS_GHOST_STATIONARY_SECONDS = 900L // 15 minutes at terminus for any source
     private const val OFF_ROUTE_METERS = 500.0
     private const val TERMINUS_NEAR_METERS = 125.0
-    private const val TERMINUS_PHANTOM_GUARD_METERS = 160.0
+    private const val TERMINUS_PHANTOM_GUARD_METERS = 150.0
     private const val TERMINUS_BAY_METERS = 65.0
     private const val TERMINUS_STATIONARY_SECONDS = 20L
 
@@ -110,7 +113,17 @@ object GttFleetAnalyzer {
         var bestTerminusDist = Double.POSITIVE_INFINITY
         var bestTerminusName: String? = null
         if (depot == null && !isOffRoute && routePatterns.isNotEmpty()) {
-            for (pattern in routePatterns) {
+            // Only use primary patterns per direction (stop count >= 70% of max for that direction)
+            // so short-turn / depot-pull-in variants ending mid-route do not grant terminus immunity.
+            val maxStopsByDir = routePatterns
+                .groupBy { it.directionId }
+                .mapValues { (_, pats) -> pats.maxOfOrNull { it.stops.size } ?: 0 }
+            val terminusPatterns = routePatterns.filter { pat ->
+                val maxStops = maxStopsByDir[pat.directionId] ?: 0
+                maxStops <= 4 || pat.stops.size >= (maxStops * 0.7).toInt()
+            }.ifEmpty { routePatterns }
+
+            for (pattern in terminusPatterns) {
                 val firstStop = pattern.stops.firstOrNull()
                 val lastStop = pattern.stops.lastOrNull()
                 if (firstStop != null) {
@@ -163,10 +176,14 @@ object GttFleetAnalyzer {
         val ageSec = bus.gpsAgeSeconds(nowMillis)
         val isStale = ageSec != null && ageSec > STALE_GPS_SECONDS
         val statSec = bus.stationarySinceMillis?.let { ((nowMillis - it) / 1000L).coerceAtLeast(0L) }
-        val isMovingFast = bus.speedKmh != null && bus.speedKmh >= 12f
+        val exceededTerminusLayover = statSec != null && statSec >= TERMINUS_MAX_LAYOVER_SECONDS
+        // If coordinates have not displaced by 22m in >= 60s, any non-zero speedKmh is a frozen AVM field
+        val isPhysicallyStationary = statSec != null && statSec >= 60L
+        val isMovingFast = !isPhysicallyStationary && bus.speedKmh != null && bus.speedKmh >= 12f
         val isAtTerminus = spatial.depotName == null &&
             !spatial.isOffRoute &&
             !isStale &&
+            !exceededTerminusLayover &&
             spatial.isNearTerminus &&
             !isMovingFast &&
             (
@@ -175,8 +192,12 @@ object GttFleetAnalyzer {
                     bus.bearing == null ||
                     (bus.speedKmh != null && bus.speedKmh < 4f)
                 )
-        // Never misclassify a bus waiting normally at its terminus as "stuck"
-        val isStuck = !spatial.isNearTerminus && statSec != null && statSec >= STUCK_STATIONARY_SECONDS
+        // A bus waiting normally at its terminus (< 10 min) is never "stuck",
+        // but a bus frozen at a terminus beyond 10 minutes is flagged as stuck/inactive.
+        val isStuck = statSec != null && (
+            (!spatial.isNearTerminus && statSec >= STUCK_STATIONARY_SECONDS) ||
+                (spatial.isNearTerminus && exceededTerminusLayover)
+            )
 
         return VehicleHealthAssessment(
             depotName = spatial.depotName,
@@ -208,10 +229,14 @@ object GttFleetAnalyzer {
     }
 
     /**
-     * Returns true ONLY when a vehicle is exclusively tracked by MaTO Live, has been stationary
-     * at the exact same coordinates for >= 4 minutes (240s), and is confirmed NOT at/near a terminus
-     * (with loaded [routePatterns]) and NOT in a GTT depot. Multi-source vehicles and terminus layovers
-     * are never flagged.
+     * Returns true ONLY when a vehicle is exclusively tracked by MaTO Live, is outside GTT depots,
+     * and has either:
+     * - Stale GPS age >= 150s, OR
+     * - Been physically stationary within the same 22m anchor for >= 3 minutes (180s) mid-route
+     *   OR >= 10 minutes (600s) at a terminus (or when route patterns are not yet loaded).
+     *
+     * Never allows a frozen `speedKmh` field in the MaTO packet to bypass stationary phantom detection:
+     * a vehicle whose coordinates have not moved 22m in 3+ minutes is physically motionless (< 0.44 km/h).
      */
     fun isConfirmedMatoPhantomWithSpatial(
         bus: BusVehicle,
@@ -219,18 +244,22 @@ object GttFleetAnalyzer {
         hasKnownRoutePatterns: Boolean,
         nowMillis: Long,
     ): Boolean {
-        if (!hasKnownRoutePatterns) return false
         if (!isMatoOnlySource(bus)) return false
-        if (spatial.depotName != null ||
-            spatial.isNearTerminus ||
-            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
-        ) {
-            return false
-        }
-        if (bus.speedKmh != null && bus.speedKmh >= 5f) return false
+        if (spatial.depotName != null) return false
+        val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
+        if (gpsAgeSec != null && gpsAgeSec >= STALE_GPS_SECONDS) return true
         val since = bus.stationarySinceMillis ?: return false
         val statSec = ((nowMillis - since) / 1000L).coerceAtLeast(0L)
-        return statSec >= MATO_PHANTOM_STATIONARY_SECONDS
+        if (!hasKnownRoutePatterns) {
+            return statSec >= MATO_TERMINUS_PHANTOM_STATIONARY_SECONDS
+        }
+        val isNearAnyTerminus = spatial.isNearTerminus ||
+            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
+        return if (isNearAnyTerminus) {
+            statSec >= MATO_TERMINUS_PHANTOM_STATIONARY_SECONDS
+        } else {
+            statSec >= MATO_PHANTOM_STATIONARY_SECONDS
+        }
     }
 
     fun isConfirmedMatoPhantom(
@@ -238,12 +267,11 @@ object GttFleetAnalyzer {
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
     ): Boolean {
-        if (routePatterns.isEmpty()) return false
         val spatial = assessSpatial(bus, routePatterns)
         return isConfirmedMatoPhantomWithSpatial(
             bus = bus,
             spatial = spatial,
-            hasKnownRoutePatterns = true,
+            hasKnownRoutePatterns = routePatterns.isNotEmpty(),
             nowMillis = nowMillis,
         )
     }
@@ -253,17 +281,19 @@ object GttFleetAnalyzer {
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
     ): List<BusVehicle> {
-        if (routePatterns.isEmpty() || vehicles.isEmpty()) return vehicles
+        if (vehicles.isEmpty()) return vehicles
         return vehicles.filterNot { bus ->
             isConfirmedMatoPhantom(bus, routePatterns, nowMillis)
         }
     }
 
     /**
-     * Returns true when ANY mid-route vehicle (even multi-source mirrored GTFS-RT) is provably dead:
-     * parked at the same anchor (<22m) for >= 7 minutes strictly outside depots and >160m away
-     * from any terminus, with zero/absent speed AND either stale GPS (>= 180s) or 8+ minutes
-     * completely frozen mid-route (catching feeds that keep advancing fake timestamps).
+     * Returns true when ANY vehicle (even multi-source mirrored GTFS-RT) is provably dead:
+     * - GPS timestamp >= 10 minutes old outside depots, OR
+     * - Mid-route: parked at the same anchor (<22m) for >= 7 minutes strictly outside depots and >150m away
+     *   from any primary terminus, with either stale GPS (>= 180s) or >= 8 minutes completely frozen
+     *   mid-route (ignoring any frozen `speedKmh` field since 7+ min inside a 22m radius is physically 0 km/h), OR
+     * - Terminus (or before route patterns load): parked at the exact same coordinates (<22m) for >= 15 minutes.
      */
     fun isConfirmedDeadGhostWithSpatial(
         bus: BusVehicle,
@@ -271,23 +301,21 @@ object GttFleetAnalyzer {
         hasKnownRoutePatterns: Boolean,
         nowMillis: Long,
     ): Boolean {
-        if (!hasKnownRoutePatterns) return false
-        if (spatial.depotName != null ||
-            spatial.isNearTerminus ||
-            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
-        ) {
-            return false
-        }
+        if (spatial.depotName != null) return false
         val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
         val hasStaleTimestamp = gpsAgeSec != null && gpsAgeSec >= 180L
         if (gpsAgeSec != null && gpsAgeSec >= 600L) return true
         val since = bus.stationarySinceMillis ?: return false
         val statSec = ((nowMillis - since) / 1000L).coerceAtLeast(0L)
+        if (!hasKnownRoutePatterns) {
+            return statSec >= DEAD_TERMINUS_GHOST_STATIONARY_SECONDS
+        }
+        val isNearAnyTerminus = spatial.isNearTerminus ||
+            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
+        if (isNearAnyTerminus) {
+            return statSec >= DEAD_TERMINUS_GHOST_STATIONARY_SECONDS
+        }
         if (statSec < 420L) return false
-        val reportedSpeed = bus.speedKmh
-        val hasFreshLiveSpeed = !hasStaleTimestamp && reportedSpeed != null && reportedSpeed >= 3f
-        // If speed is fresh and >=3 km/h, still catch buses physically frozen within 22m for >= 9 min
-        if (hasFreshLiveSpeed && statSec < 540L) return false
         return hasStaleTimestamp || statSec >= 480L
     }
 
@@ -296,12 +324,11 @@ object GttFleetAnalyzer {
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
     ): Boolean {
-        if (routePatterns.isEmpty()) return false
         val spatial = assessSpatial(bus, routePatterns)
         return isConfirmedDeadGhostWithSpatial(
             bus = bus,
             spatial = spatial,
-            hasKnownRoutePatterns = true,
+            hasKnownRoutePatterns = routePatterns.isNotEmpty(),
             nowMillis = nowMillis,
         )
     }
@@ -311,18 +338,19 @@ object GttFleetAnalyzer {
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
     ): List<BusVehicle> {
-        if (routePatterns.isEmpty() || vehicles.isEmpty()) return vehicles
+        if (vehicles.isEmpty()) return vehicles
+        val hasKnownPatterns = routePatterns.isNotEmpty()
         return vehicles.filterNot { bus ->
             val spatial = assessSpatial(bus, routePatterns)
             isConfirmedMatoPhantomWithSpatial(
                 bus = bus,
                 spatial = spatial,
-                hasKnownRoutePatterns = true,
+                hasKnownRoutePatterns = hasKnownPatterns,
                 nowMillis = nowMillis,
             ) || isConfirmedDeadGhostWithSpatial(
                 bus = bus,
                 spatial = spatial,
-                hasKnownRoutePatterns = true,
+                hasKnownRoutePatterns = hasKnownPatterns,
                 nowMillis = nowMillis,
             )
         }
@@ -614,7 +642,8 @@ object GttFleetAnalyzer {
         if (health.isInDepot ||
             health.isStaleGps ||
             health.isOffRoute ||
-            isConfirmedMatoPhantomWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis)
+            isConfirmedMatoPhantomWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis) ||
+            isConfirmedDeadGhostWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis)
         ) {
             return null
         }
