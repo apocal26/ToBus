@@ -1,18 +1,7 @@
 package com.example.ui.viewmodel
 
-import android.Manifest
-import android.annotation.SuppressLint
 import android.app.Application
-import android.content.Context
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
-import android.os.Build
-import android.os.CancellationSignal
-import android.os.Looper
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.model.BusVehicle
@@ -34,27 +23,18 @@ import com.example.data.model.TransitStop
 import com.example.data.model.UserWidgetSettings
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.formatTurinLabel
-import com.example.data.model.shortTurinPlaceName
-import com.example.data.network.AppUpdateChecker
-import com.example.data.network.AppUpdateDownloader
 import com.example.data.network.AppUpdateInfo
 import com.example.data.network.GttRealtimeRepository
 import com.example.data.network.GttStaticRouteStore
-import com.example.data.network.UpdateCheckResult
 import com.example.data.network.UpdateInstallState
 import com.example.data.preferences.ToBusPreferences
-import com.example.map.TransitMapBitmapRenderer
 import com.example.map.WebMercator
 import com.example.notifications.FavoriteAlertNotifier
 import com.example.notifications.FavoriteAlertsScheduler
 import com.example.widget.BusMapWidgetProvider
 import com.example.widget.FavoriteAlertsWidgetProvider
-import com.example.widget.StopArrivalsWidgetProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -230,16 +210,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var hasAutoCenteredCurrentLine = false
     private var needsRouteRefit = true
     private var hasVerifiedLiveRouteForLine: String? = null
-    private var isStudioTabActive = false
     @Volatile
     private var isLinePickerOpen = false
     @Volatile
     private var pendingMatoSyncOnPickerClose = false
     private var consecutivePollFailures = 0
-    private var previewDirty = true
     private var lastViewportPx: Pair<Int, Int> = 1000 to 1400
-    private var previewRenderJob: Job? = null
-    private var stopPreviewJob: Job? = null
     private var routeLoadJob: Job? = null
     private var routeLoadSeq: Long = 0L
     private var lineCatalogJob: Job? = null
@@ -248,18 +224,28 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var stopSearchJob: Job? = null
     private var foregroundPollingJob: Job? = null
     private var clockTickerJob: Job? = null
-    private var updateDownloadJob: Job? = null
-    private var installLaunchSeq: Long = 0L
-    private var lastPollElapsedMs: Long = 0L
     private var lastWidgetSyncMillis: Long = 0L
     private var cameraFlySeq: Long = 0L
     private var dismissedOutageStableKey: String? = null
 
-    private val locationManager: LocationManager? =
-        appContext.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-    private var activeLocationListener: LocationListener? = null
-    private var currentLocationCancelSignal: CancellationSignal? = null
-    private var pendingCenterOnNextFix: Boolean = false
+    private val locationController = MapLocationController(
+        appContext = appContext,
+        uiState = _uiState,
+        syncLinePickerState = ::syncLinePickerState,
+        nextCameraFlyId = { ++cameraFlySeq },
+    )
+    private val updateCoordinator = AppUpdateCoordinator(
+        appContext = appContext,
+        preferences = preferences,
+        scope = viewModelScope,
+        uiState = _uiState,
+    )
+    private val widgetCoordinator = WidgetPreviewCoordinator(
+        appContext = appContext,
+        repository = repository,
+        scope = viewModelScope,
+        uiState = _uiState,
+    )
 
     init {
         if (initialSettings.hasSelectedLine) {
@@ -311,16 +297,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 hasFavoriteLines = preferences.currentFavoriteLines().isNotEmpty(),
             )
         }
-        // Clean up any previously downloaded update APKs automatically on startup, then run the
-        // lightweight once-per-24h GitHub Releases check after cold boot settles.
-        viewModelScope.launch(Dispatchers.IO) {
-            AppUpdateDownloader.cleanupOldUpdates(appContext)
-            delay(4_500L)
-            val result = AppUpdateChecker.checkForUpdate(preferences = preferences, force = false)
-            if (result is UpdateCheckResult.Available) {
-                _uiState.update { it.copy(availableUpdate = result.info) }
-            }
-        }
+        updateCoordinator.scheduleStartupCheck()
     }
 
     private fun syncLinePickerState() {
@@ -358,9 +335,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 repository.stopMatoLiveStream()
             }
             startForegroundJobs()
-            if (_uiState.value.isUserLocationEnabled && hasLocationPermission()) {
-                startLocationUpdates(centerOnNextFix = false)
-            }
+            locationController.resumeIfEnabled()
         } else {
             repository.stopMatoLiveStream()
             foregroundPollingJob?.cancel()
@@ -369,16 +344,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             clockTickerJob = null
             focusArrivalJob?.cancel()
             focusArrivalJob = null
-            stopLocationUpdates()
+            locationController.stopLocationUpdates()
         }
     }
 
     fun setStudioTabActive(active: Boolean) {
-        isStudioTabActive = active
-        if (active && (previewDirty || _uiState.value.widgetPreviewBitmap == null)) {
-            previewDirty = false
-            regenerateWidgetPreview(force = true)
-        }
+        widgetCoordinator.setStudioTabActive(active)
     }
 
     fun setLinePickerOpen(open: Boolean) {
@@ -450,223 +421,15 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         repository.stopMatoLiveStream()
-        stopLocationUpdates()
+        locationController.stopLocationUpdates()
         super.onCleared()
     }
 
-    fun hasLocationPermission(): Boolean {
-        val fine = ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_FINE_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-        val coarse = ContextCompat.checkSelfPermission(appContext, Manifest.permission.ACCESS_COARSE_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
-        return fine || coarse
-    }
+    fun hasLocationPermission(): Boolean = locationController.hasLocationPermission()
 
-    fun onLocationPermissionResult(granted: Boolean) {
-        if (granted) {
-            enableAndCenterUserLocation()
-        } else {
-            _uiState.update {
-                it.copy(
-                    isUserLocationEnabled = false,
-                    isLocatingUser = false,
-                    userLocation = null,
-                    statusToast = "Permesso posizione non concesso",
-                )
-            }
-            syncLinePickerState()
-        }
-    }
+    fun onLocationPermissionResult(granted: Boolean) = locationController.onLocationPermissionResult(granted)
 
-    /**
-     * Discreet 3-state GPS toggle when permission is already granted:
-     * 1. Off -> turn ON and smoothly fly to user position
-     * 2. On & map panned away -> smoothly re-center on user position
-     * 3. On & already centered on user -> turn OFF cleanly to save battery
-     */
-    fun onUserLocationButtonClicked() {
-        if (!hasLocationPermission()) return
-        val state = _uiState.value
-        if (!state.isUserLocationEnabled) {
-            enableAndCenterUserLocation()
-            return
-        }
-
-        val loc = state.userLocation
-        if (loc == null) {
-            startLocationUpdates(centerOnNextFix = true)
-            return
-        }
-
-        val distFromCenter = haversineMeters(
-            state.camera.centerLat,
-            state.camera.centerLon,
-            loc.lat,
-            loc.lon,
-        )
-        if (distFromCenter > 85.0 || state.camera.zoom < 14.5) {
-            flyCameraToUser(loc, announceNearestStop = true)
-        } else {
-            stopLocationUpdates()
-            _uiState.update {
-                it.copy(
-                    isUserLocationEnabled = false,
-                    isLocatingUser = false,
-                    userLocation = null,
-                    statusToast = "Posizione GPS disattivata",
-                )
-            }
-            syncLinePickerState()
-        }
-    }
-
-    private fun enableAndCenterUserLocation() {
-        val lm = locationManager
-        if (lm == null) {
-            _uiState.update { it.copy(statusToast = "Servizio GPS non disponibile") }
-            return
-        }
-        val anyEnabled = runCatching {
-            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
-                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-        }.getOrDefault(false)
-        if (!anyEnabled) {
-            _uiState.update {
-                it.copy(
-                    isUserLocationEnabled = false,
-                    isLocatingUser = false,
-                    statusToast = "Attiva la geolocalizzazione sul dispositivo",
-                )
-            }
-            return
-        }
-
-        _uiState.update { it.copy(isUserLocationEnabled = true, isLocatingUser = true) }
-        startLocationUpdates(centerOnNextFix = true)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun startLocationUpdates(centerOnNextFix: Boolean) {
-        if (!hasLocationPermission()) return
-        val lm = locationManager ?: return
-        stopLocationUpdates()
-        pendingCenterOnNextFix = centerOnNextFix
-
-        // 1. Check freshest cached system fix for instant feedback
-        val providers = buildList {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) add(LocationManager.FUSED_PROVIDER)
-            add(LocationManager.GPS_PROVIDER)
-            add(LocationManager.NETWORK_PROVIDER)
-        }.filter { runCatching { lm.isProviderEnabled(it) }.getOrDefault(false) }
-
-        val bestLastKnown = providers
-            .mapNotNull { p -> runCatching { lm.getLastKnownLocation(p) }.getOrNull() }
-            .filter { loc -> System.currentTimeMillis() - loc.time <= 10 * 60_000L }
-            .maxByOrNull { it.time }
-
-        if (bestLastKnown != null) {
-            handleNewLocation(bestLastKnown, fromFreshFix = false)
-        }
-
-        // 2. Request lightweight foreground updates (stopped immediately on ON_STOP)
-        val listener = LocationListener { location ->
-            handleNewLocation(location, fromFreshFix = true)
-        }
-        activeLocationListener = listener
-
-        val primaryProviders = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            runCatching { lm.isProviderEnabled(LocationManager.FUSED_PROVIDER) }.getOrDefault(false)
-        ) {
-            listOf(LocationManager.FUSED_PROVIDER)
-        } else {
-            listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
-                .filter { runCatching { lm.isProviderEnabled(it) }.getOrDefault(false) }
-        }
-
-        primaryProviders.forEach { provider ->
-            runCatching {
-                lm.requestLocationUpdates(provider, 9_000L, 10f, listener, Looper.getMainLooper())
-            }
-        }
-
-        // 3. Kick off a single immediate fresh fix on API 30+ if no recent lastKnown fix exists
-        if (bestLastKnown == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val fastProvider = primaryProviders.firstOrNull() ?: return
-            val cancel = CancellationSignal()
-            currentLocationCancelSignal = cancel
-            runCatching {
-                lm.getCurrentLocation(fastProvider, cancel, appContext.mainExecutor) { loc ->
-                    if (loc != null) {
-                        handleNewLocation(loc, fromFreshFix = true)
-                    } else if (_uiState.value.userLocation == null) {
-                        _uiState.update { it.copy(isLocatingUser = false) }
-                    }
-                }
-            }
-        }
-    }
-
-    private fun stopLocationUpdates() {
-        currentLocationCancelSignal?.cancel()
-        currentLocationCancelSignal = null
-        activeLocationListener?.let { listener ->
-            runCatching { locationManager?.removeUpdates(listener) }
-        }
-        activeLocationListener = null
-    }
-
-    private fun handleNewLocation(location: Location, fromFreshFix: Boolean) {
-        val stateLoc = UserLocationState(
-            lat = location.latitude,
-            lon = location.longitude,
-            accuracyMeters = location.accuracy.coerceIn(5f, 300f),
-            updatedAtMillis = System.currentTimeMillis(),
-        )
-        _uiState.update {
-            it.copy(
-                userLocation = stateLoc,
-                isLocatingUser = if (fromFreshFix) false else it.isLocatingUser && pendingCenterOnNextFix,
-            )
-        }
-        syncLinePickerState()
-        if (pendingCenterOnNextFix) {
-            pendingCenterOnNextFix = false
-            flyCameraToUser(stateLoc, announceNearestStop = true)
-            _uiState.update { it.copy(isLocatingUser = false) }
-        }
-    }
-
-    private fun flyCameraToUser(loc: UserLocationState, announceNearestStop: Boolean) {
-        val currentZoom = _uiState.value.camera.zoom
-        val target = CameraState(
-            centerLat = loc.lat.coerceIn(44.85, 45.30),
-            centerLon = loc.lon.coerceIn(7.35, 8.05),
-            zoom = currentZoom.coerceAtLeast(15.6).coerceAtMost(CameraState.MAX_ZOOM),
-        )
-        val nearestToast = if (announceNearestStop) {
-            val stops = _uiState.value.routePatterns.flatMap { it.stops }
-            val nearest = stops.minByOrNull { haversineMeters(loc.lat, loc.lon, it.lat, it.lon) }
-            if (nearest != null) {
-                val meters = haversineMeters(loc.lat, loc.lon, nearest.lat, nearest.lon).toInt()
-                if (meters <= 500) {
-                    "Fermata vicina: ${shortTurinPlaceName(nearest.name)} (${meters} m)"
-                } else {
-                    null
-                }
-            } else {
-                null
-            }
-        } else {
-            null
-        }
-        cameraFlySeq++
-        _uiState.update {
-            it.copy(
-                cameraFlyRequest = CameraFlyRequest(target = target, id = cameraFlySeq),
-                statusToast = nearestToast ?: it.statusToast,
-            )
-        }
-    }
+    fun onUserLocationButtonClicked() = locationController.onUserLocationButtonClicked()
 
     private fun startForegroundJobs() {
         if (foregroundPollingJob?.isActive != true) {
@@ -674,7 +437,6 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 while (isActive) {
                     refreshLiveData(isInitial = _uiState.value.lastUpdatedMillis == null)
                     val startMs = System.currentTimeMillis()
-                    lastPollElapsedMs = startMs
                     while (isActive) {
                         val pollIntervalMs = _uiState.value.settings.livePollInterval.millis
                         val elapsed = System.currentTimeMillis() - startMs
@@ -1363,16 +1125,6 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val r = 6371000.0
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        val a = kotlin.math.sin(dLat / 2.0) * kotlin.math.sin(dLat / 2.0) +
-            kotlin.math.cos(Math.toRadians(lat1)) * kotlin.math.cos(Math.toRadians(lat2)) *
-            kotlin.math.sin(dLon / 2.0) * kotlin.math.sin(dLon / 2.0)
-        return r * 2.0 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1.0 - a))
-    }
-
     fun selectStop(stop: TransitStop?) {
         stopArrivalsJob?.cancel()
         focusArrivalJob?.cancel()
@@ -1506,20 +1258,12 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         includeAlerts: Boolean = false,
         rescheduleInterval: RefreshInterval? = null,
     ) {
-        viewModelScope.launch(Dispatchers.IO) {
-            if (rescheduleInterval != null) {
-                BusMapWidgetProvider.schedulePeriodicUpdates(appContext, rescheduleInterval)
-            }
-            if (includeMap) {
-                BusMapWidgetProvider.requestUpdateAllWidgets(appContext)
-            }
-            if (includeStops) {
-                StopArrivalsWidgetProvider.requestUpdateAll(appContext)
-            }
-            if (includeAlerts) {
-                FavoriteAlertsWidgetProvider.requestUpdateAll(appContext)
-            }
-        }
+        widgetCoordinator.requestWidgetUpdatesAsync(
+            includeMap = includeMap,
+            includeStops = includeStops,
+            includeAlerts = includeAlerts,
+            rescheduleInterval = rescheduleInterval,
+        )
     }
 
     fun toggleFavoriteStop(stop: TransitStop) {
@@ -1851,62 +1595,13 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setPreviewSize(size: WidgetPreviewSize) {
-        _uiState.update { it.copy(previewSize = size) }
-        when (size) {
-            WidgetPreviewSize.STOPS_LIVE -> refreshStopWidgetPreview()
-            WidgetPreviewSize.ALERTS_LIVE -> {
-                if (_uiState.value.allAlerts.isEmpty()) {
-                    viewModelScope.launch(Dispatchers.IO) {
-                        val alerts = repository.fetchServiceAlertsNow().orEmpty()
-                        if (alerts.isNotEmpty()) {
-                            val selected = _uiState.value.settings.selectedLine
-                            val forLine = if (selected.isNotEmpty()) {
-                                alerts.filter { alert ->
-                                    alert.isCurrentOrUpcoming() &&
-                                        alert.affectedLines.any { it.equals(selected, ignoreCase = true) }
-                                }
-                            } else {
-                                emptyList()
-                            }
-                            _uiState.update { it.copy(allAlerts = alerts, lineAlerts = forLine) }
-                        }
-                    }
-                }
-            }
-            else -> regenerateWidgetPreview()
-        }
-    }
+    fun setPreviewSize(size: WidgetPreviewSize) = widgetCoordinator.setPreviewSize(size)
 
     fun clearToast() {
         _uiState.update { it.copy(statusToast = null) }
     }
 
-    fun triggerHomeWidgetSync() {
-        requestWidgetUpdatesAsync(includeMap = true, includeStops = true, includeAlerts = true)
-        when (_uiState.value.previewSize) {
-            WidgetPreviewSize.STOPS_LIVE -> refreshStopWidgetPreview()
-            WidgetPreviewSize.ALERTS_LIVE -> {
-                viewModelScope.launch(Dispatchers.IO) {
-                    val alerts = repository.fetchServiceAlertsNow()
-                    if (alerts != null) {
-                        val selected = _uiState.value.settings.selectedLine
-                        val forLine = if (selected.isNotEmpty()) {
-                            alerts.filter { alert ->
-                                alert.isCurrentOrUpcoming() &&
-                                    alert.affectedLines.any { it.equals(selected, ignoreCase = true) }
-                            }
-                        } else {
-                            emptyList()
-                        }
-                        _uiState.update { it.copy(allAlerts = alerts, lineAlerts = forLine) }
-                    }
-                }
-            }
-            else -> regenerateWidgetPreview()
-        }
-        _uiState.update { it.copy(statusToast = "Widget sulla Home aggiornati") }
-    }
+    fun triggerHomeWidgetSync() = widgetCoordinator.triggerHomeWidgetSync()
 
     fun openFavoriteStopById(stopId: String) {
         val cleaned = stopId.trim()
@@ -1917,280 +1612,23 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         openFavoriteStop(fav)
     }
 
-    fun refreshStopWidgetPreview() {
-        val allFavorites = _uiState.value.favoriteStops
-        if (allFavorites.isEmpty()) {
-            _uiState.update { it.copy(stopWidgetPreviewByStopId = emptyMap(), isLoadingStopWidgetPreview = false) }
-            return
-        }
-        stopPreviewJob?.cancel()
-        stopPreviewJob = viewModelScope.launch {
-            _uiState.update { it.copy(isLoadingStopWidgetPreview = true) }
-            val cachedAll = repository.getLastCachedSnapshot()?.allVehicles ?: _uiState.value.lineVehicles
-            val byStopId: Map<String, List<StopArrival>> = coroutineScope {
-                allFavorites.map { fav ->
-                    async {
-                        val lineVehicles = cachedAll.filter {
-                            it.lineCode.equals(fav.lineCode, ignoreCase = true)
-                        }
-                        val arrivals = runCatching {
-                            repository.fetchStopArrivals(
-                                stop = fav.toTransitStop(),
-                                preferredLine = fav.lineCode,
-                                liveVehicles = lineVehicles,
-                            )
-                        }.getOrDefault(emptyList())
-                        fav.stopId to arrivals
-                    }
-                }.awaitAll().toMap()
-            }
-            _uiState.update {
-                it.copy(
-                    stopWidgetPreviewByStopId = byStopId,
-                    isLoadingStopWidgetPreview = false,
-                )
-            }
-        }
-    }
+    fun refreshStopWidgetPreview() = widgetCoordinator.refreshStopWidgetPreview()
 
-    fun regenerateWidgetPreview(force: Boolean = false) {
-        if (!force && !isStudioTabActive) {
-            previewDirty = true
-            return
-        }
-        previewDirty = false
-        if (_uiState.value.previewSize == WidgetPreviewSize.STOPS_LIVE) {
-            refreshStopWidgetPreview()
-            return
-        }
-        if (_uiState.value.previewSize == WidgetPreviewSize.ALERTS_LIVE) {
-            return
-        }
-        previewRenderJob?.cancel()
-        previewRenderJob = viewModelScope.launch(Dispatchers.IO) {
-            val state = _uiState.value
-            _uiState.update { it.copy(isRenderingPreview = true) }
-            val density = appContext.resources.displayMetrics.density.coerceIn(2.0f, 3.0f)
-            val widthPx = (state.previewSize.widthDp * density).toInt()
-            val heightPx = (state.previewSize.heightDp * density).toInt()
+    fun regenerateWidgetPreview(force: Boolean = false) = widgetCoordinator.regenerateWidgetPreview(force)
 
-            val bitmap = runCatching {
-                TransitMapBitmapRenderer.renderWidgetMap(
-                    context = appContext,
-                    widthPx = widthPx,
-                    heightPx = heightPx,
-                    density = density,
-                    settings = state.settings,
-                    vehicles = state.lineVehicles,
-                    routePatterns = state.routePatterns,
-                    favoriteStops = state.favoriteStops,
-                    isCompactSquare = state.previewSize.isSquare,
-                )
-            }.getOrNull()
+    fun checkForUpdatesManually() = updateCoordinator.checkForUpdatesManually()
 
-            _uiState.update {
-                it.copy(
-                    widgetPreviewBitmap = bitmap ?: it.widgetPreviewBitmap,
-                    isRenderingPreview = false,
-                )
-            }
-        }
-    }
+    fun startInAppUpdateDownload() = updateCoordinator.startInAppUpdateDownload()
 
-    fun checkForUpdatesManually() {
-        if (_uiState.value.isCheckingUpdate) return
-        viewModelScope.launch {
-            _uiState.update { it.copy(isCheckingUpdate = true) }
-            val result = AppUpdateChecker.checkForUpdate(preferences = preferences, force = true)
-            _uiState.update { state ->
-                when (result) {
-                    is UpdateCheckResult.Available -> state.copy(
-                        isCheckingUpdate = false,
-                        availableUpdate = result.info,
-                    )
-                    UpdateCheckResult.UpToDate -> state.copy(
-                        isCheckingUpdate = false,
-                        statusToast = "ToBus è già aggiornata all'ultima versione",
-                    )
-                    UpdateCheckResult.RepoNotConfigured -> state.copy(
-                        isCheckingUpdate = false,
-                        statusToast = "Imposta prima il repository GitHub",
-                    )
-                    UpdateCheckResult.Throttled -> state.copy(isCheckingUpdate = false)
-                    is UpdateCheckResult.Error -> state.copy(
-                        isCheckingUpdate = false,
-                        statusToast = "Controllo aggiornamenti non riuscito (${result.message})",
-                    )
-                }
-            }
-        }
-    }
+    fun cancelUpdateDownload() = updateCoordinator.cancelUpdateDownload()
 
-    fun startInAppUpdateDownload() {
-        val update = _uiState.value.availableUpdate ?: return
-        if (update.apkDownloadUrl.isNullOrBlank()) return
-        if (_uiState.value.updateInstallState is UpdateInstallState.Downloading) return
+    fun onInstallPermissionReturned() = updateCoordinator.onInstallPermissionReturned()
 
-        updateDownloadJob?.cancel()
-        _uiState.update {
-            it.copy(updateInstallState = UpdateInstallState.Downloading(bytesDownloaded = 0L, totalBytes = -1L))
-        }
-        updateDownloadJob = viewModelScope.launch {
-            val result = AppUpdateDownloader.downloadApk(
-                context = appContext,
-                update = update,
-                onProgress = { downloaded, total ->
-                    _uiState.update { state ->
-                        if (state.updateInstallState is UpdateInstallState.Downloading) {
-                            state.copy(
-                                updateInstallState = UpdateInstallState.Downloading(
-                                    bytesDownloaded = downloaded,
-                                    totalBytes = total,
-                                ),
-                            )
-                        } else {
-                            state
-                        }
-                    }
-                },
-            )
-            result.fold(
-                onSuccess = { apkFile ->
-                    val nextState = if (AppUpdateDownloader.canInstallPackages(appContext)) {
-                        installLaunchSeq++
-                        UpdateInstallState.ReadyToInstall(
-                            apkFilePath = apkFile.absolutePath,
-                            launchSeq = installLaunchSeq,
-                        )
-                    } else {
-                        UpdateInstallState.NeedsInstallPermission(apkFilePath = apkFile.absolutePath)
-                    }
-                    _uiState.update { it.copy(updateInstallState = nextState) }
-                },
-                onFailure = { err ->
-                    _uiState.update {
-                        it.copy(
-                            updateInstallState = UpdateInstallState.Error(
-                                err.message ?: "Download non riuscito",
-                            ),
-                        )
-                    }
-                },
-            )
-        }
-    }
+    fun retriggerReadyApkInstall() = updateCoordinator.retriggerReadyApkInstall()
 
-    fun cancelUpdateDownload() {
-        updateDownloadJob?.cancel()
-        updateDownloadJob = null
-        viewModelScope.launch(Dispatchers.IO) {
-            AppUpdateDownloader.cleanupOldUpdates(appContext)
-        }
-        _uiState.update { it.copy(updateInstallState = UpdateInstallState.Idle) }
-    }
+    fun dismissUpdateDialog() = updateCoordinator.dismissUpdateDialog()
 
-    fun onInstallPermissionReturned() {
-        val current = _uiState.value.updateInstallState
-        val path = when (current) {
-            is UpdateInstallState.NeedsInstallPermission -> current.apkFilePath
-            is UpdateInstallState.ReadyToInstall -> current.apkFilePath
-            else -> return
-        }
-        val file = java.io.File(path)
-        if (!file.exists()) {
-            _uiState.update {
-                it.copy(updateInstallState = UpdateInstallState.Error("File APK non trovato, riprova il download"))
-            }
-            return
-        }
-        if (AppUpdateDownloader.canInstallPackages(appContext)) {
-            installLaunchSeq++
-            _uiState.update {
-                it.copy(
-                    updateInstallState = UpdateInstallState.ReadyToInstall(
-                        apkFilePath = path,
-                        launchSeq = installLaunchSeq,
-                    ),
-                )
-            }
-        }
-    }
+    fun ignoreCurrentUpdateVersion() = updateCoordinator.ignoreCurrentUpdateVersion()
 
-    fun retriggerReadyApkInstall() {
-        val current = _uiState.value.updateInstallState
-        val path = when (current) {
-            is UpdateInstallState.ReadyToInstall -> current.apkFilePath
-            is UpdateInstallState.NeedsInstallPermission -> current.apkFilePath
-            else -> return
-        }
-        val file = java.io.File(path)
-        if (!file.exists()) {
-            startInAppUpdateDownload()
-            return
-        }
-        if (AppUpdateDownloader.canInstallPackages(appContext)) {
-            installLaunchSeq++
-            _uiState.update {
-                it.copy(
-                    updateInstallState = UpdateInstallState.ReadyToInstall(
-                        apkFilePath = path,
-                        launchSeq = installLaunchSeq,
-                    ),
-                )
-            }
-        } else {
-            _uiState.update {
-                it.copy(updateInstallState = UpdateInstallState.NeedsInstallPermission(apkFilePath = path))
-            }
-        }
-    }
-
-    fun dismissUpdateDialog() {
-        updateDownloadJob?.cancel()
-        updateDownloadJob = null
-        val wasInstalling = _uiState.value.updateInstallState is UpdateInstallState.ReadyToInstall
-        if (!wasInstalling) {
-            viewModelScope.launch(Dispatchers.IO) {
-                AppUpdateDownloader.cleanupOldUpdates(appContext)
-            }
-        }
-        _uiState.update {
-            it.copy(
-                availableUpdate = null,
-                updateInstallState = UpdateInstallState.Idle,
-            )
-        }
-    }
-
-    fun ignoreCurrentUpdateVersion() {
-        updateDownloadJob?.cancel()
-        updateDownloadJob = null
-        viewModelScope.launch(Dispatchers.IO) {
-            AppUpdateDownloader.cleanupOldUpdates(appContext)
-        }
-        val tag = _uiState.value.availableUpdate?.tagName
-        if (!tag.isNullOrBlank()) {
-            preferences.setDismissedUpdateTag(tag)
-        }
-        _uiState.update {
-            it.copy(
-                availableUpdate = null,
-                updateInstallState = UpdateInstallState.Idle,
-            )
-        }
-    }
-
-    fun saveGithubRepoSlug(slug: String) {
-        preferences.setGithubRepo(slug)
-        preferences.setLastUpdateCheckMillis(0L)
-        _uiState.update {
-            it.copy(
-                githubRepoSlug = preferences.getGithubRepo(),
-                statusToast = if (slug.isBlank()) "Repository GitHub rimosso" else "Repository salvato: $slug",
-            )
-        }
-        if (slug.isNotBlank()) {
-            checkForUpdatesManually()
-        }
-    }
+    fun saveGithubRepoSlug(slug: String) = updateCoordinator.saveGithubRepoSlug(slug)
 }

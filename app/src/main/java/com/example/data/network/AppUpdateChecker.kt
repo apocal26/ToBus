@@ -1,5 +1,6 @@
 package com.example.data.network
 
+import android.os.Build
 import android.util.Log
 import com.example.BuildConfig
 import com.example.data.preferences.ToBusPreferences
@@ -7,7 +8,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONObject
+import com.example.data.network.MinimalJsonParser.optArray
+import com.example.data.network.MinimalJsonParser.optBoolean
+import com.example.data.network.MinimalJsonParser.optLong
+import com.example.data.network.MinimalJsonParser.optString
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 data class AppUpdateInfo(
@@ -16,11 +21,25 @@ data class AppUpdateInfo(
     val releaseNotes: String,
     val releasePageUrl: String,
     val apkDownloadUrl: String?,
+    val selectedApkAbi: String? = null,
+    val selectedApkSizeBytes: Long? = null,
 ) {
     /** Direct APK asset link when available, otherwise the GitHub Release page. */
     val preferredOpenUrl: String
         get() = apkDownloadUrl ?: releasePageUrl
 }
+
+internal data class ReleaseAssetCandidate(
+    val name: String,
+    val downloadUrl: String,
+    val sizeBytes: Long? = null,
+)
+
+internal data class SelectedApkAsset(
+    val downloadUrl: String,
+    val abiLabel: String?,
+    val sizeBytes: Long?,
+)
 
 sealed interface UpdateCheckResult {
     data class Available(val info: AppUpdateInfo) : UpdateCheckResult
@@ -35,8 +54,10 @@ sealed interface UpdateCheckResult {
  * - Zero background services, WorkManager, or periodic timers.
  * - Strict 24-hour throttle persisted in SharedPreferences (returns in < 0.1 ms when already checked today).
  * - Single tiny (~2 KB) GET to `api.github.com/repos/{owner}/{repo}/releases/latest` on `Dispatchers.IO`.
+ * - Deterministic ABI-aware APK selection matching [Build.SUPPORTED_ABIS] with automatic fallback to
+ *   a universal APK (and safe release-page fallback if no compatible APK exists for this CPU).
  * - Pairs with [AppUpdateDownloader] for verified HTTPS in-app APK download via `FileProvider`
- *   and system `PackageInstaller` confirmation (or GitHub Release fallback when no APK asset is attached).
+ *   and system `PackageInstaller` confirmation.
  */
 object AppUpdateChecker {
     private const val TAG = "AppUpdateChecker"
@@ -160,10 +181,94 @@ object AppUpdateChecker {
         }
     }
 
-    internal fun parseLatestReleaseJson(jsonText: String): AppUpdateInfo? {
+    internal fun currentDeviceAbis(): List<String> = runCatching {
+        Build.SUPPORTED_ABIS?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+    }.getOrDefault(emptyList())
+
+    /**
+     * Extracts a canonical Android ABI identifier from a release APK filename,
+     * `"universal"` when explicitly labeled universal, or `null` when untagged
+     * (legacy single-APK releases).
+     */
+    internal fun detectApkAbiTag(fileName: String): String? {
+        val lower = fileName.lowercase(Locale.ROOT)
+        return when {
+            lower.contains("arm64-v8a") || lower.contains("arm64_v8a") ||
+                Regex("(^|[-_.])arm64([-_.]|$)").containsMatchIn(lower) -> "arm64-v8a"
+            lower.contains("armeabi-v7a") || lower.contains("armeabi_v7a") ||
+                Regex("(^|[-_.])armv7a?([-_.]|$)").containsMatchIn(lower) -> "armeabi-v7a"
+            lower.contains("x86_64") || lower.contains("x86-64") -> "x86_64"
+            Regex("(^|[-_.])x86([-_.]|$)").containsMatchIn(lower) -> "x86"
+            lower.contains("universal") -> "universal"
+            else -> null
+        }
+    }
+
+    /**
+     * Picks the best installable APK asset for [supportedAbis]:
+     * 1. Exact ABI match following the device's ordered [Build.SUPPORTED_ABIS] preference.
+     * 2. Explicit `universal` APK fallback.
+     * 3. Legacy untagged `.apk` fallback (e.g. `ToBus-v1.1.0.apk`).
+     * 4. `null` if only incompatible ABI-specific APKs exist (never downloads an un-installable APK).
+     */
+    internal fun selectBestApkAsset(
+        assets: List<ReleaseAssetCandidate>,
+        supportedAbis: List<String>,
+    ): SelectedApkAsset? {
+        val validApks = assets.filter { candidate ->
+            candidate.name.endsWith(".apk", ignoreCase = true) &&
+                isTrustedGithubUrl(candidate.downloadUrl)
+        }
+        if (validApks.isEmpty()) return null
+
+        val tagged = validApks.map { candidate ->
+            candidate to detectApkAbiTag(candidate.name)
+        }
+
+        // 1. Strict device-preferred ABI match (e.g. arm64-v8a before armeabi-v7a)
+        for (deviceAbi in supportedAbis) {
+            val normalizedAbi = deviceAbi.trim().lowercase(Locale.ROOT)
+            val match = tagged.firstOrNull { (_, tag) -> tag == normalizedAbi }
+            if (match != null) {
+                return SelectedApkAsset(
+                    downloadUrl = match.first.downloadUrl,
+                    abiLabel = match.second,
+                    sizeBytes = match.first.sizeBytes?.takeIf { it > 0L },
+                )
+            }
+        }
+
+        // 2. Explicit universal APK fallback
+        val explicitUniversal = tagged.firstOrNull { (_, tag) -> tag == "universal" }
+        if (explicitUniversal != null) {
+            return SelectedApkAsset(
+                downloadUrl = explicitUniversal.first.downloadUrl,
+                abiLabel = "universal",
+                sizeBytes = explicitUniversal.first.sizeBytes?.takeIf { it > 0L },
+            )
+        }
+
+        // 3. Legacy untagged APK fallback (single-APK releases without ABI suffix)
+        val legacyUntagged = tagged.firstOrNull { (_, tag) -> tag == null }
+        if (legacyUntagged != null) {
+            return SelectedApkAsset(
+                downloadUrl = legacyUntagged.first.downloadUrl,
+                abiLabel = null,
+                sizeBytes = legacyUntagged.first.sizeBytes?.takeIf { it > 0L },
+            )
+        }
+
+        // 4. Only incompatible ABI-specific APKs exist -> return null so UI falls back to GitHub page
+        return null
+    }
+
+    internal fun parseLatestReleaseJson(
+        jsonText: String,
+        supportedAbis: List<String> = currentDeviceAbis(),
+    ): AppUpdateInfo? {
         if (jsonText.isBlank()) return null
         return runCatching {
-            val obj = JSONObject(jsonText)
+            val obj = MinimalJsonParser.parseObject(jsonText) ?: return null
             if (obj.optBoolean("draft", false) || obj.optBoolean("prerelease", false)) {
                 return null
             }
@@ -177,26 +282,30 @@ object AppUpdateChecker {
                 .replace(Regex("\n{3,}"), "\n\n")
             val notes = if (rawNotes.length > 4000) rawNotes.take(3997).trimEnd() + "…" else rawNotes
 
-            var apkUrl: String? = null
-            val assets = obj.optJSONArray("assets")
+            val candidates = mutableListOf<ReleaseAssetCandidate>()
+            val assets = obj.optArray("assets")
             if (assets != null) {
-                for (i in 0 until assets.length()) {
-                    val asset = assets.optJSONObject(i) ?: continue
+                for (rawAsset in assets) {
+                    val asset = rawAsset as? Map<*, *> ?: continue
                     val name = asset.optString("name", "").trim()
                     val downloadUrl = asset.optString("browser_download_url", "").trim()
-                    if (name.endsWith(".apk", ignoreCase = true) && isTrustedGithubUrl(downloadUrl)) {
-                        apkUrl = downloadUrl
-                        break
+                    val size = asset.optLong("size", -1L).takeIf { it > 0L }
+                    if (name.isNotEmpty() && downloadUrl.isNotEmpty()) {
+                        candidates.add(ReleaseAssetCandidate(name = name, downloadUrl = downloadUrl, sizeBytes = size))
                     }
                 }
             }
+
+            val bestApk = selectBestApkAsset(candidates, supportedAbis)
 
             AppUpdateInfo(
                 tagName = tagName,
                 title = title,
                 releaseNotes = notes,
                 releasePageUrl = htmlUrl,
-                apkDownloadUrl = apkUrl,
+                apkDownloadUrl = bestApk?.downloadUrl,
+                selectedApkAbi = bestApk?.abiLabel,
+                selectedApkSizeBytes = bestApk?.sizeBytes,
             )
         }.getOrNull()
     }

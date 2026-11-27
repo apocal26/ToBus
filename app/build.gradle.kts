@@ -88,6 +88,20 @@ android {
       isReturnDefaultValues = true
     }
   }
+  // Opt-in per-ABI APK splits used exclusively by the GitHub Release workflow (-PtobusAbiSplits=true).
+  // Keeps local debug/release builds and default APK output paths 100% unchanged.
+  val enableAbiSplits = (project.findProperty("tobusAbiSplits") as? String)
+    ?.equals("true", ignoreCase = true) == true
+  if (enableAbiSplits) {
+    splits {
+      abi {
+        isEnable = true
+        reset()
+        include("arm64-v8a", "armeabi-v7a")
+        isUniversalApk = true
+      }
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true

@@ -16,3 +16,9 @@
 local.properties
 .env
 debug.keystore
+
+# AI Studio & local build/release artifacts (excluded from public GitHub repo)
+.aistudio/
+.build-outputs/
+public/assets/aistudio/
+release-artifacts/

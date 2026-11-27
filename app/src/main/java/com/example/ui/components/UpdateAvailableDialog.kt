@@ -129,11 +129,13 @@ fun UpdateAvailableDialog(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        val abiSuffix = update.selectedApkAbi?.let { " · $it" }.orEmpty()
                         Text(
-                            text = "${update.tagName} · installata v${BuildConfig.VERSION_NAME}",
+                            text = "${update.tagName} · installata v${BuildConfig.VERSION_NAME}$abiSuffix",
                             style = MaterialTheme.typography.bodySmall,
                             color = badgeAccent,
                             maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
@@ -246,6 +248,10 @@ fun UpdateAvailableDialog(
                 when (installState) {
                     UpdateInstallState.Idle -> {
                         Spacer(modifier = Modifier.height(2.dp))
+                        val sizeSuffix = update.selectedApkSizeBytes
+                            ?.takeIf { it > 0L }
+                            ?.let { " (${AppUpdateDownloader.formatByteSize(it)})" }
+                            .orEmpty()
                         Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -258,7 +264,11 @@ fun UpdateAvailableDialog(
                         ) {
                             Box(contentAlignment = Alignment.Center) {
                                 Text(
-                                    text = if (update.apkDownloadUrl != null) "Scarica e installa" else "Apri release su GitHub",
+                                    text = if (update.apkDownloadUrl != null) {
+                                        "Scarica e installa$sizeSuffix"
+                                    } else {
+                                        "Apri release su GitHub"
+                                    },
                                     style = MaterialTheme.typography.labelLarge,
                                     color = DarkInkOnAccent,
                                 )

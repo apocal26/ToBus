@@ -152,54 +152,69 @@ jobs:
           echo "Signing certificate Owner: ${CERT_OWNER}"
           echo "Signing certificate SHA-256: ${CERT_SHA256}"
 
-          gradle :app:assembleRelease $GRADLE_PROPS --no-daemon --stacktrace
-          APK_SOURCE="app/build/outputs/apk/release/app-release.apk"
+          gradle :app:assembleRelease $GRADLE_PROPS -PtobusAbiSplits=true --no-daemon --stacktrace
 
           BUILD_TOOLS_DIR="$(ls -d "${ANDROID_HOME}/build-tools/"* 2>/dev/null | sort -V | tail -n 1)"
-          if [ -n "$BUILD_TOOLS_DIR" ] && [ -x "${BUILD_TOOLS_DIR}/apksigner" ]; then
-            # Gradle already zipaligns (16 KB page aligned) and signs the release APK.
-            # Verify first WITHOUT mutating in-place; only re-align + sign to a fresh file if verification fails.
-            if ! "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$APK_SOURCE" || \
-               ! "${BUILD_TOOLS_DIR}/apksigner" verify --min-sdk-version 24 "$APK_SOURCE" >/dev/null 2>&1; then
-              echo "Re-aligning and re-signing APK cleanly to a fresh output file..."
-              "${BUILD_TOOLS_DIR}/zipalign" -P 16 -f 4 "$APK_SOURCE" "${RUNNER_TEMP}/aligned.apk"
-              "${BUILD_TOOLS_DIR}/apksigner" sign \
-                --ks "$KEYSTORE_PATH" \
-                --ks-key-alias upload \
-                --ks-pass "pass:${SIGN_PASS}" \
-                --key-pass "pass:${SIGN_KEY_PASS}" \
-                --min-sdk-version 24 \
-                --v2-signing-enabled true \
-                --v3-signing-enabled true \
-                --out "${RUNNER_TEMP}/signed.apk" \
-                "${RUNNER_TEMP}/aligned.apk"
-              cp "${RUNNER_TEMP}/signed.apk" "$APK_SOURCE"
-            fi
-            # Strictly verify BOTH alignment and signature on the exact final APK before uploading
-            "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$APK_SOURCE"
-            "${BUILD_TOOLS_DIR}/apksigner" verify --min-sdk-version 24 --verbose --print-certs "$APK_SOURCE"
-          fi
-
           mkdir -p release-artifacts
-          APK_NAME="ToBus-${RELEASE_TAG}.apk"
-          cp "$APK_SOURCE" "release-artifacts/${APK_NAME}"
-          APK_SHA256="$(sha256sum "release-artifacts/${APK_NAME}" | awk '{print $1}')"
-          APK_SIZE="$(ls -lh "release-artifacts/${APK_NAME}" | awk '{print $5}')"
-          ls -lh "release-artifacts/${APK_NAME}"
-          echo "APK_FILE=release-artifacts/${APK_NAME}" >> "$GITHUB_ENV"
 
           {
             echo "### Release APK Summary"
-            echo "- **APK**: \`${APK_NAME}\` (${APK_SIZE})"
-            echo "- **APK SHA-256**: \`${APK_SHA256}\`"
             echo "- **versionName**: \`${VERSION_CLEAN}\`"
             echo "- **versionCode**: \`${VERSION_CODE}\`"
             echo "- **Signing source**: ${SIGN_SOURCE}"
             echo "- **Certificate Owner**: \`${CERT_OWNER}\`"
             echo "- **Certificate SHA-256**: \`${CERT_SHA256}\`"
+            echo ""
+            echo "| Variante | File | Dimensione | SHA-256 |"
+            echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Publish GitHub Release
+          verify_and_publish_apk() {
+            local ABI_LABEL="$1"
+            local SRC_APK="$2"
+            local DEST_NAME="ToBus-${RELEASE_TAG}-${ABI_LABEL}.apk"
+            local DEST_PATH="release-artifacts/${DEST_NAME}"
+
+            if [ ! -f "$SRC_APK" ]; then
+              echo "::error::APK atteso non trovato: ${SRC_APK}"
+              exit 1
+            fi
+
+            if [ -n "$BUILD_TOOLS_DIR" ] && [ -x "${BUILD_TOOLS_DIR}/apksigner" ]; then
+              if ! "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$SRC_APK" || \
+                 ! "${BUILD_TOOLS_DIR}/apksigner" verify --min-sdk-version 24 "$SRC_APK" >/dev/null 2>&1; then
+                echo "Re-aligning and re-signing ${DEST_NAME}..."
+                "${BUILD_TOOLS_DIR}/zipalign" -P 16 -f 4 "$SRC_APK" "${RUNNER_TEMP}/aligned-${ABI_LABEL}.apk"
+                "${BUILD_TOOLS_DIR}/apksigner" sign \
+                  --ks "$KEYSTORE_PATH" \
+                  --ks-key-alias upload \
+                  --ks-pass "pass:${SIGN_PASS}" \
+                  --key-pass "pass:${SIGN_KEY_PASS}" \
+                  --min-sdk-version 24 \
+                  --v2-signing-enabled true \
+                  --v3-signing-enabled true \
+                  --out "${RUNNER_TEMP}/signed-${ABI_LABEL}.apk" \
+                  "${RUNNER_TEMP}/aligned-${ABI_LABEL}.apk"
+                cp "${RUNNER_TEMP}/signed-${ABI_LABEL}.apk" "$SRC_APK"
+              fi
+              "${BUILD_TOOLS_DIR}/zipalign" -c -P 16 4 "$SRC_APK"
+              "${BUILD_TOOLS_DIR}/apksigner" verify --min-sdk-version 24 --verbose --print-certs "$SRC_APK"
+            fi
+
+            cp "$SRC_APK" "$DEST_PATH"
+            local APK_SHA256
+            APK_SHA256="$(sha256sum "$DEST_PATH" | awk '{print $1}')"
+            local APK_SIZE
+            APK_SIZE="$(ls -lh "$DEST_PATH" | awk '{print $5}')"
+            ls -lh "$DEST_PATH"
+            echo "| \`${ABI_LABEL}\` | \`${DEST_NAME}\` | ${APK_SIZE} | \`${APK_SHA256}\` |" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          verify_and_publish_apk "arm64-v8a" "app/build/outputs/apk/release/app-arm64-v8a-release.apk"
+          verify_and_publish_apk "armeabi-v7a" "app/build/outputs/apk/release/app-armeabi-v7a-release.apk"
+          verify_and_publish_apk "universal" "app/build/outputs/apk/release/app-universal-release.apk"
+
+      - name: Publish GitHub Release (Universal first for legacy updaters)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -207,4 +222,14 @@ jobs:
           name: ToBus ${{ env.RELEASE_TAG }}
           body: ${{ inputs.notes }}
           generate_release_notes: ${{ inputs.notes == '' }}
-          files: ${{ env.APK_FILE }}
+          files: |
+            release-artifacts/*-universal.apk
+
+      - name: Upload ABI-split APKs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            release-artifacts/*-arm64-v8a.apk \
+            release-artifacts/*-armeabi-v7a.apk \
+            --clobber
