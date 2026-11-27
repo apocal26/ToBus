@@ -1174,7 +1174,18 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         focusArrivalJob?.cancel()
         focusArrivalJob = viewModelScope.launch {
             val nowMillis = System.currentTimeMillis()
-            val allLive = repository.getLastCachedSnapshot()?.allVehicles.orEmpty().ifEmpty { state.lineVehicles }
+            val baseAllLive = repository.getLastCachedSnapshot()?.allVehicles.orEmpty().ifEmpty { state.lineVehicles }
+            val cachedExtraLine = repository.getCachedSingleLineVehicles(targetLine, nowMillis)
+            val allLive = if (cachedExtraLine.isNotEmpty()) {
+                GttRealtimeRepository.mergeMultiSourceVehicles(
+                    matoVehicles = cachedExtraLine,
+                    gttVehicles = baseAllLive,
+                    busOneVehicles = emptyList(),
+                    nowMillis = nowMillis,
+                )
+            } else {
+                baseAllLive
+            }
             val targetLinePatterns = if (isTrackedLine) {
                 state.routePatterns
             } else {
@@ -1206,10 +1217,15 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             // If a "Live" arrival (especially on another line like 55/5) wasn't in the general GTFS-RT pool,
             // run an instant on-demand MaTO GraphQL query for that exact line before giving up.
             if (matched == null && arrival.isRealtime) {
-                val onDemandLineBuses = repository.fetchLiveVehiclesForSingleLine(targetLine)
+                val onDemandLineBuses = repository.fetchLiveVehiclesForSingleLine(targetLine, forceRefresh = cachedExtraLine.isNotEmpty())
                 if (_uiState.value.selectedStop?.stopId != stop.stopId) return@launch
                 if (onDemandLineBuses.isNotEmpty()) {
-                    val expandedPool = allLive + onDemandLineBuses
+                    val expandedPool = GttRealtimeRepository.mergeMultiSourceVehicles(
+                        matoVehicles = onDemandLineBuses,
+                        gttVehicles = allLive,
+                        busOneVehicles = emptyList(),
+                        nowMillis = System.currentTimeMillis(),
+                    )
                     matched = GttRealtimeRepository.findExactBusForArrival(
                         arrival = arrival,
                         stop = stop,

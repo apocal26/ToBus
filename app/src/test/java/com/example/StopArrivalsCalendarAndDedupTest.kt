@@ -858,4 +858,442 @@ class StopArrivalsCalendarAndDedupTest {
         assertEquals(1, reconciled.size)
         assertEquals("Siccardi Cap", reconciled.first().headsign)
     }
+
+    @Test
+    fun impossibleNearbyStimatoIsHiddenUnlessSecondPhysicalBusOrTerminusBusExists() {
+        val nowMillis = 1_795_334_400_000L
+        val nowSec = nowMillis / 1000L
+
+        // Line 55 straight northbound corridor (~5.56 km): origin at 45.0100, stop at 45.0400 (~3.34 km -> floor ~575s)
+        val stop317 = TransitStop("317", "317", "SANTA RITA", 45.0400, 7.6500, directionId = 0, sequence = 12)
+        val line55Dir0Stops = listOf(
+            TransitStop("550", "550", "GERBIDO CAP", 45.0100, 7.6500, directionId = 0, sequence = 1),
+            stop317,
+            TransitStop("559", "559", "VANCHIGLIA CAP", 45.0600, 7.6500, directionId = 0, sequence = 20),
+        )
+        val line55Dir1Stops = listOf(
+            TransitStop("559B", "559B", "VANCHIGLIA CAP", 45.0600, 7.6500, directionId = 1, sequence = 1),
+            TransitStop("550B", "550B", "GERBIDO CAP", 45.0100, 7.6500, directionId = 1, sequence = 20),
+        )
+        val line55Patterns = listOf(
+            RoutePattern(
+                id = "55_dir0",
+                name = "55 to Vanchiglia",
+                directionId = 0,
+                segments = listOf(line55Dir0Stops.map { GeoPoint(it.lat, it.lon) }),
+                stops = line55Dir0Stops,
+            ),
+            RoutePattern(
+                id = "55_dir1",
+                name = "55 to Gerbido",
+                directionId = 1,
+                segments = listOf(line55Dir1Stops.map { GeoPoint(it.lat, it.lon) }),
+                stops = line55Dir1Stops,
+            ),
+        )
+
+        // Only 1 northbound bus (#5501) ~2.0 km upstream (~7 min away), plus 2 buses heading south (opposite direction)
+        val bus5501North = BusVehicle(
+            entityId = "e5501",
+            vehicleId = "5501",
+            label = "5501",
+            lineCode = "55",
+            rawRouteId = "55U",
+            tripId = "T55_LIVE",
+            latitude = 45.0220,
+            longitude = 7.6500,
+            bearing = 0f,
+            speedKmh = 18f,
+            directionId = 0,
+            timestampSeconds = nowSec - 5L,
+            stopId = null,
+            status = VehicleStopStatus.IN_TRANSIT_TO,
+            sourceName = "MaTO Live",
+        )
+        val bus5502Opposite = bus5501North.copy(
+            entityId = "e5502",
+            vehicleId = "5502",
+            label = "5502",
+            tripId = null,
+            latitude = 45.0480,
+            bearing = 180f,
+            directionId = 1,
+        )
+        val bus5503Opposite = bus5502Opposite.copy(
+            entityId = "e5503",
+            vehicleId = "5503",
+            label = "5503",
+            latitude = 45.0350,
+        )
+
+        val rawArrivals = listOf(
+            StopArrival(
+                lineCode = "55",
+                headsign = "Vanchiglia",
+                arrivalEpochSeconds = nowSec + 7L * 60L,
+                isRealtime = true,
+                vehicleId = null,
+                sourceLabel = "GTT Palina",
+            ),
+            // Impossible Stimato 3 min after Live (above terminusFloorSec ~9.5 min, so old filter kept it!)
+            StopArrival(
+                lineCode = "55",
+                headsign = "Vanchiglia",
+                arrivalEpochSeconds = nowSec + 10L * 60L,
+                isRealtime = false,
+                vehicleId = null,
+                sourceLabel = "Orario",
+            ),
+            // Legitimate future Stimato (+25 min)
+            StopArrival(
+                lineCode = "55",
+                headsign = "Vanchiglia",
+                arrivalEpochSeconds = nowSec + 25L * 60L,
+                isRealtime = false,
+                vehicleId = null,
+                sourceLabel = "Orario",
+            ),
+        )
+
+        // Case A: Only 1 physical bus on direction 0 -> +10m Stimato MUST be hidden, +7m Live linked & +25m Stimato kept!
+        val caseA = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = emptyList(),
+            allLivePool = listOf(bus5501North, bus5502Opposite, bus5503Opposite),
+            routePatterns = emptyList(),
+            rawArrivals = rawArrivals,
+            nowMillis = nowMillis,
+            otherLinePatterns = mapOf("55" to line55Patterns),
+        ).sortedBy { it.arrivalEpochSeconds }
+
+        assertEquals(2, caseA.size)
+        assertEquals("5501", caseA[0].vehicleId)
+        assertTrue(caseA[0].isRealtime)
+        assertFalse(caseA[1].isRealtime)
+        assertEquals(nowSec + 25L * 60L, caseA[1].arrivalEpochSeconds)
+
+        // Case B: A 2nd real bus (#5504) parked at origin terminus (Gerbido Cap) -> +10m Stimato MUST be preserved!
+        val bus5504AtOrigin = bus5501North.copy(
+            entityId = "e5504",
+            vehicleId = "5504",
+            label = "5504",
+            tripId = null,
+            latitude = 45.0102,
+            longitude = 7.6500,
+            bearing = 180f, // Still facing south from incoming run, waiting at origin terminus
+            speedKmh = 0f,
+            directionId = 1, // Waiting at origin terminus before switching trip/direction
+        )
+        val caseB = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = emptyList(),
+            allLivePool = listOf(bus5501North, bus5502Opposite, bus5504AtOrigin),
+            routePatterns = emptyList(),
+            rawArrivals = rawArrivals,
+            nowMillis = nowMillis,
+            otherLinePatterns = mapOf("55" to line55Patterns),
+        ).sortedBy { it.arrivalEpochSeconds }
+
+        assertEquals(3, caseB.size)
+        assertEquals(nowSec + 10L * 60L, caseB[1].arrivalEpochSeconds)
+
+        // Case C: Real bunching — 2nd upstream bus (#5505) physically approaching at ~10 min -> absorbs +10m Stimato into Live!
+        val bus5505SecondUpstream = bus5501North.copy(
+            entityId = "e5505",
+            vehicleId = "5505",
+            label = "5505",
+            tripId = null,
+            latitude = 45.0145,
+            longitude = 7.6500,
+            speedKmh = 18f,
+            directionId = 0,
+        )
+        val caseC = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = emptyList(),
+            allLivePool = listOf(bus5501North, bus5505SecondUpstream),
+            routePatterns = emptyList(),
+            rawArrivals = rawArrivals,
+            nowMillis = nowMillis,
+            otherLinePatterns = mapOf("55" to line55Patterns),
+        ).sortedBy { it.arrivalEpochSeconds }
+
+        assertEquals(3, caseC.size)
+        assertEquals(setOf("5501", "5505"), caseC.mapNotNull { it.vehicleId }.toSet())
+    }
+
+    @Test
+    fun gttPalinaLiveKeepsStandaloneRunsButDropsDuplicatesAndPostPassageGhosts() {
+        val nowMillis = 1_795_334_400_000L
+        val nowSec = nowMillis / 1000L
+
+        val stop317 = TransitStop("317", "317", "SANTA RITA", 45.0400, 7.6500, directionId = 0, sequence = 12)
+        val line12Stops = listOf(
+            TransitStop("120", "120", "ALLAMANO CAP", 45.0100, 7.6500, directionId = 0, sequence = 1),
+            stop317,
+            TransitStop("129", "129", "PORTA NUOVA CAP", 45.0600, 7.6500, directionId = 0, sequence = 20),
+        )
+        val line12Patterns = listOf(
+            RoutePattern(
+                id = "12_dir0",
+                name = "12 to Porta Nuova",
+                directionId = 0,
+                segments = listOf(line12Stops.map { GeoPoint(it.lat, it.lon) }),
+                stops = line12Stops,
+            ),
+        )
+
+        // Bus #1201 ~2.0 km upstream (~7 min away) + Bus #1202 just passed 300m downstream
+        val bus1201Upstream = BusVehicle(
+            entityId = "e1201",
+            vehicleId = "1201",
+            label = "1201",
+            lineCode = "12",
+            rawRouteId = "12U",
+            tripId = "T12_1",
+            latitude = 45.0220,
+            longitude = 7.6500,
+            bearing = 0f,
+            speedKmh = 18f,
+            directionId = 0,
+            timestampSeconds = nowSec - 5L,
+            stopId = null,
+            status = VehicleStopStatus.IN_TRANSIT_TO,
+        )
+        val bus1202JustPassed = bus1201Upstream.copy(
+            entityId = "e1202",
+            vehicleId = "1202",
+            label = "1202",
+            tripId = "T12_0",
+            latitude = 45.0428, // ~310m past stop317
+        )
+
+        val rawArrivals = listOf(
+            // 1. Imminent post-passage ghost (+2 min) when #1202 just passed downstream and no bus is < 6 min away
+            StopArrival(
+                lineCode = "12",
+                headsign = "Porta Nuova",
+                arrivalEpochSeconds = nowSec + 2L * 60L,
+                isRealtime = true,
+                vehicleId = null,
+                sourceLabel = "GTT Palina",
+            ),
+            // 2. Real tracked arrival (+7 min, linked to #1201)
+            StopArrival(
+                lineCode = "12",
+                headsign = "Porta Nuova",
+                arrivalEpochSeconds = nowSec + 7L * 60L,
+                isRealtime = true,
+                vehicleId = "1201",
+                sourceLabel = "GTT Palina",
+            ),
+            // 3. Duplicate unlinked GTT Palina Live (+10 min, 3 min after #1201 with NO 2nd physical bus) -> DROP
+            StopArrival(
+                lineCode = "12",
+                headsign = "Porta Nuova",
+                arrivalEpochSeconds = nowSec + 10L * 60L,
+                isRealtime = true,
+                vehicleId = null,
+                sourceLabel = "GTT Palina",
+            ),
+            // 4. Standalone unlinked GTT Palina Live (+18 min, e.g. real bus with silent GPS transponder) -> KEEP!
+            StopArrival(
+                lineCode = "12",
+                headsign = "Porta Nuova",
+                arrivalEpochSeconds = nowSec + 18L * 60L,
+                isRealtime = true,
+                vehicleId = null,
+                sourceLabel = "GTT Palina",
+            ),
+        )
+
+        val reconciled = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = listOf(bus1201Upstream, bus1202JustPassed),
+            allLivePool = listOf(bus1201Upstream, bus1202JustPassed),
+            routePatterns = line12Patterns,
+            rawArrivals = rawArrivals,
+            nowMillis = nowMillis,
+        ).sortedBy { it.arrivalEpochSeconds }
+
+        assertEquals(2, reconciled.size)
+        assertEquals("1201", reconciled[0].vehicleId)
+        assertEquals(nowSec + 7L * 60L, reconciled[0].arrivalEpochSeconds)
+        assertNull(reconciled[1].vehicleId)
+        assertEquals("GTT Palina", reconciled[1].sourceLabel)
+        assertEquals(nowSec + 18L * 60L, reconciled[1].arrivalEpochSeconds)
+    }
+
+    @Test
+    fun trafficPausedBusKeepsCrosshairWhileConfirmed4MinMatoPhantomIsExcluded() {
+        val nowMillis = 1_795_334_400_000L
+        val nowSec = nowMillis / 1000L
+
+        val stop317 = TransitStop("317", "317", "SANTA RITA", 45.0400, 7.6500, directionId = 0, sequence = 12)
+        val line12Stops = listOf(
+            TransitStop("120", "120", "ALLAMANO CAP", 45.0100, 7.6500, directionId = 0, sequence = 1),
+            stop317,
+            TransitStop("129", "129", "PORTA NUOVA CAP", 45.0600, 7.6500, directionId = 0, sequence = 20),
+        )
+        val line12Patterns = listOf(
+            RoutePattern(
+                id = "12_dir0",
+                name = "12 to Porta Nuova",
+                directionId = 0,
+                segments = listOf(line12Stops.map { GeoPoint(it.lat, it.lon) }),
+                stops = line12Stops,
+            ),
+        )
+
+        // Bus paused 2.5 minutes mid-route at a red light (should STILL link crosshair, NOT synthesize fake GPS arrival)
+        val trafficPausedBus = BusVehicle(
+            entityId = "e1210",
+            vehicleId = "1210",
+            label = "1210",
+            lineCode = "12",
+            rawRouteId = "12U",
+            tripId = null,
+            latitude = 45.0250,
+            longitude = 7.6500,
+            bearing = 0f,
+            speedKmh = 0f,
+            directionId = 0,
+            timestampSeconds = nowSec - 15L,
+            stopId = null,
+            status = VehicleStopStatus.IN_TRANSIT_TO,
+            sourceName = "MaTO Live",
+            contributingSources = setOf("MaTO Live"),
+            stationarySinceMillis = nowMillis - 150_000L, // 2.5 min stationary
+        )
+
+        // Confirmed 4.5-minute MaTO-only phantom mid-route (MUST be excluded from crosshair linking!)
+        val confirmedMatoPhantom = trafficPausedBus.copy(
+            entityId = "e1299",
+            vehicleId = "1299",
+            label = "1299",
+            stationarySinceMillis = nowMillis - 270_000L, // 4.5 min stationary
+        )
+
+        val incomingPalina = listOf(
+            StopArrival(
+                lineCode = "12",
+                headsign = "Porta Nuova",
+                arrivalEpochSeconds = nowSec + 6L * 60L,
+                isRealtime = true,
+                vehicleId = null,
+                sourceLabel = "GTT Palina",
+            ),
+        )
+
+        // 1. Traffic-paused bus links to the incoming GTT Palina arrival so the GPS crosshair stays usable
+        val withTrafficPaused = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = listOf(trafficPausedBus),
+            allLivePool = listOf(trafficPausedBus),
+            routePatterns = line12Patterns,
+            rawArrivals = incomingPalina,
+            nowMillis = nowMillis,
+        )
+        assertEquals(1, withTrafficPaused.size)
+        assertEquals("1210", withTrafficPaused.first().vehicleId)
+
+        // 2. Traffic-paused bus alone (with NO feed arrival) does NOT synthesize a fake GPS Live arrival
+        val noSyntheticFromPaused = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = listOf(trafficPausedBus),
+            allLivePool = listOf(trafficPausedBus),
+            routePatterns = line12Patterns,
+            rawArrivals = emptyList(),
+            nowMillis = nowMillis,
+        )
+        assertTrue(noSyntheticFromPaused.isEmpty())
+
+        // 3. Confirmed 4.5-min MaTO phantom is NEVER linked to the incoming arrival
+        val withPhantom = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = listOf(confirmedMatoPhantom),
+            allLivePool = listOf(confirmedMatoPhantom),
+            routePatterns = line12Patterns,
+            rawArrivals = incomingPalina,
+            nowMillis = nowMillis,
+        )
+        assertEquals(1, withPhantom.size)
+        assertNull("Confirmed 4.5-min MaTO phantom must NOT be linked as GPS crosshair!", withPhantom.first().vehicleId)
+    }
+
+    @Test
+    fun otherLineMatoOnlyVehicleLinksCrosshairAndAbsorbsDelayedStimatoImmediately() {
+        val nowMillis = 1_795_334_400_000L
+        val nowSec = nowMillis / 1000L
+
+        val stop317 = TransitStop("317", "317", "SANTA RITA", 45.0400, 7.6500, directionId = 0, sequence = 12)
+        val line58Stops = listOf(
+            TransitStop("580", "580", "ALLAMANO CAP", 45.0100, 7.6500, directionId = 0, sequence = 1),
+            stop317,
+            TransitStop("589", "589", "BERTOLA CAP", 45.0600, 7.6500, directionId = 0, sequence = 20),
+        )
+        val line58Patterns = listOf(
+            RoutePattern(
+                id = "58_dir0",
+                name = "58 to Bertola",
+                directionId = 0,
+                segments = listOf(line58Stops.map { GeoPoint(it.lat, it.lon) }),
+                stops = line58Stops,
+            ),
+        )
+
+        // MaTO-only vehicle fetched in parallel for Line 58 (even while viewing Line 12!)
+        val bus58MatoOnly = BusVehicle(
+            entityId = "mato_58_3312",
+            vehicleId = "3312",
+            label = "3312",
+            lineCode = "58",
+            rawRouteId = "58U",
+            tripId = "T58_MATO",
+            latitude = 45.0220, // ~2.0 km upstream -> ~7 min ETA
+            longitude = 7.6500,
+            bearing = 0f,
+            speedKmh = 18f,
+            directionId = 0,
+            timestampSeconds = nowSec - 4L,
+            stopId = null,
+            status = VehicleStopStatus.IN_TRANSIT_TO,
+            sourceName = "MaTO Live",
+        )
+
+        // Feed only has a scheduled slot (+5 min) while bus #3312 is running ~2 min late (~7 min)
+        val rawArrivals = listOf(
+            StopArrival(
+                lineCode = "58",
+                headsign = "Bertola",
+                arrivalEpochSeconds = nowSec + 5L * 60L,
+                isRealtime = false,
+                vehicleId = null,
+                sourceLabel = "Orario",
+            ),
+        )
+
+        val reconciled = GttRealtimeRepository.reconcileLiveVehiclesWithArrivals(
+            stop = stop317,
+            preferredLine = "12",
+            liveVehicles = emptyList(),
+            allLivePool = listOf(bus58MatoOnly),
+            routePatterns = emptyList(),
+            rawArrivals = rawArrivals,
+            nowMillis = nowMillis,
+            otherLinePatterns = mapOf("58" to line58Patterns),
+        )
+
+        assertEquals(1, reconciled.size)
+        assertTrue(reconciled.first().isRealtime)
+        assertEquals("3312", reconciled.first().vehicleId)
+        assertEquals("Bertola", reconciled.first().headsign)
+    }
 }

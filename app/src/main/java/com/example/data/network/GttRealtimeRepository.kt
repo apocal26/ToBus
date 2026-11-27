@@ -102,8 +102,14 @@ class GttRealtimeRepository private constructor(context: Context) {
         val inferredBearing: Float? = null,
     )
 
+    private data class CachedSingleLineVehicles(
+        val fetchedAtMillis: Long,
+        val vehicles: List<BusVehicle>,
+    )
+
     private val movementTracker = ConcurrentHashMap<String, MovementRecord>()
     private val sourceHealthTracker = SourceHealthTracker()
+    private val singleLineLiveCache = ConcurrentHashMap<String, CachedSingleLineVehicles>()
 
     @Volatile
     private var lastSnapshot: LiveFeedSnapshot? = null
@@ -1058,11 +1064,47 @@ class GttRealtimeRepository private constructor(context: Context) {
      * On-demand fast MaTO GraphQL lookup for a single line (used when the user taps a "Live" arrival
      * of another line inside a stop card and its vehicle was not in the general GTFS-RT pool).
      */
-    suspend fun fetchLiveVehiclesForSingleLine(lineCode: String): List<BusVehicle> = withContext(Dispatchers.IO) {
+    fun getCachedSingleLineVehicles(
+        lineCode: String,
+        nowMillis: Long = System.currentTimeMillis(),
+    ): List<BusVehicle> {
+        val clean = GtfsRtProtobufParser.normalizeGttLineCode(lineCode).ifBlank { lineCode.trim().uppercase() }
+        if (clean.isEmpty() || clean == "?") return emptyList()
+        val cached = singleLineLiveCache[clean] ?: return emptyList()
+        val ttl = if (cached.vehicles.isNotEmpty()) SINGLE_LINE_LIVE_CACHE_TTL_MS else SINGLE_LINE_EMPTY_CACHE_TTL_MS
+        return if ((nowMillis - cached.fetchedAtMillis) <= ttl) cached.vehicles else emptyList()
+    }
+
+    suspend fun fetchLiveVehiclesForSingleLine(
+        lineCode: String,
+        forceRefresh: Boolean = false,
+    ): List<BusVehicle> = withContext(Dispatchers.IO) {
+        val clean = GtfsRtProtobufParser.normalizeGttLineCode(lineCode).ifBlank { lineCode.trim().uppercase() }
+        if (clean.isEmpty() || clean == "?") return@withContext emptyList()
         val nowMillis = System.currentTimeMillis()
-        withTimeoutOrNull(3_800L) {
-            fetchMatoGraphQlVehiclePositions(lineCode, nowMillis)
+        if (!forceRefresh) {
+            val cached = singleLineLiveCache[clean]
+            if (cached != null) {
+                val ttl = if (cached.vehicles.isNotEmpty()) SINGLE_LINE_LIVE_CACHE_TTL_MS else SINGLE_LINE_EMPTY_CACHE_TTL_MS
+                if ((nowMillis - cached.fetchedAtMillis) <= ttl) {
+                    return@withContext cached.vehicles
+                }
+            }
+        }
+        val fetched = withTimeoutOrNull(3_400L) {
+            fetchMatoGraphQlVehiclePositions(clean, nowMillis)
         }.orEmpty()
+        val enriched = if (fetched.isNotEmpty()) {
+            enrichWithTripUpdatesAndMovement(fetched, lastTripUpdates, nowMillis)
+        } else {
+            emptyList()
+        }
+        singleLineLiveCache[clean] = CachedSingleLineVehicles(nowMillis, enriched)
+        if (singleLineLiveCache.size > 48) {
+            val cutoff = nowMillis - 2 * SINGLE_LINE_LIVE_CACHE_TTL_MS
+            singleLineLiveCache.entries.removeIf { it.value.fetchedAtMillis < cutoff }
+        }
+        enriched
     }
 
     /**
@@ -1675,7 +1717,7 @@ class GttRealtimeRepository private constructor(context: Context) {
             }
         }
 
-        withTimeoutOrNull(2_200L) {
+        withTimeoutOrNull(3_600L) {
             fetchRoutePatterns(normalized, activeTripIds)
         }.orEmpty()
     }
@@ -1823,29 +1865,132 @@ class GttRealtimeRepository private constructor(context: Context) {
             preReconciled.addAll(scheduled)
         }
 
-        // 4. Load real route geometries for OTHER lines passing this stop (e.g. 55, 5, 58) so we know
-        //    each line's exact directionId & street-by-street polyline at THIS palina (never confuse directions!)
+        // 4. Load real route geometries AND on-demand MaTO live positions in parallel for OTHER lines
+        //    passing this stop so GPS crosshairs appear immediately on first open (without visiting each line first!)
         val dedupedPre = deduplicateArrivals(preReconciled)
         val otherLineCodes = dedupedPre
-            .map { it.lineCode.trim().uppercase() }
-            .filter { it.isNotEmpty() && !it.equals(normPref, ignoreCase = true) }
-            .distinct()
-            .take(6)
-        val otherLinePatterns: Map<String, List<RoutePattern>> = if (otherLineCodes.isNotEmpty()) {
-            coroutineScope {
-                otherLineCodes.map { code ->
-                    async {
-                        val lineTrips = allLivePool
-                            .asSequence()
-                            .filter { it.lineCode.equals(code, ignoreCase = true) }
-                            .mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }
-                            .toSet()
-                        code to getFastRoutePatternsForLine(code, lineTrips)
-                    }
-                }.map { it.await() }.filter { it.second.isNotEmpty() }.toMap()
+            .groupBy { it.lineCode.trim().uppercase() }
+            .entries
+            .filter { (code, _) -> code.isNotEmpty() && !code.equals(normPref, ignoreCase = true) }
+            .sortedWith(
+                compareByDescending<Map.Entry<String, List<StopArrival>>> { (_, list) ->
+                    list.any { it.isRealtime }
+                }.thenBy { (_, list) ->
+                    list.minOfOrNull { it.arrivalEpochSeconds } ?: Long.MAX_VALUE
+                },
+            )
+            .map { it.key }
+            .take(10)
+
+        val liveCountByLine = allLivePool.groupingBy { it.lineCode.trim().uppercase() }.eachCount()
+        val linesNeedingMatoLive = buildList {
+            for (code in otherLineCodes) {
+                val lineArrs = dedupedPre.filter { it.lineCode.equals(code, ignoreCase = true) }
+                val rtArrs = lineArrs.filter { it.isRealtime }
+                if (rtArrs.isEmpty()) continue
+                val hasUnlinkedRt = rtArrs.any { arr ->
+                    val vid = GtfsRtProtobufParser.canonicalFleetId(arr.vehicleId).ifBlank { null }
+                    vid == null || vid !in vehicleByCanonId
+                }
+                val poolCount = liveCountByLine[code] ?: 0
+                if (hasUnlinkedRt || poolCount < rtArrs.size) {
+                    add(code)
+                }
+            }
+            if (normPref.isNotEmpty()) {
+                val prefRt = dedupedPre.filter {
+                    it.lineCode.equals(normPref, ignoreCase = true) && it.isRealtime
+                }
+                val prefUnlinked = prefRt.any { arr ->
+                    val vid = GtfsRtProtobufParser.canonicalFleetId(arr.vehicleId).ifBlank { null }
+                    vid == null || vid !in vehicleByCanonId
+                }
+                val prefPoolCount = liveCountByLine[normPref] ?: 0
+                if (prefRt.isNotEmpty() && (prefUnlinked || prefPoolCount < prefRt.size)) {
+                    add(normPref)
+                }
+            }
+        }.distinct().take(8)
+
+        val (otherLinePatterns, extraSingleLineVehicles) = coroutineScope {
+            val patternsDeferred = otherLineCodes.map { code ->
+                async {
+                    val lineTrips = allLivePool
+                        .asSequence()
+                        .filter { it.lineCode.equals(code, ignoreCase = true) }
+                        .mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }
+                        .toSet()
+                    code to getFastRoutePatternsForLine(code, lineTrips)
+                }
+            }
+            val matoLinesDeferred = linesNeedingMatoLive.map { code ->
+                async {
+                    fetchLiveVehiclesForSingleLine(code)
+                }
+            }
+            val patternsMap = patternsDeferred
+                .map { it.await() }
+                .filter { it.second.isNotEmpty() }
+                .toMap()
+            val extraVehicles = matoLinesDeferred
+                .flatMap { it.await() }
+            patternsMap to extraVehicles
+        }
+
+        val enrichedAllLivePool = if (extraSingleLineVehicles.isNotEmpty()) {
+            mergeMultiSourceVehicles(
+                matoVehicles = extraSingleLineVehicles,
+                gttVehicles = allLivePool,
+                busOneVehicles = emptyList(),
+                nowMillis = nowMillis,
+            )
+        } else {
+            allLivePool
+        }
+
+        val enrichedPrefVehicles = if (extraSingleLineVehicles.isNotEmpty() && normPref.isNotEmpty()) {
+            val extraPref = extraSingleLineVehicles.filter {
+                it.lineCode.equals(normPref, ignoreCase = true) ||
+                    it.rawRouteId.equals(normPref, ignoreCase = true)
+            }
+            if (extraPref.isNotEmpty()) {
+                mergeMultiSourceVehicles(
+                    matoVehicles = extraPref,
+                    gttVehicles = liveVehicles,
+                    busOneVehicles = emptyList(),
+                    nowMillis = nowMillis,
+                )
+            } else {
+                liveVehicles
             }
         } else {
+            liveVehicles
+        }
+
+        // Re-link any unlinked arrivals whose tripId now matches one of the freshly fetched MaTO vehicles
+        val enrichedByTrip = if (extraSingleLineVehicles.isNotEmpty()) {
+            enrichedAllLivePool.mapNotNull { v ->
+                GtfsRtProtobufParser.normalizeTripId(v.tripId)?.let { it to v }
+            }.toMap()
+        } else {
             emptyMap()
+        }
+        val finalPreArrivals = if (enrichedByTrip.isNotEmpty()) {
+            dedupedPre.map { arr ->
+                if (!arr.vehicleId.isNullOrBlank()) {
+                    arr
+                } else {
+                    val cleanTrip = GtfsRtProtobufParser.normalizeTripId(arr.tripId)
+                    val matchedVeh = cleanTrip?.let { enrichedByTrip[it] }
+                    if (matchedVeh != null && matchedVeh.lineCode.equals(arr.lineCode, ignoreCase = true)) {
+                        arr.copy(vehicleId = matchedVeh.vehicleId)
+                    } else {
+                        arr
+                    }
+                }
+            }
+        } else {
+            dedupedPre
         }
 
         // 5. Physics-consistent reconciliation with live GPS positions & exact route polylines (preferred + other lines):
@@ -1857,10 +2002,10 @@ class GttRealtimeRepository private constructor(context: Context) {
         val reconciled = reconcileLiveVehiclesWithArrivals(
             stop = stop,
             preferredLine = normPref,
-            liveVehicles = liveVehicles,
-            allLivePool = allLivePool,
+            liveVehicles = enrichedPrefVehicles,
+            allLivePool = enrichedAllLivePool,
             routePatterns = activePatterns,
-            rawArrivals = dedupedPre,
+            rawArrivals = finalPreArrivals,
             nowMillis = nowMillis,
             otherLinePatterns = otherLinePatterns,
         )
@@ -2749,6 +2894,8 @@ class GttRealtimeRepository private constructor(context: Context) {
         private const val MAX_VEHICLE_ZOMBIE_AGE_SECONDS = 360L
         private const val MATO_PRECEDENCE_WINDOW_SECONDS = 25L
         internal const val OVERLAY_HTTP_CACHE_TTL_MS = 120_000L
+        private const val SINGLE_LINE_LIVE_CACHE_TTL_MS = 25_000L
+        private const val SINGLE_LINE_EMPTY_CACHE_TTL_MS = 10_000L
         private val SAFE_ROUTE_KEY_REGEX = Regex("[^A-Z0-9_]")
         private val OVERPASS_SAFE_REF_REGEX = Regex("[^A-Za-z0-9/\\- ]")
 
@@ -3427,6 +3574,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                         stop = stopOnTargetLine,
                         routePatterns = targetLinePatterns,
                         nowMillis = nowMillis,
+                        allowTrafficPaused = true,
                     )
                     if (approach != null && approach.alreadyPassed) return false
                 }
@@ -3483,6 +3631,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                     stop = stopOnTargetLine,
                     routePatterns = targetLinePatterns,
                     nowMillis = nowMillis,
+                    allowTrafficPaused = true,
                 ) ?: return@mapNotNull null
                 if (approach.alreadyPassed) return@mapNotNull null
                 val etaDiff = abs(approach.estimatedEtaSeconds - targetEtaSec)
@@ -3534,11 +3683,17 @@ class GttRealtimeRepository private constructor(context: Context) {
             val terminusFloorSec: Long? = stopAlongMeters?.let { along ->
                 if (along < 250.0) 90L else (along / 5.8).toLong().coerceIn(180L, 1_200L)
             }
+            val prefOriginPoint = dirPattern?.stops?.firstOrNull()?.let { GeoPoint(it.lat, it.lon) }
+                ?: dirPattern?.points?.firstOrNull()
 
-            val prefLineVehicles = liveVehicles.filter {
-                it.lineCode.equals(normPref, ignoreCase = true) ||
-                    it.rawRouteId.equals(normPref, ignoreCase = true)
-            }
+            val prefLineVehicles = com.example.data.model.GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                vehicles = liveVehicles.filter {
+                    it.lineCode.equals(normPref, ignoreCase = true) ||
+                        it.rawRouteId.equals(normPref, ignoreCase = true)
+                },
+                routePatterns = routePatterns,
+                nowMillis = nowMillis,
+            )
             val approachByVehicleId = LinkedHashMap<String, com.example.data.model.GttFleetAnalyzer.BusStopApproach>()
             for (bus in prefLineVehicles) {
                 val approach = com.example.data.model.GttFleetAnalyzer.estimateBusApproachToStop(
@@ -3546,6 +3701,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                     stop = stop,
                     routePatterns = routePatterns,
                     nowMillis = nowMillis,
+                    allowTrafficPaused = true,
                 ) ?: continue
                 val canonVid = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
                 approachByVehicleId[canonVid] = approach
@@ -3553,6 +3709,8 @@ class GttRealtimeRepository private constructor(context: Context) {
             val approachingUpstream = approachByVehicleId.values
                 .filter { !it.alreadyPassed && it.remainingMeters <= 10_000.0 }
                 .sortedBy { it.remainingMeters }
+            val prefRecentlyPassed = approachByVehicleId.values
+                .filter { it.alreadyPassed && it.remainingMeters in -950.0..-75.0 }
 
             val allLiveById = allLivePool.associateBy {
                 GtfsRtProtobufParser.canonicalFleetId(it.vehicleId).ifBlank { it.vehicleId }
@@ -3574,8 +3732,11 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val stopDirectionId: Int,
                 val terminusName: String?,
                 val terminusFloorSec: Long?,
+                val originPoint: GeoPoint?,
+                val activeBuses: List<BusVehicle>,
                 val approachByVehId: Map<String, com.example.data.model.GttFleetAnalyzer.BusStopApproach>,
                 val approachingUpstream: List<com.example.data.model.GttFleetAnalyzer.BusStopApproach>,
+                val recentlyPassedDownstream: List<com.example.data.model.GttFleetAnalyzer.BusStopApproach>,
             )
             val otherLineContexts = HashMap<String, OtherLineContext>()
             for ((rawKey, patterns) in otherLinePatterns) {
@@ -3600,7 +3761,13 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val otherFloor = otherAlong?.let { along ->
                     if (along < 250.0) 90L else (along / 5.8).toLong().coerceIn(180L, 1_200L)
                 }
-                val otherBuses = reliableLiveByLine[lineKey].orEmpty()
+                val otherOriginPoint = otherDirPat?.stops?.firstOrNull()?.let { GeoPoint(it.lat, it.lon) }
+                    ?: otherDirPat?.points?.firstOrNull()
+                val otherBuses = com.example.data.model.GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                    vehicles = reliableLiveByLine[lineKey].orEmpty(),
+                    routePatterns = patterns,
+                    nowMillis = nowMillis,
+                )
                 val appMap = LinkedHashMap<String, com.example.data.model.GttFleetAnalyzer.BusStopApproach>()
                 for (bus in otherBuses) {
                     val app = com.example.data.model.GttFleetAnalyzer.estimateBusApproachToStop(
@@ -3608,6 +3775,7 @@ class GttRealtimeRepository private constructor(context: Context) {
                         stop = stopForOther,
                         routePatterns = patterns,
                         nowMillis = nowMillis,
+                        allowTrafficPaused = true,
                     ) ?: continue
                     val canonBusId = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
                     appMap[canonBusId] = app
@@ -3615,20 +3783,33 @@ class GttRealtimeRepository private constructor(context: Context) {
                 val upstream = appMap.values
                     .filter { !it.alreadyPassed && it.remainingMeters <= 10_000.0 }
                     .sortedBy { it.remainingMeters }
+                val recentlyPassed = appMap.values
+                    .filter { it.alreadyPassed && it.remainingMeters in -950.0..-75.0 }
                 otherLineContexts[lineKey] = OtherLineContext(
                     patterns = patterns,
                     stopDirectionId = otherDir,
                     terminusName = otherDirPat?.terminusName(),
                     terminusFloorSec = otherFloor,
+                    originPoint = otherOriginPoint,
+                    activeBuses = otherBuses,
                     approachByVehId = appMap,
                     approachingUpstream = upstream,
+                    recentlyPassedDownstream = recentlyPassed,
                 )
             }
+
+            // Process already-linked arrivals first, then unlinked realtime arrivals, then scheduled slots
+            // so a verified vehicleId is never stolen by an earlier unlinked prediction.
+            val orderedRawArrivals = rawArrivals.sortedWith(
+                compareByDescending<StopArrival> { !it.vehicleId.isNullOrBlank() }
+                    .thenByDescending { it.isRealtime }
+                    .thenBy { it.arrivalEpochSeconds },
+            )
 
             val coveredVehicleIds = HashSet<String>()
             val out = mutableListOf<StopArrival>()
 
-            for (arr in rawArrivals) {
+            for (arr in orderedRawArrivals) {
                 val lineKey = arr.lineCode.trim().uppercase()
                 val isPref = lineKey.equals(normPref, ignoreCase = true)
                 val vid = GtfsRtProtobufParser.canonicalFleetId(arr.vehicleId).ifBlank { null }
@@ -3772,12 +3953,16 @@ class GttRealtimeRepository private constructor(context: Context) {
                     } else if (arr.isRealtime && otherCtx != null && otherCtx.approachingUpstream.isNotEmpty()) {
                         // Link unlinked realtime arrival on another line (e.g. GTT Palina Line 55) ONLY to an
                         // upstream bus on Line 55's EXACT direction whose polyline ETA matches!
-                        val maxGap = maxOf(210L, (feedEtaSec.coerceAtLeast(0L) * 0.45).toLong())
+                        val maxGap = maxOf(240L, (feedEtaSec.coerceAtLeast(0L) * 0.50).toLong())
                         val bestMatch = otherCtx.approachingUpstream
-                            .filter { it.bus.vehicleId !in coveredVehicleIds }
+                            .filter {
+                                val cid = GtfsRtProtobufParser.canonicalFleetId(it.bus.vehicleId).ifBlank { it.bus.vehicleId }
+                                cid !in coveredVehicleIds
+                            }
                             .minByOrNull { abs(it.estimatedEtaSeconds - feedEtaSec) }
                         if (bestMatch != null && abs(bestMatch.estimatedEtaSeconds - feedEtaSec) <= maxGap) {
-                            coveredVehicleIds.add(bestMatch.bus.vehicleId)
+                            val cid = GtfsRtProtobufParser.canonicalFleetId(bestMatch.bus.vehicleId).ifBlank { bestMatch.bus.vehicleId }
+                            coveredVehicleIds.add(cid)
                             out.add(
                                 arr.copy(
                                     vehicleId = bestMatch.bus.vehicleId,
@@ -3792,12 +3977,16 @@ class GttRealtimeRepository private constructor(context: Context) {
                 // For unlinked preferredLine "Live" arrivals, link to the closest ETA match among uncovered upstream buses
                 if (isPref && vid == null && arr.isRealtime && approachingUpstream.isNotEmpty()) {
                     val bestMatch = approachingUpstream
-                        .filter { it.bus.vehicleId !in coveredVehicleIds }
+                        .filter {
+                            val cid = GtfsRtProtobufParser.canonicalFleetId(it.bus.vehicleId).ifBlank { it.bus.vehicleId }
+                            cid !in coveredVehicleIds
+                        }
                         .minByOrNull { abs(it.estimatedEtaSeconds - feedEtaSec) }
                     if (bestMatch != null) {
                         val maxGap = maxOf(300L, (bestMatch.estimatedEtaSeconds * 0.65).toLong())
                         if (abs(bestMatch.estimatedEtaSeconds - feedEtaSec) <= maxGap) {
-                            coveredVehicleIds.add(bestMatch.bus.vehicleId)
+                            val cid = GtfsRtProtobufParser.canonicalFleetId(bestMatch.bus.vehicleId).ifBlank { bestMatch.bus.vehicleId }
+                            coveredVehicleIds.add(cid)
                             out.add(arr.copy(vehicleId = bestMatch.bus.vehicleId))
                             continue
                         }
@@ -3808,9 +3997,10 @@ class GttRealtimeRepository private constructor(context: Context) {
             }
 
             // Always ensure EVERY approaching reliable live bus on preferredLine is represented,
-            // absorbing any nearby scheduled slot (up to 8 min late or 3 min early) instead of duplicating it!
+            // absorbing any nearby scheduled slot (up to 9 min late or 4 min early) instead of duplicating it!
             for (approach in approachingUpstream) {
-                if (approach.bus.vehicleId in coveredVehicleIds) continue
+                val cid = GtfsRtProtobufParser.canonicalFleetId(approach.bus.vehicleId).ifBlank { approach.bus.vehicleId }
+                if (cid in coveredVehicleIds) continue
                 val existingCloseIdx = out.withIndex()
                     .filter { (_, existing) ->
                         if (!existing.lineCode.equals(normPref, ignoreCase = true) || existing.vehicleId != null) {
@@ -3819,10 +4009,10 @@ class GttRealtimeRepository private constructor(context: Context) {
                         val existingEta = existing.arrivalEpochSeconds - nowSec
                         val delta = approach.estimatedEtaSeconds - existingEta
                         if (existing.isRealtime) {
-                            abs(delta) <= 240L
+                            abs(delta) <= 270L
                         } else {
-                            // A real bus running up to 8 min late (or 3 min early) replaces that scheduled slot
-                            delta in -180L..480L
+                            // A real bus running up to 9 min late (or 4 min early) replaces that scheduled slot
+                            delta in -240L..540L
                         }
                     }
                     .minByOrNull { (_, existing) ->
@@ -3844,8 +4034,8 @@ class GttRealtimeRepository private constructor(context: Context) {
                             ?: existing.headsign,
                         sourceLabel = if (shouldUpdateEta) "GPS Live" else existing.sourceLabel,
                     )
-                    coveredVehicleIds.add(approach.bus.vehicleId)
-                } else if (approach.remainingMeters <= 6_500.0) {
+                    coveredVehicleIds.add(cid)
+                } else if (!approach.isTrafficPaused && approach.remainingMeters <= 6_500.0) {
                     out.add(
                         StopArrival(
                             lineCode = normPref,
@@ -3858,35 +4048,206 @@ class GttRealtimeRepository private constructor(context: Context) {
                             sourceLabel = "GPS Live",
                         ),
                     )
-                    coveredVehicleIds.add(approach.bus.vehicleId)
+                    coveredVehicleIds.add(cid)
                 }
             }
 
-            // Final physical reality filter: drop impossible phantom arrivals when live GPS telemetry is active
+            // For OTHER lines with resolved route geometry, absorb any nearby unlinked scheduled slot
+            // corresponding to an uncovered upstream bus (prevents duplicate Stimato + Live and enables crosshair!)
+            for ((lineKey, otherCtx) in otherLineContexts) {
+                for (approach in otherCtx.approachingUpstream) {
+                    val cid = GtfsRtProtobufParser.canonicalFleetId(approach.bus.vehicleId).ifBlank { approach.bus.vehicleId }
+                    if (cid in coveredVehicleIds) continue
+                    val existingCloseIdx = out.withIndex()
+                        .filter { (_, existing) ->
+                            if (!existing.lineCode.equals(lineKey, ignoreCase = true) || existing.vehicleId != null) {
+                                return@filter false
+                            }
+                            val existingEta = existing.arrivalEpochSeconds - nowSec
+                            val delta = approach.estimatedEtaSeconds - existingEta
+                            if (existing.isRealtime) {
+                                abs(delta) <= 270L
+                            } else {
+                                delta in -240L..540L
+                            }
+                        }
+                        .minByOrNull { (_, existing) ->
+                            abs((existing.arrivalEpochSeconds - nowSec) - approach.estimatedEtaSeconds)
+                        }
+                        ?.index
+                    if (existingCloseIdx != null) {
+                        val existing = out[existingCloseIdx]
+                        val existingEta = existing.arrivalEpochSeconds - nowSec
+                        val shouldUpdateEta = !existing.isRealtime || abs(existingEta - approach.estimatedEtaSeconds) > 180L
+                        out[existingCloseIdx] = existing.copy(
+                            arrivalEpochSeconds = if (shouldUpdateEta) nowSec + approach.estimatedEtaSeconds else existing.arrivalEpochSeconds,
+                            isRealtime = true,
+                            vehicleId = approach.bus.vehicleId,
+                            tripId = existing.tripId ?: approach.bus.tripId,
+                            headsign = existing.headsign.takeUnless { it.startsWith("Linea ", true) }
+                                ?: otherCtx.terminusName
+                                ?: existing.headsign,
+                            sourceLabel = if (shouldUpdateEta) "GPS Live" else existing.sourceLabel,
+                        )
+                        coveredVehicleIds.add(cid)
+                    }
+                }
+            }
+
+            // Build verified-live arrival lookup & unclaimed fleet capacity per line for physical consistency filtering
+            val verifiedLiveByLine = out
+                .filter { it.isRealtime && !it.vehicleId.isNullOrBlank() }
+                .groupBy { it.lineCode.trim().uppercase() }
+
+            fun countOriginTerminusBuses(
+                lineBuses: List<BusVehicle>,
+                originPoint: GeoPoint?,
+            ): Int {
+                if (originPoint == null || lineBuses.isEmpty()) return 0
+                return lineBuses.count { bus ->
+                    val cid = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId }
+                    if (cid in coveredVehicleIds) return@count false
+                    com.example.data.model.GttFleetAnalyzer.haversineMeters(
+                        bus.latitude,
+                        bus.longitude,
+                        originPoint.lat,
+                        originPoint.lon,
+                    ) <= 320.0
+                }
+            }
+
+            fun hasSecondPhysicalBusForSlot(
+                unclaimedUpstream: List<com.example.data.model.GttFleetAnalyzer.BusStopApproach>,
+                originTerminusCount: Int,
+                floorSec: Long?,
+                slotEtaSec: Long,
+            ): Boolean {
+                val toleranceSec = maxOf(360L, (slotEtaSec.coerceAtLeast(0L) * 0.55).toLong())
+                if (unclaimedUpstream.any { abs(it.estimatedEtaSeconds - slotEtaSec) <= toleranceSec }) {
+                    return true
+                }
+                if (originTerminusCount > 0 && floorSec != null && slotEtaSec >= floorSec) {
+                    return true
+                }
+                return false
+            }
+
+            val prefUnclaimedUpstream = approachingUpstream.filter {
+                val cid = GtfsRtProtobufParser.canonicalFleetId(it.bus.vehicleId).ifBlank { it.bus.vehicleId }
+                cid !in coveredVehicleIds
+            }
+            val prefOriginTerminusCount = countOriginTerminusBuses(prefLineVehicles, prefOriginPoint)
+
+            // Final physical reality filter: drop impossible phantom arrivals & incompatible nearby duplicates
+            // when live GPS telemetry is active, while preserving real buses (including GPS-less GTT Palina Live runs).
             val hasPrefLiveTelemetry = prefLineVehicles.isNotEmpty() && terminusFloorSec != null
             return out.filter { arr ->
                 val vid = arr.vehicleId?.trim()?.takeIf { it.isNotEmpty() }
                 if (vid != null) return@filter true // Verified live vehicle!
-                if (arr.sourceLabel == "GTT Palina" && arr.isRealtime) return@filter true // Confirmed GTT AVM real-time!
 
                 val lineKey = arr.lineCode.trim().uppercase()
                 val isPref = lineKey.equals(normPref, ignoreCase = true)
                 val feedEtaSec = arr.arrivalEpochSeconds - nowSec
+                val verifiedSameLine = verifiedLiveByLine[lineKey].orEmpty()
+
+                val lineHasLiveAndGeo: Boolean
+                val lineFloorSec: Long?
+                val lineUnclaimedUpstream: List<com.example.data.model.GttFleetAnalyzer.BusStopApproach>
+                val lineRecentlyPassed: List<com.example.data.model.GttFleetAnalyzer.BusStopApproach>
+                val lineOriginCount: Int
+
+                if (isPref) {
+                    lineHasLiveAndGeo = hasPrefLiveTelemetry
+                    lineFloorSec = terminusFloorSec
+                    lineUnclaimedUpstream = prefUnclaimedUpstream
+                    lineRecentlyPassed = prefRecentlyPassed
+                    lineOriginCount = prefOriginTerminusCount
+                } else {
+                    val otherCtx = otherLineContexts[lineKey]
+                    lineFloorSec = otherCtx?.terminusFloorSec
+                    lineHasLiveAndGeo = otherCtx != null && otherCtx.activeBuses.isNotEmpty() && lineFloorSec != null
+                    lineUnclaimedUpstream = otherCtx?.approachingUpstream.orEmpty().filter {
+                        val cid = GtfsRtProtobufParser.canonicalFleetId(it.bus.vehicleId).ifBlank { it.bus.vehicleId }
+                        cid !in coveredVehicleIds
+                    }
+                    lineRecentlyPassed = otherCtx?.recentlyPassedDownstream.orEmpty()
+                    lineOriginCount = if (otherCtx != null) {
+                        countOriginTerminusBuses(otherCtx.activeBuses, otherCtx.originPoint)
+                    } else {
+                        0
+                    }
+                }
+
+                // GTT Palina AVM Live (unlinked): keep standalone real runs (e.g. silent GPS transponder),
+                // but reject clear duplicates near an already-tracked bus without a 2nd physical vehicle
+                // and imminent post-passage ghosts when a bus just passed the stop!
+                if (arr.sourceLabel == "GTT Palina" && arr.isRealtime) {
+                    if (lineHasLiveAndGeo) {
+                        val hasSecondBus = hasSecondPhysicalBusForSlot(
+                            unclaimedUpstream = lineUnclaimedUpstream,
+                            originTerminusCount = lineOriginCount,
+                            floorSec = lineFloorSec,
+                            slotEtaSec = feedEtaSec,
+                        )
+                        val isDuplicateNearTracked = verifiedSameLine.any { tracked ->
+                            abs(tracked.arrivalEpochSeconds - arr.arrivalEpochSeconds) <= 300L
+                        }
+                        if (isDuplicateNearTracked && !hasSecondBus) {
+                            return@filter false
+                        }
+                        val isPostPassageGhost = feedEtaSec <= 180L &&
+                            lineRecentlyPassed.isNotEmpty() &&
+                            lineUnclaimedUpstream.isEmpty() &&
+                            verifiedSameLine.none { abs(it.arrivalEpochSeconds - arr.arrivalEpochSeconds) <= 180L }
+                        if (isPostPassageGhost) {
+                            return@filter false
+                        }
+                    }
+                    return@filter true
+                }
 
                 if (isPref && hasPrefLiveTelemetry) {
                     if (arr.isRealtime && feedEtaSec <= 25L * 60L) return@filter false
-                    if (!arr.isRealtime && feedEtaSec < terminusFloorSec) return@filter false
+                    if (!arr.isRealtime) {
+                        if (feedEtaSec < terminusFloorSec) return@filter false
+                        val nearVerifiedLive = verifiedSameLine.any { tracked ->
+                            val diff = tracked.arrivalEpochSeconds - arr.arrivalEpochSeconds
+                            abs(diff) <= 360L || diff in -240L..540L
+                        }
+                        if (nearVerifiedLive && !hasSecondPhysicalBusForSlot(
+                                unclaimedUpstream = lineUnclaimedUpstream,
+                                originTerminusCount = lineOriginCount,
+                                floorSec = terminusFloorSec,
+                                slotEtaSec = feedEtaSec,
+                            )
+                        ) {
+                            return@filter false
+                        }
+                    }
                     return@filter true
                 }
 
                 if (!isPref) {
                     val otherBuses = reliableLiveByLine[lineKey].orEmpty()
-                    val otherCtx = otherLineContexts[lineKey]
-                    val otherFloor = otherCtx?.terminusFloorSec
-                    if (otherBuses.isNotEmpty() && otherFloor != null) {
+                    if (lineHasLiveAndGeo && lineFloorSec != null) {
                         // Exact polyline-based verification on Line 55/5/etc.
                         if (arr.isRealtime && feedEtaSec <= 25L * 60L) return@filter false
-                        if (!arr.isRealtime && feedEtaSec < otherFloor) return@filter false
+                        if (!arr.isRealtime) {
+                            if (feedEtaSec < lineFloorSec) return@filter false
+                            val nearVerifiedLive = verifiedSameLine.any { tracked ->
+                                val diff = tracked.arrivalEpochSeconds - arr.arrivalEpochSeconds
+                                abs(diff) <= 360L || diff in -240L..540L
+                            }
+                            if (nearVerifiedLive && !hasSecondPhysicalBusForSlot(
+                                    unclaimedUpstream = lineUnclaimedUpstream,
+                                    originTerminusCount = lineOriginCount,
+                                    floorSec = lineFloorSec,
+                                    slotEtaSec = feedEtaSec,
+                                )
+                            ) {
+                                return@filter false
+                            }
+                        }
                     } else if (otherBuses.isNotEmpty() && feedEtaSec <= 12L * 60L) {
                         val maxReachableMeters = maxOf(700.0, feedEtaSec * 7.2 + 500.0)
                         val anyReachable = otherBuses.any { bus ->

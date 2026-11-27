@@ -461,6 +461,7 @@ object GttFleetAnalyzer {
         val intermediateStops: Int,
         val estimatedEtaSeconds: Long,
         val alreadyPassed: Boolean,
+        val isTrafficPaused: Boolean = false,
     )
 
     /**
@@ -537,9 +538,19 @@ object GttFleetAnalyzer {
         stop: TransitStop,
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
+        allowTrafficPaused: Boolean = false,
     ): BusStopApproach? {
-        val health = assess(bus, routePatterns, nowMillis)
-        if (!health.isReliableLive) return null
+        val spatial = assessSpatial(bus, routePatterns)
+        val health = assessWithSpatial(bus, spatial, nowMillis)
+        if (health.isInDepot ||
+            health.isStaleGps ||
+            health.isOffRoute ||
+            isConfirmedMatoPhantomWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis)
+        ) {
+            return null
+        }
+        val isTrafficPaused = health.isStuck
+        if (isTrafficPaused && !allowTrafficPaused) return null
 
         val resolvedDir = resolveDirectionId(bus, routePatterns)
         if (resolvedDir != null && resolvedDir != stop.directionId) return null
@@ -588,6 +599,7 @@ object GttFleetAnalyzer {
                     intermediateStops = 0,
                     estimatedEtaSeconds = 0L,
                     alreadyPassed = true,
+                    isTrafficPaused = isTrafficPaused,
                 )
             }
 
@@ -617,6 +629,7 @@ object GttFleetAnalyzer {
                 intermediateStops = intermediateStops,
                 estimatedEtaSeconds = etaSec,
                 alreadyPassed = false,
+                isTrafficPaused = isTrafficPaused,
             )
         }
 
@@ -634,6 +647,7 @@ object GttFleetAnalyzer {
                     intermediateStops = 0,
                     estimatedEtaSeconds = 0L,
                     alreadyPassed = true,
+                    isTrafficPaused = isTrafficPaused,
                 )
             }
         } else if (resolvedDir == null && distMeters > 220.0) {
@@ -649,6 +663,7 @@ object GttFleetAnalyzer {
             intermediateStops = estStops,
             estimatedEtaSeconds = etaSec,
             alreadyPassed = false,
+            isTrafficPaused = isTrafficPaused,
         )
     }
 
