@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="app/src/main/res/drawable/tobus_icon_fg.png" alt="Logo ToBus" width="88" />
+<img src="docs/images/app_icon.png" alt="Logo ToBus" width="92" />
 
 # ToBus
 
