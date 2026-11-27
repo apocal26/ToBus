@@ -20,6 +20,7 @@ import com.example.data.model.CameraState
 import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.FavoriteStop
+import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LineSummary
 import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
@@ -703,15 +704,22 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 onSuccess = { snapshot ->
                     val currentSettings = _uiState.value.settings
                     val line = currentSettings.selectedLine.trim().uppercase()
+                    val evalNowMillis = System.currentTimeMillis()
+                    val currentPatterns = _uiState.value.routePatterns
                     val filtered = if (line.isEmpty()) {
                         emptyList()
                     } else {
-                        snapshot.allVehicles
+                        val rawLineVehicles = snapshot.allVehicles
                             .filter {
                                 it.lineCode.equals(line, ignoreCase = true) ||
                                     it.rawRouteId.equals(line, ignoreCase = true)
                             }
                             .sortedBy { it.vehicleId }
+                        GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                            vehicles = rawLineVehicles,
+                            routePatterns = currentPatterns,
+                            nowMillis = evalNowMillis,
+                        )
                     }
 
                     val effectiveAlerts = if (currentSettings.showServiceAlerts) snapshot.alerts else emptyList()
@@ -770,7 +778,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             isRefreshing = false,
                             lastUpdatedMillis = snapshot.fetchedAtMillis,
                             feedTimestampSeconds = snapshot.feedTimestampSeconds,
-                            nowMillis = System.currentTimeMillis(),
+                            nowMillis = evalNowMillis,
                             totalCityVehicles = snapshot.allVehicles.size,
                             errorMessage = null,
                         )
@@ -838,12 +846,19 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             val snapshot = repository.getLiveMatoOverlaySnapshot(currentSettings.dataSourceMode) ?: return@launch
             val line = currentSettings.selectedLine.trim().uppercase()
             if (line.isEmpty()) return@launch
-            val filtered = snapshot.allVehicles
+            val evalNowMillis = System.currentTimeMillis()
+            val currentPatterns = _uiState.value.routePatterns
+            val rawLineVehicles = snapshot.allVehicles
                 .filter {
                     it.lineCode.equals(line, ignoreCase = true) ||
                         it.rawRouteId.equals(line, ignoreCase = true)
                 }
                 .sortedBy { it.vehicleId }
+            val filtered = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                vehicles = rawLineVehicles,
+                routePatterns = currentPatterns,
+                nowMillis = evalNowMillis,
+            )
 
             if (snapshot.allVehicles.isNotEmpty()) {
                 consecutivePollFailures = 0
@@ -872,7 +887,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     isLoadingFeed = false,
                     lastUpdatedMillis = snapshot.fetchedAtMillis,
                     feedTimestampSeconds = snapshot.feedTimestampSeconds,
-                    nowMillis = System.currentTimeMillis(),
+                    nowMillis = evalNowMillis,
                     totalCityVehicles = snapshot.allVehicles.size,
                     errorMessage = if (snapshot.allVehicles.isNotEmpty()) null else state.errorMessage,
                 )
@@ -896,20 +911,28 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         hasVerifiedLiveRouteForLine = null
 
         val cachedSnapshot = repository.getLastCachedSnapshot()
-        val filtered = cachedSnapshot?.allVehicles
+        val previousState = _uiState.value
+        val isSameLoadedLine = previousState.settings.selectedLine.equals(cleaned, ignoreCase = true) &&
+            previousState.routePatterns.isNotEmpty()
+        val rawFiltered = cachedSnapshot?.allVehicles
             ?.filter {
                 it.lineCode.equals(cleaned, ignoreCase = true) ||
                     it.rawRouteId.equals(cleaned, ignoreCase = true)
             }
             ?.sortedBy { it.vehicleId }
             .orEmpty()
+        val filtered = if (isSameLoadedLine) {
+            GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                vehicles = rawFiltered,
+                routePatterns = previousState.routePatterns,
+                nowMillis = System.currentTimeMillis(),
+            )
+        } else {
+            rawFiltered
+        }
 
         val allAlerts = if (updated.showServiceAlerts) cachedSnapshot?.alerts.orEmpty() else emptyList()
         val lineAlerts = if (updated.showServiceAlerts) filterAlertsForLine(allAlerts, cleaned) else emptyList()
-
-        val previousState = _uiState.value
-        val isSameLoadedLine = previousState.settings.selectedLine.equals(cleaned, ignoreCase = true) &&
-            previousState.routePatterns.isNotEmpty()
 
         val nextCamera = if (filtered.isNotEmpty()) {
             hasAutoCenteredCurrentLine = true
@@ -1031,8 +1054,21 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                         null
                     }
                     _uiState.update { state ->
+                        val evalNow = System.currentTimeMillis()
+                        val cleanedVehicles = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+                            vehicles = state.lineVehicles,
+                            routePatterns = patterns,
+                            nowMillis = evalNow,
+                        )
+                        val keepSel = state.selectedVehicleId?.takeIf { selId ->
+                            cleanedVehicles.any { it.vehicleId == selId } ||
+                                state.focusedExternalVehicle?.vehicleId == selId
+                        }
                         state.copy(
                             routePatterns = patterns,
+                            lineVehicles = cleanedVehicles,
+                            selectedVehicleId = keepSel,
+                            nowMillis = evalNow,
                             isLoadingInitialRoute = false,
                             cameraFlyRequest = refitFly ?: state.cameraFlyRequest,
                         )

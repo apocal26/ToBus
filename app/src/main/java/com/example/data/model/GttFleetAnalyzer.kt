@@ -43,10 +43,8 @@ data class VehicleHealthAssessment(
             }
             isOffRoute ->
                 "Vettura fuori percorso — probabile rientro in deposito o deviazione."
-            isStuck && stationarySeconds != null -> {
-                val mins = (stationarySeconds / 60L).coerceAtLeast(1L)
-                "Mezzo fermo lungo il percorso da $mins min — possibile traffico o rallentamento."
-            }
+            isStuck ->
+                "Questo pullman potrebbe non essere aggiornato"
             else -> null
         }
     }
@@ -81,9 +79,11 @@ data class VehicleSpatialStatus(
 object GttFleetAnalyzer {
 
     private const val STALE_GPS_SECONDS = 150L
-    private const val STUCK_STATIONARY_SECONDS = 240L
+    private const val STUCK_STATIONARY_SECONDS = 120L
+    private const val MATO_PHANTOM_STATIONARY_SECONDS = 240L
     private const val OFF_ROUTE_METERS = 500.0
     private const val TERMINUS_NEAR_METERS = 125.0
+    private const val TERMINUS_PHANTOM_GUARD_METERS = 160.0
     private const val TERMINUS_BAY_METERS = 65.0
     private const val TERMINUS_STATIONARY_SECONDS = 20L
 
@@ -196,6 +196,67 @@ object GttFleetAnalyzer {
         nowMillis: Long,
     ): VehicleHealthAssessment {
         return assessWithSpatial(bus, assessSpatial(bus, routePatterns), nowMillis)
+    }
+
+    fun isMatoOnlySource(bus: BusVehicle): Boolean {
+        val sources = bus.contributingSources
+        return if (sources.isNotEmpty()) {
+            sources.all { it.equals("MaTO Live", ignoreCase = true) }
+        } else {
+            bus.sourceName.equals("MaTO Live", ignoreCase = true)
+        }
+    }
+
+    /**
+     * Returns true ONLY when a vehicle is exclusively tracked by MaTO Live, has been stationary
+     * at the exact same coordinates for >= 4 minutes (240s), and is confirmed NOT at/near a terminus
+     * (with loaded [routePatterns]) and NOT in a GTT depot. Multi-source vehicles and terminus layovers
+     * are never flagged.
+     */
+    fun isConfirmedMatoPhantomWithSpatial(
+        bus: BusVehicle,
+        spatial: VehicleSpatialStatus,
+        hasKnownRoutePatterns: Boolean,
+        nowMillis: Long,
+    ): Boolean {
+        if (!hasKnownRoutePatterns) return false
+        if (!isMatoOnlySource(bus)) return false
+        if (spatial.depotName != null ||
+            spatial.isNearTerminus ||
+            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
+        ) {
+            return false
+        }
+        if (bus.speedKmh != null && bus.speedKmh >= 5f) return false
+        val since = bus.stationarySinceMillis ?: return false
+        val statSec = ((nowMillis - since) / 1000L).coerceAtLeast(0L)
+        return statSec >= MATO_PHANTOM_STATIONARY_SECONDS
+    }
+
+    fun isConfirmedMatoPhantom(
+        bus: BusVehicle,
+        routePatterns: List<RoutePattern>,
+        nowMillis: Long,
+    ): Boolean {
+        if (routePatterns.isEmpty()) return false
+        val spatial = assessSpatial(bus, routePatterns)
+        return isConfirmedMatoPhantomWithSpatial(
+            bus = bus,
+            spatial = spatial,
+            hasKnownRoutePatterns = true,
+            nowMillis = nowMillis,
+        )
+    }
+
+    fun filterOutConfirmedMatoPhantoms(
+        vehicles: List<BusVehicle>,
+        routePatterns: List<RoutePattern>,
+        nowMillis: Long,
+    ): List<BusVehicle> {
+        if (routePatterns.isEmpty() || vehicles.isEmpty()) return vehicles
+        return vehicles.filterNot { bus ->
+            isConfirmedMatoPhantom(bus, routePatterns, nowMillis)
+        }
     }
 
     fun findDepot(lat: Double, lon: Double): GttDepot? {

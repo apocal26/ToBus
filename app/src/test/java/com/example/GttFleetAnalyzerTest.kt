@@ -351,5 +351,92 @@ class GttFleetAnalyzerTest {
         )
         assertNull(GttFleetAnalyzer.findCurrentStop(busMidRoute, listOf(pattern), resolvedDirectionId = 1))
     }
+
+    @Test
+    fun attenuatesStationaryBusAt2MinutesAndDropsMatoOnlyPhantomAt4MinutesPreservingTerminusAndMultiSource() {
+        val now = 1_700_000_000_000L
+        val nowSec = now / 1000L
+        val terminusStart = TransitStop(
+            stopId = "10",
+            stopCode = "10",
+            name = "CAP. ALLAMANO",
+            lat = 45.0330,
+            lon = 7.6190,
+            directionId = 0,
+            sequence = 0,
+        )
+        val terminusEnd = TransitStop(
+            stopId = "90",
+            stopCode = "90",
+            name = "PORTA NUOVA",
+            lat = 45.0620,
+            lon = 7.6760,
+            directionId = 0,
+            sequence = 10,
+        )
+        val pattern = RoutePattern(
+            id = "12_0",
+            name = "PORTA NUOVA",
+            directionId = 0,
+            segments = listOf(
+                listOf(
+                    GeoPoint(45.0330, 7.6190),
+                    GeoPoint(45.0480, 7.6480),
+                    GeoPoint(45.0620, 7.6760),
+                ),
+            ),
+            stops = listOf(terminusStart, terminusEnd),
+        )
+        val patterns = listOf(pattern)
+
+        // 1. Mid-route MaTO-only bus stationary for 2m10s -> ATTENUATED (isStuck = true), NOT deleted yet
+        val mato2Min = sampleBus("9050", 45.0480, 7.6480, nowSec - 5L, stationarySinceMillis = now - 130_000L).copy(
+            sourceName = "MaTO Live",
+            contributingSources = setOf("MaTO Live"),
+            speedKmh = 0f,
+        )
+        val h2Min = GttFleetAnalyzer.assess(mato2Min, patterns, now)
+        assertTrue(h2Min.isStuck)
+        assertEquals("Questo pullman potrebbe non essere aggiornato", h2Min.warningMessage())
+        assertFalse(GttFleetAnalyzer.isConfirmedMatoPhantom(mato2Min, patterns, now))
+
+        // 2. Mid-route MaTO-only bus stationary for 4m15s -> CONFIRMED PHANTOM -> filtered out
+        val mato4MinPhantom = mato2Min.copy(
+            vehicleId = "9051",
+            label = "9051",
+            stationarySinceMillis = now - 255_000L,
+        )
+        assertTrue(GttFleetAnalyzer.isConfirmedMatoPhantom(mato4MinPhantom, patterns, now))
+
+        // 3. Same MaTO-only bus stationary for 5 minutes AT TERMINUS -> NEVER flagged stuck, NEVER deleted
+        val matoTerminus = sampleBus("9052", 45.0621, 7.6761, nowSec - 5L, stationarySinceMillis = now - 300_000L).copy(
+            sourceName = "MaTO Live",
+            contributingSources = setOf("MaTO Live"),
+            speedKmh = 0f,
+        )
+        val hTerminus = GttFleetAnalyzer.assess(matoTerminus, patterns, now)
+        assertFalse(hTerminus.isStuck)
+        assertTrue(hTerminus.isAtTerminus)
+        assertFalse(GttFleetAnalyzer.isConfirmedMatoPhantom(matoTerminus, patterns, now))
+
+        // 4. Multi-source bus stationary for 4m15s -> NEVER deleted by MaTO-only phantom filter
+        val multiSourceBus = mato4MinPhantom.copy(
+            vehicleId = "9053",
+            label = "9053",
+            sourceName = "MaTO Live",
+            contributingSources = setOf("MaTO Live", "GTT Ufficiale"),
+        )
+        assertFalse(GttFleetAnalyzer.isConfirmedMatoPhantom(multiSourceBus, patterns, now))
+
+        // 5. Safety: if routePatterns is empty, never assume terminus vs mid-route -> keep vehicle
+        assertFalse(GttFleetAnalyzer.isConfirmedMatoPhantom(mato4MinPhantom, emptyList(), now))
+
+        val surviving = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
+            vehicles = listOf(mato2Min, mato4MinPhantom, matoTerminus, multiSourceBus),
+            routePatterns = patterns,
+            nowMillis = now,
+        )
+        assertEquals(listOf("9050", "9052", "9053"), surviving.map { it.vehicleId })
+    }
 }
 

@@ -1614,6 +1614,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                 PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_MAP),
                 PropertyFactory.iconAllowOverlap(true),
                 PropertyFactory.iconIgnorePlacement(true),
+                PropertyFactory.iconOpacity(Expression.toNumber(Expression.get("opacity"))),
                 PropertyFactory.symbolSortKey(Expression.toNumber(Expression.get("sortKey"))),
                 PropertyFactory.iconSize(
                     Expression.interpolate(
@@ -1642,6 +1643,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                         if (isDarkBasemap) "rgba(8, 11, 16, 0.90)" else "rgba(255, 255, 255, 0.92)",
                     ),
                     PropertyFactory.textHaloWidth(1.8f),
+                    PropertyFactory.textOpacity(Expression.toNumber(Expression.get("opacity"))),
                     PropertyFactory.textAllowOverlap(false),
                 ),
         )
@@ -1822,15 +1824,16 @@ internal fun buildBusesFeatureCollection(
         val isSelected = bus.vehicleId == selectedVehicleId
         val health = busHealthById[bus.vehicleId]
         val isDepotOrOffRoute = health != null && (health.isInDepot || health.isOffRoute)
-        val isStaleOrStuck = health != null && !isDepotOrOffRoute && (health.isStaleGps || health.isStuck)
-        val isAtTerminus = health != null && !isDepotOrOffRoute && !isStaleOrStuck && health.isAtTerminus
+        val isStaleGps = health != null && !isDepotOrOffRoute && health.isStaleGps
+        val isStuck = health != null && !isDepotOrOffRoute && !isStaleGps && health.isStuck
+        val isAtTerminus = health != null && !isDepotOrOffRoute && !isStaleGps && !isStuck && health.isAtTerminus
         val resolvedDir = resolvedDirectionById[bus.vehicleId] ?: bus.directionId
         val isCyan = colorByDirection && resolvedDir == 1
-        val isMovingArrow = bearing != null && !isDepotOrOffRoute && !isStaleOrStuck && !isAtTerminus
+        val isMovingArrow = bearing != null && !isDepotOrOffRoute && !isStaleGps && !isStuck && !isAtTerminus
 
         val iconId = when {
             isDepotOrOffRoute -> if (isSelected) MapLibreTransitIds.ICON_DEPOT_SEL else MapLibreTransitIds.ICON_DEPOT
-            isStaleOrStuck -> if (isSelected) MapLibreTransitIds.ICON_STALE_SEL else MapLibreTransitIds.ICON_STALE
+            isStaleGps -> if (isSelected) MapLibreTransitIds.ICON_STALE_SEL else MapLibreTransitIds.ICON_STALE
             isAtTerminus -> when {
                 isCyan && isSelected -> MapLibreTransitIds.ICON_TERMINUS_CYAN_SEL
                 isCyan -> MapLibreTransitIds.ICON_TERMINUS_CYAN
@@ -1851,11 +1854,19 @@ internal fun buildBusesFeatureCollection(
             }
         }
 
+        val markerOpacity = when {
+            isSelected && (isStuck || isStaleGps || isDepotOrOffRoute) -> 0.90
+            isSelected -> 1.0
+            isStuck -> 0.45
+            isStaleGps || isDepotOrOffRoute -> 0.62
+            else -> 1.0
+        }
+
         val displayId = bus.label.ifBlank { bus.vehicleId }
         val label = if (showVehicleLabels) "#$displayId" else ""
         val sortKey = when {
             isSelected -> 100
-            isDepotOrOffRoute || isStaleOrStuck -> 1
+            isDepotOrOffRoute || isStaleGps || isStuck -> 1
             isAtTerminus -> 6
             else -> 10
         }
@@ -1867,6 +1878,7 @@ internal fun buildBusesFeatureCollection(
         feature.addNumberProperty("bearing", if (isMovingArrow) (bearing ?: 0f).toDouble() else 0.0)
         feature.addStringProperty("label", label)
         feature.addNumberProperty("sortKey", sortKey)
+        feature.addNumberProperty("opacity", markerOpacity)
         feature.addBooleanProperty("isSelected", isSelected)
         feature
     }

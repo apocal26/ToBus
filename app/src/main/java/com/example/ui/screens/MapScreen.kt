@@ -507,8 +507,10 @@ fun MapScreen(
                                         "+$depotCount in deposito · Cambia linea"
                                     offRouteCount > 0 && activeReliableCount > 0 ->
                                         "+$offRouteCount fuori percorso · Cambia linea"
-                                    staleOrStuckCount > 0 ->
-                                        "$staleOrStuckCount con GPS fermo · Cambia linea"
+                                    staleOrStuckCount == 1 ->
+                                        "1 non aggiornato · Cambia linea"
+                                    staleOrStuckCount > 1 ->
+                                        "$staleOrStuckCount non aggiornati · Cambia linea"
                                     uiState.onlineSourcesCount > 0 ->
                                         "${uiState.onlineSourcesCount} fonti attive · Linee e fermate"
                                     else -> "Linee e fermate GTT"
@@ -1336,7 +1338,7 @@ private fun ActiveBusDirectionGlassPill(
         health.isInDepot -> Color(0xFFF59E0B)
         health.isOffRoute -> Color(0xFFF59E0B)
         health.isStaleGps -> AccentRed
-        health.isStuck -> AccentRed
+        health.isStuck -> AccentGold
         health.isAtTerminus -> directionAccent ?: AccentCyan
         freshness == VehicleFreshness.LIVE -> AccentEmerald
         freshness == VehicleFreshness.SLOW -> AccentGold
@@ -1430,6 +1432,7 @@ private fun ActiveBusDirectionGlassPill(
 
     Box(
         modifier = modifier
+            .graphicsLayer { alpha = if (isDimmed && !isSelected) 0.68f else 1f }
             .glassInteractive(interaction, onClick = onClick)
             .background(smokedBaseBrush, pillShape)
             .background(glassTintBrush, pillShape)
@@ -1990,7 +1993,7 @@ private fun SelectedBusInspectorCard(
 ) {
     val freshness = bus.freshness(nowMillis)
     val freshnessColor = when {
-        health.isInDepot || health.isOffRoute -> AccentGold
+        health.isInDepot || health.isOffRoute || health.isStuck -> AccentGold
         health.isStaleGps -> AccentRed
         freshness == VehicleFreshness.LIVE -> AccentEmerald
         freshness == VehicleFreshness.SLOW -> AccentGold
@@ -2149,7 +2152,7 @@ private fun SelectedBusInspectorCard(
 
             // Smart Depot / Stale / Stuck / Off-Route Alert Strip OR calm Capolinea info strip
             if (warningText != null) {
-                val warnColor = if (health.isStaleGps || health.isStuck) AccentRed else AccentGold
+                val warnColor = if (health.isStaleGps) AccentRed else AccentGold
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2204,11 +2207,12 @@ private fun SelectedBusInspectorCard(
                 health.isInDepot -> "Deposito"
                 health.isOffRoute -> "Fuori linea"
                 health.isAtTerminus -> "Capolinea"
+                health.isStuck -> "Non aggiornato"
                 freshness == VehicleFreshness.LIVE -> "Live"
                 freshness == VehicleFreshness.SLOW -> "Segnale lento"
                 else -> "Segnale fermo"
             }
-            val shouldPulse = !health.isInDepot && !health.isOffRoute && freshness == VehicleFreshness.LIVE
+            val shouldPulse = !health.isInDepot && !health.isOffRoute && !health.isStuck && freshness == VehicleFreshness.LIVE
             val pulseAlpha: Float
             val pulseScale: Float
             if (shouldPulse) {

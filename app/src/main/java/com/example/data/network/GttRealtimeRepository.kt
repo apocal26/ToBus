@@ -3413,7 +3413,12 @@ class GttRealtimeRepository private constructor(context: Context) {
 
             fun isValidMatchedBus(bus: BusVehicle): Boolean {
                 val health = com.example.data.model.GttFleetAnalyzer.assess(bus, targetLinePatterns, nowMillis)
-                if (health.isInDepot || health.isStaleGps) return false
+                if (health.isInDepot ||
+                    health.isStaleGps ||
+                    com.example.data.model.GttFleetAnalyzer.isConfirmedMatoPhantom(bus, targetLinePatterns, nowMillis)
+                ) {
+                    return false
+                }
                 if (stopOnTargetLine != null && targetLinePatterns.isNotEmpty()) {
                     val busDir = com.example.data.model.GttFleetAnalyzer.resolveDirectionId(bus, targetLinePatterns)
                     if (busDir != null && busDir != stopOnTargetLine.directionId) return false
@@ -3466,6 +3471,13 @@ class GttRealtimeRepository private constructor(context: Context) {
                     return@mapNotNull null
                 }
                 if (bus.vehicleId in claimedVehicleIds) return@mapNotNull null
+                val candidateHealth = com.example.data.model.GttFleetAnalyzer.assess(bus, targetLinePatterns, nowMillis)
+                if (candidateHealth.isInDepot ||
+                    candidateHealth.isStaleGps ||
+                    com.example.data.model.GttFleetAnalyzer.isConfirmedMatoPhantom(bus, targetLinePatterns, nowMillis)
+                ) {
+                    return@mapNotNull null
+                }
                 val approach = com.example.data.model.GttFleetAnalyzer.estimateBusApproachToStop(
                     bus = bus,
                     stop = stopOnTargetLine,

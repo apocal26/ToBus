@@ -480,6 +480,7 @@ open class BusMapWidgetProvider : AppWidgetProvider() {
 
             val favorites = prefs.currentFavoriteStops()
             val nowMillis = System.currentTimeMillis()
+            vehicles = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(vehicles, patterns, nowMillis)
             val displayedVehiclesCount = if (settings.hideInactiveInWidget) {
                 vehicles.count { bus ->
                     val health = GttFleetAnalyzer.assess(bus, patterns, nowMillis)
