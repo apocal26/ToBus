@@ -56,14 +56,30 @@ object FavoriteAlertNotifier {
     private val DIACRITICS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
     private val NON_ALNUM_REGEX = Regex("[^a-z0-9]+")
     private val SINGLE_VEHICLE_NOTICE_REGEX = Regex(
-        pattern = "\\b(?:sul|sulla|del|della)?\\s*(?:mezzo|vettura|bus|autobus|tram|treno)\\s*(?:n\\.?\\s*)?#?\\d{2,5}\\b",
+        pattern = "\\b(?:sul|sulla|del|della|il|la)?\\s*(?:mezzo|vettura|bus|autobus|tram|treno)\\s*(?:n\\s*)?\\d{2,5}\\b",
         option = RegexOption.IGNORE_CASE,
     )
+    private val HARD_STRIKE_OR_NETWORK_KEYWORDS = listOf(
+        "sciopero",
+        "tutte le linee",
+        "tutta la rete",
+        "intera rete",
+        "rete urbana",
+        "rete di superficie",
+        "trasporto pubblico",
+        "servizio sospeso",
+        "circolazione sospesa",
+        "blocco della circolazione",
+        "blocco circolazione",
+    )
     private val LOW_VALUE_PUSH_PHRASES = listOf(
-        "capienza non garantit",
-        "capienza sul mezzo",
-        "capienza sulla vettura",
+        "capacita",
+        "capienza",
+        "posti disponibili",
+        "salita a bordo",
         "posti non garantit",
+        "sovraffollament",
+        "affollament",
         "pedana",
         "aria condizionata",
         "climatizzaz",
@@ -81,12 +97,18 @@ object FavoriteAlertNotifier {
         alert: ServiceAlertInfo,
         category: ServiceAlertCategory = alert.classifyCategory(),
     ): Boolean {
-        if (category == ServiceAlertCategory.CRITICAL) return false
-        val fullText = "${alert.headerText} ${alert.descriptionText}".lowercase(Locale.ITALY)
-        if (SINGLE_VEHICLE_NOTICE_REGEX.containsMatchIn(fullText)) {
+        val normText = normalizeTextForFingerprint("${alert.headerText} ${alert.descriptionText}")
+        if (normText.contains("sciopero")) return false
+        if (SINGLE_VEHICLE_NOTICE_REGEX.containsMatchIn(normText)) {
             return true
         }
-        return LOW_VALUE_PUSH_PHRASES.any { fullText.contains(it) }
+        return LOW_VALUE_PUSH_PHRASES.any { normText.contains(it) }
+    }
+
+    private fun isGenuineCitywideCritical(alert: ServiceAlertInfo): Boolean {
+        if (alert.gtfsCause == 3) return true // GTFS-RT STRIKE
+        val normText = normalizeTextForFingerprint("${alert.headerText} ${alert.descriptionText}")
+        return HARD_STRIKE_OR_NETWORK_KEYWORDS.any { normText.contains(it) }
     }
 
     internal fun normalizeTextForFingerprint(raw: String): String {
@@ -132,8 +154,8 @@ object FavoriteAlertNotifier {
 
     /**
      * Pure selection function: returns ONLY current/upcoming alerts that affect at least one
-     * favorite line (or are network-wide critical strikes), match one of [allowedCategories],
-     * and have NEVER been seen before (by content hash OR entity ID), deduplicated within the batch.
+     * favorite line (or are genuine citywide strikes), match one of [allowedCategories],
+     * exclude single-vehicle/crowding/equipment noise, and have NEVER been seen before.
      */
     fun findNewFavoriteLineAlerts(
         alerts: List<ServiceAlertInfo>,
@@ -167,12 +189,13 @@ object FavoriteAlertNotifier {
             val isNetworkWide = ServiceAlertOrganizer.isNetworkWide(alert)
             val matchingFavs = when {
                 isNetworkWide -> {
-                    // Network-wide / bulk (>=10 lines) alerts push ONLY if CRITICAL (e.g. strike)
-                    // OR if the text explicitly names a favorite line (avoiding generic spam).
+                    // Network-wide / bulk (>=10 lines) alerts push ONLY if the text explicitly names
+                    // a favorite line OR it is a genuine citywide CRITICAL notice (e.g. strike).
                     val textFavs = favOrdered.filter { ServiceAlertOrganizer.matchesLineText(alert, it) }
                     when {
                         textFavs.isNotEmpty() -> textFavs
-                        category == ServiceAlertCategory.CRITICAL -> listOf(NETWORK_WIDE_MATCH_TOKEN)
+                        category == ServiceAlertCategory.CRITICAL && isGenuineCitywideCritical(alert) ->
+                            listOf(NETWORK_WIDE_MATCH_TOKEN)
                         else -> emptyList()
                     }
                 }

@@ -543,6 +543,18 @@ class FavoriteAlertNotifierAndCatalogTest {
             affectedLines = setOf("12"),
             activePeriods = period,
         )
+        val exactScreenshotVehicle8008 = ServiceAlertInfo(
+            id = "veh_8008",
+            headerText = "Capacità posti disponibili non garantita sul mezzo 8008",
+            descriptionText = "La capacità massima dei posti disponibili è stata raggiunta e potrebbe non essere garantita la salita a bordo.",
+            affectedLines = emptySet(),
+            activePeriods = period,
+            gtfsEffect = 1, // NO_SERVICE sent by GTT on full vehicles!
+        )
+        assertEquals(
+            com.example.data.model.ServiceAlertCategory.INFO,
+            exactScreenshotVehicle8008.classifyCategory(),
+        )
         val bulkGenericNotice = ServiceAlertInfo(
             id = "bulk_info",
             headerText = "Avviso agli utenti GTT",
@@ -559,7 +571,7 @@ class FavoriteAlertNotifierAndCatalogTest {
         )
 
         val matched = FavoriteAlertNotifier.findNewFavoriteLineAlerts(
-            alerts = listOf(vehicleCapacityNoise, bulkGenericNotice, genuineLineDetour),
+            alerts = listOf(vehicleCapacityNoise, exactScreenshotVehicle8008, bulkGenericNotice, genuineLineDetour),
             favoriteLines = listOf("12"),
             seenFingerprints = emptySet(),
             nowEpochSeconds = now,

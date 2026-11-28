@@ -260,6 +260,7 @@ data class ServiceAlertInfo(
         val isFacilityOrAccessibility = FACILITY_KEYWORDS.any { text.contains(it) }
         val hasHardCritical = gtfsCause == GTFS_CAUSE_STRIKE ||
             CRITICAL_KEYWORDS.any { text.contains(it) }
+        val isSingleVehicleOrCrowding = isSingleVehicleOrCrowdingNotice(text)
         val hasDisruption = DISRUPTION_KEYWORDS.any { text.contains(it) }
         val hasPositiveBoost = gtfsEffect == GTFS_EFFECT_ADDITIONAL_SERVICE ||
             POSITIVE_BOOST_KEYWORDS.any { text.contains(it) }
@@ -276,17 +277,23 @@ data class ServiceAlertInfo(
             }
         }
 
-        // 2. Strikes, full line/station suspensions, severe service halts -> Red
+        // 2. Single-vehicle capacity/crowding notices (even when GTFS-RT sets NO_SERVICE) are general info,
+        //    never red line suspensions/strikes.
+        if (isSingleVehicleOrCrowding && !hasHardCritical) {
+            return ServiceAlertCategory.INFO
+        }
+
+        // 3. Strikes, full line/station suspensions, severe service halts -> Red
         if (hasHardCritical || (gtfsEffect == GTFS_EFFECT_NO_SERVICE && !hasPositiveBoost)) {
             return ServiceAlertCategory.CRITICAL
         }
 
-        // 3. Service boosts, extra buses/trains, extended hours (when not paired with a diversion/closure) -> Emerald
+        // 4. Service boosts, extra buses/trains, extended hours (when not paired with a diversion/closure) -> Emerald
         if (hasPositiveBoost && !hasDisruption) {
             return ServiceAlertCategory.POSITIVE
         }
 
-        // 4. Diversions, roadworks, moved/suppressed stops, replacement buses, delays -> Orange
+        // 5. Diversions, roadworks, moved/suppressed stops, replacement buses, delays -> Orange
         if (hasDisruption ||
             gtfsEffect == GTFS_EFFECT_DETOUR ||
             gtfsEffect == GTFS_EFFECT_REDUCED_SERVICE ||
@@ -297,19 +304,19 @@ data class ServiceAlertInfo(
             return ServiceAlertCategory.DISRUPTION
         }
 
-        // 5. Reopenings and restorations to normal service -> Emerald
+        // 6. Reopenings and restorations to normal service -> Emerald
         if (hasPositiveRestore) {
             return ServiceAlertCategory.POSITIVE
         }
 
-        // 6. Accessibility issues or minor operational notices -> Amber
+        // 7. Accessibility issues or minor operational notices -> Amber
         if (gtfsEffect == GTFS_EFFECT_ACCESSIBILITY_ISSUE ||
             NOTICE_KEYWORDS.any { text.contains(it) }
         ) {
             return ServiceAlertCategory.NOTICE
         }
 
-        // 7. General informational communications -> Cyan
+        // 8. General informational communications -> Cyan
         return ServiceAlertCategory.INFO
     }
 
@@ -323,6 +330,26 @@ data class ServiceAlertInfo(
         private const val GTFS_EFFECT_MODIFIED_SERVICE = 6
         private const val GTFS_EFFECT_STOP_MOVED = 9
         private const val GTFS_EFFECT_ACCESSIBILITY_ISSUE = 11
+
+        private val SINGLE_VEHICLE_REF_REGEX = Regex(
+            pattern = "\\b(?:sul|sulla|del|della|il|la)?\\s*(?:mezzo|vettura|bus|autobus|tram|treno)\\s*(?:n\\.?\\s*)?#?\\d{2,5}\\b",
+            option = RegexOption.IGNORE_CASE,
+        )
+
+        private val CROWDING_CAPACITY_KEYWORDS = listOf(
+            "capacità",
+            "capacita",
+            "capienza",
+            "posti disponibili",
+            "salita a bordo",
+            "sovraffollament",
+            "affollament",
+        )
+
+        private fun isSingleVehicleOrCrowdingNotice(lowerText: String): Boolean {
+            if (CROWDING_CAPACITY_KEYWORDS.any { lowerText.contains(it) }) return true
+            return SINGLE_VEHICLE_REF_REGEX.containsMatchIn(lowerText)
+        }
 
         private val FACILITY_KEYWORDS = listOf(
             "ascensor",
