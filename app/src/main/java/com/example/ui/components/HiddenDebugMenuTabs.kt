@@ -82,6 +82,8 @@ internal enum class DebugLogFilter(
     val categories: Set<DiagCategory>?,
 ) {
     ALL("Tutti", null),
+    VEHICLES("Mezzi", setOf(DiagCategory.VEHICLE)),
+    WIDGETS("Widget", setOf(DiagCategory.WIDGET)),
     SOURCES("Fonti", setOf(DiagCategory.POLL, DiagCategory.SOURCE)),
     MQTT("MQTT", setOf(DiagCategory.MQTT)),
     ROUTES_STOPS("Percorsi/Fermate", setOf(DiagCategory.ROUTE, DiagCategory.STOP, DiagCategory.CACHE)),
@@ -170,11 +172,66 @@ internal fun DebugStatusAndSourcesTab(
                     )
                 }
             }
-            if (!runtime?.sourceMotion.isNullOrEmpty()) {
-                runtime?.sourceMotion?.forEach { m ->
+            runtime?.sourceMotion?.takeIf { it.isNotEmpty() }?.forEach { m ->
+                DebugDetailNote(
+                    text = "${m.sourceName}: ${m.statusLabel} · nonDep=${m.observedNonDepot} · moto=${m.movingCount} · fermi=${m.stuckCount}",
+                )
+            }
+        }
+
+        // 2b. Per-Vehicle Forensic Telemetry (Active Line)
+        if (runtime != null) {
+            val activeTraces = runtime.focusedLineBusTraces
+            val recentDrops = runtime.recentDroppedBuses
+            val hideMap = uiState.settings.hideInactiveOnMap
+            val keptCount = activeTraces.count { it.isKeptByPipeline }
+            val shownCount = activeTraces.count { it.isKeptByPipeline && !it.isHiddenByMapFilter(hideMap) }
+            val dropTimeFmt = remember { SimpleDateFormat("HH:mm:ss", Locale.ITALY) }
+            DebugSectionCard(title = "Telemetria Mezzi · Linea ${uiState.settings.selectedLine.ifBlank { "-" }}") {
+                DebugStatusRow(
+                    label = "Stato linea (tenuti / UI / scarti)",
+                    value = "$keptCount tenuti · $shownCount in mappa · ${activeTraces.size - keptCount} esclusi",
+                    accent = AccentCyan,
+                )
+                DebugStatusRow(
+                    label = "Depositi OSM / Grace / Kin",
+                    value = "OSM ${runtime.depotPolygonsLoaded}/${runtime.depotTotalCount} · grace=${runtime.verifiedGraceCount} · kin=${runtime.kinematicTrackedCount}",
+                    accent = if (runtime.depotPolygonsLoaded > 0) AccentEmerald else AccentGold,
+                )
+                DebugDetailNote(
+                    text = "Filtri: hideInattiviMap=${uiState.settings.hideInactiveOnMap} · hideInattiviWidget=${uiState.settings.hideInactiveInWidget} · depositi=${uiState.settings.showDepotsOnMap} · fermate=${uiState.settings.showStopsOnMap}",
+                )
+                if (activeTraces.isEmpty()) {
+                    DebugDetailNote(text = "Nessun mezzo tracciato sull'ultimo ciclo per questa linea.")
+                } else {
+                    activeTraces.take(18).forEach { trace ->
+                        val color = when {
+                            !trace.isKeptByPipeline && trace.verdictCode == "STAGED_RETAINED" -> AccentGold
+                            !trace.isKeptByPipeline -> AccentRed
+                            trace.showBlockedWarningOnMap || trace.isHoldover -> AccentGold
+                            trace.depotName != null || trace.isOffRoute -> AccentOrange
+                            else -> AccentEmerald
+                        }
+                        DebugDetailNote(
+                            text = trace.formatForensicLine(hideInactiveOnMap = hideMap),
+                            color = color,
+                        )
+                    }
+                    if (activeTraces.size > 18) {
+                        DebugDetailNote(text = "… altri ${activeTraces.size - 18} mezzi nel Report completo.")
+                    }
+                }
+                if (recentDrops.isNotEmpty()) {
                     DebugDetailNote(
-                        text = "${m.sourceName}: ${m.statusLabel} · nonDep=${m.observedNonDepot} · moto=${m.movingCount} · fermi=${m.stuckCount}",
+                        text = "— Ultimi scarti/rimozioni (${recentDrops.size}) —",
+                        color = AccentGold,
                     )
+                    recentDrops.take(6).forEach { drop ->
+                        DebugDetailNote(
+                            text = drop.formatLine(dropTimeFmt),
+                            color = AccentOrange,
+                        )
+                    }
                 }
             }
         }
@@ -472,7 +529,7 @@ internal fun DebugLogViewerTab(
                     color = TextSubtitle,
                 )
             } else {
-                entries.take(80).forEach { entry ->
+                entries.take(160).forEach { entry ->
                     val severityColor = when (entry.severity) {
                         DiagSeverity.OK -> AccentEmerald
                         DiagSeverity.WARN -> AccentGold
@@ -516,9 +573,12 @@ internal fun copyFullDiagnosticReportToClipboard(
     val runtime = snapshot.runtime
     val outage = runtime?.outageSnapshot
     val mqtt = runtime?.mqtt
+    val s = uiState.settings
+    val dropTimeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.ITALY)
     val header = buildList {
         add("App: ToBus v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}) · ${Build.MANUFACTURER} ${Build.MODEL}")
-        add("Linea attiva: ${uiState.settings.selectedLine.ifBlank { "-" }} (${uiState.lineVehicles.size} mezzi) · Flotta rete: ${uiState.totalCityVehicles} · Modalità: ${uiState.settings.dataSourceMode.id} · Poll: ${uiState.settings.livePollInterval.seconds}s")
+        add("Linea attiva: ${s.selectedLine.ifBlank { "-" }} (${uiState.lineVehicles.size} mezzi UI) · Flotta rete: ${uiState.totalCityVehicles} · Modalità: ${s.dataSourceMode.id} · Poll: ${s.livePollInterval.seconds}s")
+        add("Impostazioni: hideInactiveMap=${s.hideInactiveOnMap} hideInactiveWidget=${s.hideInactiveInWidget} showDepots=${s.showDepotsOnMap} showStops=${s.showStopsOnMap} showRoute=${s.showRouteLine} widgetRoute=${s.showRouteInWidget} widgetFavStops=${s.showFavoriteStopsInWidget} mapStyle=${s.mapStyle.id} palette=${s.routeColorPalette.id} notifyFav=${s.notifyFavoriteLineAlerts} notifyCats=${s.notifyAlertCategories.joinToString(",") { it.id }}")
         add("Catalogo: ${uiState.allActiveLines.count { it.activeVehicleCount > 0 }} attive, ${uiState.allActiveLines.count { it.activeVehicleCount == 0 }} inattive · Preferite: ${snapshot.favoriteLines.joinToString(",").ifBlank { "nessuna" }}")
         if (outage != null) {
             add("Rete: ${outage.connectivity.transportLabel} (conn=${outage.connectivity.isConnected}, valid=${outage.connectivity.isValidated}, captive=${outage.connectivity.isCaptivePortal})")
@@ -526,7 +586,7 @@ internal fun copyFullDiagnosticReportToClipboard(
             add("Outage: ${outage.activeOutage?.let { "${it.kind.id} (sim=${it.isSimulated})" } ?: "nessuno"} · fail=${outage.consecutiveTotalFailures} stale=${outage.consecutiveStalePolls} frozen=${outage.consecutiveFrozenPolls} · ${outage.lastEvaluationNote}")
         }
         if (mqtt != null) {
-            add("MaTO MQTT: conn=${mqtt.isConnected} active=${mqtt.isActiveDesired} profile=${mqtt.profileLabel} line=${mqtt.focusedLine} raw=${mqtt.rawPublishCount} parsed=${mqtt.parsedVehicleCount} cache=${mqtt.cachedVehicles} subOk=${mqtt.subAckAccepted} subRej=${mqtt.subAckRejected} retry=${mqtt.reconnectAttempts} topic=${mqtt.lastSampleTopic ?: "-"} err=${mqtt.lastError ?: "-"}")
+            add("MaTO MQTT: conn=${mqtt.isConnected} active=${mqtt.isActiveDesired} profile=${mqtt.profileLabel} line=${mqtt.focusedLine} raw=${mqtt.rawPublishCount} live=${mqtt.livePublishCount} ret=${mqtt.retainedPublishCount} parsed=${mqtt.parsedVehicleCount} cache=${mqtt.cachedVehicles} staged=${mqtt.stagedRetainedCount} subOk=${mqtt.subAckAccepted} subRej=${mqtt.subAckRejected} retry=${mqtt.reconnectAttempts} topic=${mqtt.lastSampleTopic ?: "-"} err=${mqtt.lastError ?: "-"}")
         }
         if (uiState.sourceStatuses.isNotEmpty()) {
             add("Fonti: " + uiState.sourceStatuses.joinToString(" | ") { "${it.name}=${if (it.isOnline) "ON" else "OFF"}(${it.detail})" })
@@ -536,13 +596,33 @@ internal fun copyFullDiagnosticReportToClipboard(
                 add("Motion: " + runtime.sourceMotion.joinToString(" | ") { "${it.sourceName}:${it.statusLabel} nonDep=${it.observedNonDepot} mov=${it.movingCount} stuck=${it.stuckCount}" })
             }
             add("Percorso: ${runtime.lastRouteLoadSummary} · Fermata: ${runtime.lastStopArrivalsSummary}")
-            add("Cache: RAM=${runtime.routeCacheRamCount} Disco=${runtime.routeCacheDiskCount} Track=${runtime.movementTrackedCount} TU=${runtime.tripUpdatesCount} · ${runtime.staticStoreSummary}")
+            add("Cache: RAM=${runtime.routeCacheRamCount} Disco=${runtime.routeCacheDiskCount} Track=${runtime.movementTrackedCount} Kin=${runtime.kinematicTrackedCount} Grace=${runtime.verifiedGraceCount} TU=${runtime.tripUpdatesCount} DepotsOSM=${runtime.depotPolygonsLoaded}/${runtime.depotTotalCount} · ${runtime.staticStoreSummary}")
+
+            val traces = runtime.focusedLineBusTraces
+            val keptCount = traces.count { it.isKeptByPipeline }
+            val shownCount = traces.count { it.isKeptByPipeline && !it.isHiddenByMapFilter(s.hideInactiveOnMap) }
+            add("--- Mezzi Linea Attiva (L.${s.selectedLine.ifBlank { "-" }}: $keptCount tenuti, $shownCount visibili UI, ${traces.size - keptCount} scartati/staged) ---")
+            if (traces.isEmpty()) {
+                add("(nessun mezzo tracciato sull'ultimo ciclo per questa linea)")
+            } else {
+                traces.forEach { trace ->
+                    add(trace.formatForensicLine(hideInactiveOnMap = s.hideInactiveOnMap))
+                }
+            }
+
+            val drops = runtime.recentDroppedBuses
+            if (drops.isNotEmpty()) {
+                add("--- Ultimi Mezzi Scartati/Rimossi (${drops.size}) ---")
+                drops.forEach { drop ->
+                    add(drop.formatLine(dropTimeFmt))
+                }
+            }
         }
     }
     val reportText = ToBusDiagnosticsLog.formatReport(
         headerLines = header,
         categories = filter.categories,
-        maxEntries = 90,
+        maxEntries = 220,
     )
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
     cm?.setPrimaryClip(ClipData.newPlainText("ToBus Diagnostic Report", reportText))

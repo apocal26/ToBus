@@ -33,8 +33,10 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.data.model.BusVehicle
 import com.example.data.model.CameraState
+import com.example.data.model.GttDepot
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.MapStyle
+import com.example.data.model.RouteColorPalette
 import com.example.data.model.RoutePattern
 import com.example.data.model.TransitStop
 import com.example.data.model.VehicleHealthAssessment
@@ -83,6 +85,7 @@ private data class BusMapVisualHealth(
     val isInDepot: Boolean,
     val isStaleGps: Boolean,
     val isStuck: Boolean,
+    val showBlockedWarningOnMap: Boolean,
     val isOffRoute: Boolean,
     val isAtTerminus: Boolean,
 )
@@ -104,6 +107,7 @@ fun InteractiveTurinMap(
     userLocation: UserLocationState? = null,
     cameraFlyRequest: CameraFlyRequest? = null,
     routePatterns: List<RoutePattern>,
+    depotZones: List<GttDepot> = emptyList(),
     favoriteStopIds: Set<String>,
     selectedVehicleId: String?,
     selectedStop: TransitStop? = null,
@@ -112,7 +116,10 @@ fun InteractiveTurinMap(
     isForegroundActive: Boolean,
     showVehicleLabels: Boolean,
     showRouteLine: Boolean,
+    showStopsOnMap: Boolean = true,
+    showDepotsOnMap: Boolean = true,
     colorByDirection: Boolean,
+    routeColorPalette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
     focusedDirectionFilter: Int? = null,
     shiftCameraForBottomSheet: Boolean = true,
     precomputedHealthById: Map<String, VehicleHealthAssessment>? = null,
@@ -144,11 +151,15 @@ fun InteractiveTurinMap(
         if (activeExternalBus != null) vehicles + activeExternalBus else vehicles
     }
 
-    val baseVisibleStops = remember(routePatterns, focusedDirectionFilter) {
-        routePatterns
-            .flatMap { it.stops }
-            .filter { focusedDirectionFilter == null || it.directionId == focusedDirectionFilter }
-            .distinctBy { "${it.stopId}_${it.directionId}" }
+    val baseVisibleStops = remember(routePatterns, focusedDirectionFilter, showStopsOnMap) {
+        if (!showStopsOnMap) {
+            emptyList()
+        } else {
+            routePatterns
+                .flatMap { it.stops }
+                .filter { focusedDirectionFilter == null || it.directionId == focusedDirectionFilter }
+                .distinctBy { "${it.stopId}_${it.directionId}" }
+        }
     }
     val visibleStops = remember(baseVisibleStops, selectedStop) {
         if (selectedStop != null && baseVisibleStops.none { it.stopId == selectedStop.stopId }) {
@@ -185,6 +196,7 @@ fun InteractiveTurinMap(
                 isInDepot = h.isInDepot,
                 isStaleGps = h.isStaleGps,
                 isStuck = h.isStuck,
+                showBlockedWarningOnMap = h.showBlockedWarningOnMap,
                 isOffRoute = h.isOffRoute,
                 isAtTerminus = h.isAtTerminus,
             )
@@ -225,6 +237,7 @@ fun InteractiveTurinMap(
     var hasViewportLayout by remember { mutableStateOf(false) }
 
     val latestRoutePatterns by rememberUpdatedState(routePatterns)
+    val latestDepotZones by rememberUpdatedState(depotZones)
     val latestFavoriteStopIds by rememberUpdatedState(favoriteStopIds)
     val latestSelectedStopId by rememberUpdatedState(selectedStopId)
     val latestHighlightedMainDirectionId by rememberUpdatedState(highlightedMainDirectionId)
@@ -237,8 +250,11 @@ fun InteractiveTurinMap(
     val latestBusHealthById by rememberUpdatedState(busHealthById)
     val latestResolvedDirectionById by rememberUpdatedState(resolvedDirectionById)
     val latestColorByDirection by rememberUpdatedState(colorByDirection)
+    val latestRouteColorPalette by rememberUpdatedState(routeColorPalette)
     val latestShowVehicleLabels by rememberUpdatedState(showVehicleLabels)
     val latestShowRouteLine by rememberUpdatedState(showRouteLine)
+    val latestShowStopsOnMap by rememberUpdatedState(showStopsOnMap)
+    val latestShowDepotsOnMap by rememberUpdatedState(showDepotsOnMap)
     val latestFocusedDirectionFilter by rememberUpdatedState(focusedDirectionFilter)
     val latestVisibleStops by rememberUpdatedState(visibleStops)
     val latestOnCameraChange by rememberUpdatedState(onCameraChange)
@@ -516,18 +532,31 @@ fun InteractiveTurinMap(
         val map = mapLibreMap ?: return@LaunchedEffect
         activeStyle = null
         latestOnMapReadyChanged(false)
+        val paletteAtLoad = latestRouteColorPalette
         val (styleJson, preRenderedLandmarks, preRenderedTransit) = withContext(Dispatchers.Default) {
             Triple(
                 TurinVectorStyleBuilder.buildStyleJson(mapStyle),
                 getOrCreateLandmarkDotSprites(isDark = mapStyle.isDark, density = density),
-                getOrCreateTransitSprites(density = density),
+                getOrCreateTransitSprites(density = density, palette = paletteAtLoad),
             )
         }
         map.setStyle(Style.Builder().fromJson(styleJson)) { style ->
             runCatching {
+                installGttDepotsLayer(
+                    style = style,
+                    isDarkBasemap = mapStyle.isDark,
+                    density = density,
+                    depots = latestDepotZones,
+                )
+                setGttDepotsVisibility(style, visible = latestShowDepotsOnMap)
                 installMajorLandmarksLayer(style, mapStyle, density, preRenderedLandmarks = preRenderedLandmarks)
-                registerTransitSprites(style, density, preRendered = preRenderedTransit)
-                installTransitLayers(style, isDarkBasemap = mapStyle.isDark)
+                registerTransitSprites(
+                    style = style,
+                    density = density,
+                    palette = paletteAtLoad,
+                    preRendered = preRenderedTransit,
+                )
+                installTransitLayers(style, isDarkBasemap = mapStyle.isDark, palette = paletteAtLoad)
 
                 // Synchronously hydrate all sources & visibilities BEFORE exposing the ready map
                 val routeVis = if (latestShowRouteLine) Property.VISIBLE else Property.NONE
@@ -566,7 +595,11 @@ fun InteractiveTurinMap(
                         dimAll = latestHasExternalRouteFocus,
                     ),
                 )
-                val stopsVis = if (latestShowRouteLine || selStopId != null) Property.VISIBLE else Property.NONE
+                val stopsVis = if ((latestShowRouteLine && latestShowStopsOnMap) || selStopId != null) {
+                    Property.VISIBLE
+                } else {
+                    Property.NONE
+                }
                 style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
                 style.getLayer(MapLibreTransitIds.STOPS_DOT_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
                 style.getLayer(MapLibreTransitIds.STOPS_FAV_STAR_LAYER)?.setProperties(PropertyFactory.visibility(stopsVis))
@@ -638,6 +671,34 @@ fun InteractiveTurinMap(
         latestOnCameraFlyConsumed(req.id)
     }
 
+    // Update verified OSM GTT depot polygons, labels, and visibility reactively
+    LaunchedEffect(activeStyle, styleReadyTick, depotZones, showDepotsOnMap) {
+        val style = activeStyle ?: return@LaunchedEffect
+        if (!style.isFullyLoaded) return@LaunchedEffect
+        style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.DEPOTS_SOURCE)
+            ?.setGeoJson(buildGttDepotsPolygonCollection(depotZones))
+        style.getSourceAs<GeoJsonSource>(MapLibreTransitIds.DEPOTS_LABELS_SOURCE)
+            ?.setGeoJson(buildGttDepotsLabelCollection(depotZones))
+        setGttDepotsVisibility(style, visible = showDepotsOnMap)
+    }
+
+    // Live route & bus color palette update (zero-flicker, no style reload needed)
+    LaunchedEffect(activeStyle, styleReadyTick, routeColorPalette) {
+        val style = activeStyle ?: return@LaunchedEffect
+        if (!style.isFullyLoaded) return@LaunchedEffect
+        val sprites = withContext(Dispatchers.Default) {
+            getOrCreateTransitSprites(density = density, palette = routeColorPalette)
+        }
+        if (style.isFullyLoaded) {
+            applyTransitPaletteToStyle(
+                style = style,
+                density = density,
+                palette = routeColorPalette,
+                preRenderedSprites = sprites,
+            )
+        }
+    }
+
     // Update Route Polylines & visibility (highlighting selected bus direction or dimming when inspecting external bus)
     LaunchedEffect(
         activeStyle,
@@ -700,6 +761,7 @@ fun InteractiveTurinMap(
         selectedStopId,
         colorByDirection,
         showRouteLine,
+        showStopsOnMap,
         highlightedMainDirectionId,
         hasExternalRouteFocus,
     ) {
@@ -717,7 +779,11 @@ fun InteractiveTurinMap(
                 dimAll = hasExternalRouteFocus,
             ),
         )
-        val vis = if (showRouteLine || selectedStopId != null) Property.VISIBLE else Property.NONE
+        val vis = if ((showRouteLine && showStopsOnMap) || selectedStopId != null) {
+            Property.VISIBLE
+        } else {
+            Property.NONE
+        }
         style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.STOPS_DOT_LAYER)?.setProperties(PropertyFactory.visibility(vis))
         style.getLayer(MapLibreTransitIds.STOPS_FAV_STAR_LAYER)?.setProperties(PropertyFactory.visibility(vis))

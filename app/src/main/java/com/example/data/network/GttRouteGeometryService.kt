@@ -5,6 +5,7 @@ import android.util.Log
 import com.example.data.model.GeoPoint
 import com.example.data.model.RoutePattern
 import com.example.data.model.TransitStop
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -39,10 +40,23 @@ internal class GttRouteGeometryService(
     private val overpassEndpoints: List<String>,
 ) {
     private val routeMemoryCache = ConcurrentHashMap<String, List<RoutePattern>>()
+    private val inFlightRouteFetches = ConcurrentHashMap<String, CompletableDeferred<List<RoutePattern>>>()
 
     @Volatile
     var lastRouteLoadSummary: String = "Nessun percorso caricato"
         private set
+
+    @Volatile
+    private var preferredMatoEndpointIdx: Int = 0
+
+    @Volatile
+    private var preferredMatoQueryIdx: Int = 0
+
+    @Volatile
+    private var matoRouteDownUntilMillis: Long = 0L
+
+    @Volatile
+    private var consecutiveMatoEmptyCount: Int = 0
 
     fun getMemoryCachedPatterns(normalizedLine: String): List<RoutePattern> =
         routeMemoryCache[normalizedLine].orEmpty()
@@ -93,60 +107,104 @@ internal class GttRouteGeometryService(
                 }
         }
 
-        val routeFetchStart = SystemClock.elapsedRealtime()
-        var routeSourceTag = "none"
-
-        var fetched: List<RoutePattern> = queryMatoGraphQl(normalized, todayYyyyMmDd, activeTripIds)
-        if (fetched.isNotEmpty()) {
-            routeSourceTag = "MaTO GraphQL ($normalized)"
-        }
-        if (fetched.isEmpty()) {
-            for (altQuery in GtfsRtProtobufParser.alternateFeedQueryCodes(normalized)) {
-                fetched = queryMatoGraphQl(altQuery, todayYyyyMmDd, activeTripIds, matchTargetLine = normalized)
-                if (fetched.isNotEmpty()) {
-                    routeSourceTag = "MaTO GraphQL (alt:$altQuery)"
-                    break
-                }
+        // Coalesce concurrent requests for the same line (e.g. main UI + Map Widget firing together
+        // on line switch) so two threads never parse the 12.7MB GTFS zip simultaneously.
+        if (!forceRefresh) {
+            inFlightRouteFetches[memKey]?.let { existingDeferred ->
+                val awaited = runCatching { existingDeferred.await() }.getOrNull()
+                if (!awaited.isNullOrEmpty()) return@withContext awaited
             }
         }
-
-        if (fetched.isEmpty()) {
-            fetched = staticRouteStoreProvider().getRoutePatternsForLine(normalized, nowMillis, activeTripIds)
-            if (fetched.isNotEmpty()) routeSourceTag = "GTFS Statico"
+        val myDeferred = CompletableDeferred<List<RoutePattern>>()
+        val existingDeferred = if (!forceRefresh) inFlightRouteFetches.putIfAbsent(memKey, myDeferred) else null
+        if (existingDeferred != null) {
+            val awaited = runCatching { existingDeferred.await() }.getOrNull()
+            if (!awaited.isNullOrEmpty()) return@withContext awaited
+        }
+        if (existingDeferred == null) {
+            inFlightRouteFetches[memKey] = myDeferred
         }
 
-        if (fetched.isEmpty()) {
-            fetched = queryOverpassTurinRoute(normalized)
-            if (fetched.isNotEmpty()) {
-                routeSourceTag = "OSM Overpass ($normalized)"
-            } else {
-                for (altQuery in GtfsRtProtobufParser.alternateFeedQueryCodes(normalized)) {
-                    fetched = queryOverpassTurinRoute(altQuery)
-                    if (fetched.isNotEmpty()) {
-                        routeSourceTag = "OSM Overpass (alt:$altQuery)"
-                        break
+        try {
+            val routeFetchStart = SystemClock.elapsedRealtime()
+            var routeSourceTag = "none"
+
+            val staticStore = staticRouteStoreProvider()
+            val hasLocalGtfs = staticStore.hasCachedGtfsZip()
+            val existingMem = routeMemoryCache[memKey]
+            val skipMatoForLocalLiveVerify = forceRefresh &&
+                activeTripIds.isNotEmpty() &&
+                hasLocalGtfs &&
+                (nowMillis < matoRouteDownUntilMillis || existingMem?.any { it.id.startsWith("gtfs_") } == true)
+
+            var fetched: List<RoutePattern> = emptyList()
+            if (!skipMatoForLocalLiveVerify && nowMillis >= matoRouteDownUntilMillis) {
+                fetched = queryMatoGraphQl(normalized, todayYyyyMmDd, activeTripIds, nowMillis = nowMillis)
+                if (fetched.isNotEmpty()) {
+                    routeSourceTag = "MaTO GraphQL ($normalized)"
+                }
+                if (fetched.isEmpty() && !hasLocalGtfs && nowMillis >= matoRouteDownUntilMillis) {
+                    for (altQuery in GtfsRtProtobufParser.alternateFeedQueryCodes(normalized)) {
+                        fetched = queryMatoGraphQl(
+                            lineCode = altQuery,
+                            todayYyyyMmDd = todayYyyyMmDd,
+                            activeTripIds = activeTripIds,
+                            matchTargetLine = normalized,
+                            nowMillis = nowMillis,
+                        )
+                        if (fetched.isNotEmpty()) {
+                            routeSourceTag = "MaTO GraphQL (alt:$altQuery)"
+                            break
+                        }
+                        if (nowMillis < matoRouteDownUntilMillis) break
                     }
                 }
             }
-        }
 
-        val routeElapsedMs = SystemClock.elapsedRealtime() - routeFetchStart
-        val totalStops = fetched.sumOf { it.stops.size }
-        lastRouteLoadSummary = "L.$normalized via $routeSourceTag (${fetched.size} dir, $totalStops ferm, ${routeElapsedMs}ms)"
-        ToBusDiagnosticsLog.record(
-            category = DiagCategory.ROUTE,
-            message = "Percorso L.$normalized: $routeSourceTag",
-            detail = "dir=${fetched.size} fermate=$totalStops ${routeElapsedMs}ms liveTrips=${activeTripIds.size}",
-            severity = if (fetched.isNotEmpty()) DiagSeverity.OK else DiagSeverity.WARN,
-        )
+            if (fetched.isEmpty()) {
+                fetched = staticStore.getRoutePatternsForLine(normalized, nowMillis, activeTripIds)
+                if (fetched.isNotEmpty()) routeSourceTag = "GTFS Statico"
+            }
 
-        if (fetched.isNotEmpty()) {
-            cacheRouteStops(fetched)
-            routeMemoryCache[memKey] = fetched
-            routeMemoryCache[normalized] = fetched
-            runCatching { diskFile.writeText(serializePatterns(fetched)) }
+            if (fetched.isEmpty()) {
+                fetched = queryOverpassTurinRoute(normalized)
+                if (fetched.isNotEmpty()) {
+                    routeSourceTag = "OSM Overpass ($normalized)"
+                } else {
+                    for (altQuery in GtfsRtProtobufParser.alternateFeedQueryCodes(normalized)) {
+                        fetched = queryOverpassTurinRoute(altQuery)
+                        if (fetched.isNotEmpty()) {
+                            routeSourceTag = "OSM Overpass (alt:$altQuery)"
+                            break
+                        }
+                    }
+                }
+            }
+
+            val routeElapsedMs = SystemClock.elapsedRealtime() - routeFetchStart
+            val totalStops = fetched.sumOf { it.stops.size }
+            lastRouteLoadSummary = "L.$normalized via $routeSourceTag (${fetched.size} dir, $totalStops ferm, ${routeElapsedMs}ms)"
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.ROUTE,
+                message = "Percorso L.$normalized: $routeSourceTag",
+                detail = "dir=${fetched.size} fermate=$totalStops ${routeElapsedMs}ms liveTrips=${activeTripIds.size}",
+                severity = if (fetched.isNotEmpty()) DiagSeverity.OK else DiagSeverity.WARN,
+            )
+
+            if (fetched.isNotEmpty()) {
+                cacheRouteStops(fetched)
+                routeMemoryCache[memKey] = fetched
+                routeMemoryCache[normalized] = fetched
+                runCatching { diskFile.writeText(serializePatterns(fetched)) }
+            }
+            myDeferred.complete(fetched)
+            fetched
+        } catch (t: Throwable) {
+            myDeferred.complete(emptyList())
+            throw t
+        } finally {
+            inFlightRouteFetches.remove(memKey, myDeferred)
         }
-        fetched
     }
 
     /**
@@ -215,7 +273,9 @@ internal class GttRouteGeometryService(
         todayYyyyMmDd: String,
         activeTripIds: Set<String> = emptySet(),
         matchTargetLine: String = lineCode,
+        nowMillis: Long = System.currentTimeMillis(),
     ): List<RoutePattern> {
+        if (nowMillis < matoRouteDownUntilMillis) return emptyList()
         val escapedName = lineCode.replace("\"", "")
         val queries = listOf(
             """
@@ -321,8 +381,16 @@ internal class GttRouteGeometryService(
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val client = matoFastHttpClientProvider()
 
-        for (endpoint in matoEndpoints) {
-            for (query in queries) {
+        val endpointOrder = matoEndpoints.indices.sortedBy { if (it == preferredMatoEndpointIdx) 0 else 1 }
+        val queryOrder = queries.indices.sortedBy { if (it == preferredMatoQueryIdx) 0 else 1 }
+        var anyValidGraphQlData = false
+
+        for (epIdx in endpointOrder) {
+            val endpoint = matoEndpoints[epIdx]
+            var endpointFailed = false
+            for (qIdx in queryOrder) {
+                if (endpointFailed) break
+                val query = queries[qIdx]
                 try {
                     val payload = JSONObject().put("query", query).toString()
                     val request = Request.Builder()
@@ -334,15 +402,36 @@ internal class GttRouteGeometryService(
                         .build()
 
                     client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) continue
+                        if (!response.isSuccessful) {
+                            if (response.code == 404 || response.code == 405 || response.code >= 500) {
+                                endpointFailed = true
+                            }
+                            continue
+                        }
                         val body = response.body?.string() ?: continue
+                        val root = runCatching { JSONObject(body) }.getOrNull() ?: continue
+                        val hasErrors = root.optJSONArray("errors")?.let { it.length() > 0 } == true
+                        val hasDataRoutes = root.optJSONObject("data")?.optJSONArray("routes") != null
+                        if (!hasErrors && hasDataRoutes) {
+                            anyValidGraphQlData = true
+                        }
                         val parsed = parseMatoGraphQlResponse(body, matchTargetLine, activeTripIds)
-                        if (parsed.isNotEmpty()) return parsed
+                        if (parsed.isNotEmpty()) {
+                            preferredMatoEndpointIdx = epIdx
+                            preferredMatoQueryIdx = qIdx
+                            matoRouteDownUntilMillis = 0L
+                            consecutiveMatoEmptyCount = 0
+                            return parsed
+                        }
                     }
                 } catch (e: Exception) {
+                    endpointFailed = true
                     Log.d(TAG, "MATO GraphQL skip su $endpoint: ${e.message}")
                 }
             }
+        }
+        if (!anyValidGraphQlData || ++consecutiveMatoEmptyCount >= 2) {
+            matoRouteDownUntilMillis = nowMillis + MATO_ROUTE_DOWN_COOLDOWN_MS
         }
         return emptyList()
     }
@@ -579,6 +668,7 @@ internal class GttRouteGeometryService(
     companion object {
         private const val TAG = "GttRouteGeometry"
         private const val ROUTE_CACHE_TTL_MS = 6L * 60L * 60L * 1000L
+        private const val MATO_ROUTE_DOWN_COOLDOWN_MS = 5L * 60L * 1000L
         private val SAFE_ROUTE_KEY_REGEX = Regex("[^A-Z0-9_]")
         private val OVERPASS_SAFE_REF_REGEX = Regex("[^A-Za-z0-9/+\\- ]")
 

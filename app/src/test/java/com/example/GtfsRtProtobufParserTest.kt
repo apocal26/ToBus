@@ -110,11 +110,13 @@ class GtfsRtProtobufParserTest {
 
         val liveBus = sampleBus(timestampSec = nowSec - 18L)
         val slowBus = sampleBus(timestampSec = nowSec - 90L)
-        val staleBus = sampleBus(timestampSec = nowSec - 210L)
+        val slowLaggedBus = sampleBus(timestampSec = nowSec - 210L)
+        val staleBus = sampleBus(timestampSec = nowSec - 250L)
 
         assertEquals(18L, liveBus.gpsAgeSeconds(nowMs))
         assertEquals(VehicleFreshness.LIVE, liveBus.freshness(nowMs))
         assertEquals(VehicleFreshness.SLOW, slowBus.freshness(nowMs))
+        assertEquals(VehicleFreshness.SLOW, slowLaggedBus.freshness(nowMs))
         assertEquals(VehicleFreshness.STALE, staleBus.freshness(nowMs))
     }
 

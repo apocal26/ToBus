@@ -50,13 +50,14 @@ data class AlertTimeRange(
 enum class ServiceAlertCategory(
     val id: String,
     val label: String,
+    val filterLabelIt: String,
     val priority: Int,
 ) {
-    CRITICAL(id = "critical", label = "Disservizio", priority = 5),
-    DISRUPTION(id = "disruption", label = "Deviazione", priority = 4),
-    NOTICE(id = "notice", label = "Avviso", priority = 3),
-    POSITIVE(id = "positive", label = "Potenziamento", priority = 2),
-    INFO(id = "info", label = "Info", priority = 1);
+    CRITICAL(id = "critical", label = "Disservizio", filterLabelIt = "Disservizi e scioperi", priority = 5),
+    DISRUPTION(id = "disruption", label = "Deviazione", filterLabelIt = "Deviazioni e lavori", priority = 4),
+    NOTICE(id = "notice", label = "Avviso", filterLabelIt = "Avvisi e impianti", priority = 3),
+    POSITIVE(id = "positive", label = "Potenziamento", filterLabelIt = "Potenziamenti", priority = 2),
+    INFO(id = "info", label = "Info", filterLabelIt = "Informazioni generali", priority = 1);
 
     companion object {
         fun fromId(id: String?): ServiceAlertCategory =
@@ -583,21 +584,67 @@ data class BusVehicle(
     val lastMovedAtMillis: Long? = null,
     val stationarySinceMillis: Long? = null,
     val fetchedAtMillis: Long = System.currentTimeMillis(),
+    val isMqttRetained: Boolean = false,
+    val hasExplicitTimestamp: Boolean = true,
+    val isHoldover: Boolean = false,
 ) {
     /**
      * Exact age in seconds since the bus's onboard GPS last emitted this position.
-     * Falls back to feed fetch time if GPS timestamp is missing (0).
+     * Falls back to null if GPS timestamp is missing (0).
      */
     fun gpsAgeSeconds(nowMillis: Long): Long? {
         if (timestampSeconds <= 0L) return null
         return ((nowMillis / 1000L) - timestampSeconds).coerceAtLeast(0L)
     }
 
+    /**
+     * Returns only genuine GPS position feed names (excluding schedule/delay enrichers such as
+     * `TripUpdates` or disk-cache tags so non-GPS metadata can never mask a single-source phantom).
+     */
+    fun gpsSourceNames(): Set<String> {
+        val raw = if (contributingSources.isNotEmpty()) contributingSources else setOf(sourceName)
+        return raw.filterTo(LinkedHashSet(raw.size)) { src ->
+            !src.equals("TripUpdates", ignoreCase = true) &&
+                !src.equals("Cache", ignoreCase = true)
+        }
+    }
+
+    /**
+     * True when at least one official GTFS-RT vehicle position feed (`GTT Ufficiale` or
+     * `BusOne Proxy`) corroborated this vehicle on its current line.
+     */
+    fun hasOfficialGtfsCorroboration(): Boolean {
+        val sources = gpsSourceNames()
+        if (sources.any {
+                it.equals("GTT Ufficiale", ignoreCase = true) ||
+                    it.equals("BusOne Proxy", ignoreCase = true)
+            }
+        ) {
+            return true
+        }
+        return sourceName.equals("GTT Ufficiale", ignoreCase = true) ||
+            sourceName.equals("BusOne Proxy", ignoreCase = true)
+    }
+
+    /**
+     * True when coordinates have genuinely progressed between distinct observations within
+     * [windowSeconds] and the vehicle is not currently parked at a stationary anchor.
+     */
+    fun hasRecentPhysicalMovement(nowMillis: Long, windowSeconds: Long = 240L): Boolean {
+        if (stationarySinceMillis != null) return false
+        val movedAt = lastMovedAtMillis ?: return false
+        val sinceMoveSec = ((nowMillis - movedAt) / 1000L).coerceAtLeast(0L)
+        return sinceMoveSec < windowSeconds
+    }
+
     fun freshness(nowMillis: Long): VehicleFreshness {
         val age = gpsAgeSeconds(nowMillis) ?: return VehicleFreshness.SLOW
+        if (hasRecentPhysicalMovement(nowMillis) && age > 45L) {
+            return VehicleFreshness.SLOW
+        }
         return when {
             age <= 45L -> VehicleFreshness.LIVE
-            age <= 150L -> VehicleFreshness.SLOW
+            age <= 240L -> VehicleFreshness.SLOW
             else -> VehicleFreshness.STALE
         }
     }
@@ -894,6 +941,7 @@ data class LiveFeedSnapshot(
     val sourceStatuses: List<DataSourceStatus> = emptyList(),
     val alerts: List<ServiceAlertInfo> = emptyList(),
     val outageReport: GttDataOutageReport? = null,
+    val healthyOfficialGtfsOnline: Boolean = false,
 )
 
 enum class MapStyle(
@@ -1040,6 +1088,65 @@ data class CameraState(
     }
 }
 
+enum class RouteColorPalette(
+    val id: String,
+    val labelIt: String,
+    val primaryHex: String,
+    val secondaryHex: String,
+    val primaryGlowRgba: String,
+    val secondaryGlowRgba: String,
+    val primaryArgb: Int,
+    val secondaryArgb: Int,
+) {
+    TURIN_GOLD(
+        id = "turin_gold",
+        labelIt = "Classico",
+        primaryHex = "#FFB300",
+        secondaryHex = "#38BDF8",
+        primaryGlowRgba = "rgba(255, 179, 0, 0.24)",
+        secondaryGlowRgba = "rgba(56, 189, 248, 0.24)",
+        primaryArgb = 0xFFFFB300.toInt(),
+        secondaryArgb = 0xFF38BDF8.toInt(),
+    ),
+    EMERALD_VIOLET(
+        id = "emerald_violet",
+        labelIt = "Smeraldo",
+        primaryHex = "#10B981",
+        secondaryHex = "#A78BFA",
+        primaryGlowRgba = "rgba(16, 185, 129, 0.24)",
+        secondaryGlowRgba = "rgba(167, 139, 250, 0.24)",
+        primaryArgb = 0xFF10B981.toInt(),
+        secondaryArgb = 0xFFA78BFA.toInt(),
+    ),
+    CORAL_TEAL(
+        id = "coral_teal",
+        labelIt = "Corallo",
+        primaryHex = "#FB7185",
+        secondaryHex = "#2DD4BF",
+        primaryGlowRgba = "rgba(251, 113, 133, 0.24)",
+        secondaryGlowRgba = "rgba(45, 212, 191, 0.24)",
+        primaryArgb = 0xFFFB7185.toInt(),
+        secondaryArgb = 0xFF2DD4BF.toInt(),
+    ),
+    COBALT_MAGENTA(
+        id = "cobalt_magenta",
+        labelIt = "Cobalto",
+        primaryHex = "#3B82F6",
+        secondaryHex = "#EC4899",
+        primaryGlowRgba = "rgba(59, 130, 246, 0.24)",
+        secondaryGlowRgba = "rgba(236, 72, 153, 0.24)",
+        primaryArgb = 0xFF3B82F6.toInt(),
+        secondaryArgb = 0xFFEC4899.toInt(),
+    );
+
+    companion object {
+        fun fromId(id: String?): RouteColorPalette {
+            if (id.equals("cobalt_amber", ignoreCase = true)) return COBALT_MAGENTA
+            return entries.firstOrNull { it.id == id } ?: TURIN_GOLD
+        }
+    }
+}
+
 @Immutable
 data class UserWidgetSettings(
     val selectedLine: String = "",
@@ -1048,7 +1155,12 @@ data class UserWidgetSettings(
     val fixedCamera: CameraState = CameraState(),
     val showVehicleLabels: Boolean = false,
     val showRouteLine: Boolean = true,
+    val showStopsOnMap: Boolean = true,
+    val showDepotsOnMap: Boolean = true,
     val colorByDirection: Boolean = true,
+    val routeColorPalette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
+    val showRouteInWidget: Boolean = true,
+    val showFavoriteStopsInWidget: Boolean = true,
     val hideInactiveInWidget: Boolean = true,
     val refreshInterval: RefreshInterval = RefreshInterval.MIN_5,
     val dataSourceMode: DataSourceMode = DataSourceMode.AUTO,
@@ -1056,6 +1168,7 @@ data class UserWidgetSettings(
     val keepScreenOn: Boolean = false,
     val showServiceAlerts: Boolean = true,
     val notifyFavoriteLineAlerts: Boolean = false,
+    val notifyAlertCategories: Set<ServiceAlertCategory> = ServiceAlertCategory.entries.toSet(),
     val hideInactiveOnMap: Boolean = false,
 ) {
     val hasSelectedLine: Boolean

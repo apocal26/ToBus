@@ -15,7 +15,10 @@ import android.widget.RemoteViews
 import com.example.MainActivity
 import com.example.R
 import com.example.data.model.ServiceAlertInfo
+import com.example.data.network.DiagCategory
+import com.example.data.network.DiagSeverity
 import com.example.data.network.GttRealtimeRepository
+import com.example.data.network.ToBusDiagnosticsLog
 import com.example.data.preferences.ToBusPreferences
 import com.example.notifications.FavoriteAlertNotifier
 import kotlinx.coroutines.CoroutineScope
@@ -265,6 +268,17 @@ class FavoriteAlertsWidgetProvider : AppWidgetProvider() {
                 }
             }
 
+            if (!showLoading && preloadedAlerts == null && favorites.isNotEmpty() && !BusMapWidgetProvider.isNetworkReadyForWidget(context)) {
+                ToBusDiagnosticsLog.record(
+                    category = DiagCategory.WIDGET,
+                    message = "Alerts widget rinviato (standby/rete non pronta)",
+                    detail = "netReady=false favs=${favorites.size} -> JobScheduler retry",
+                    severity = DiagSeverity.INFO,
+                )
+                WidgetRefreshJobScheduler.scheduleNetworkRetry(context)
+                return
+            }
+
             val repo = GttRealtimeRepository.getInstance(context)
             val fetchedAlerts: List<ServiceAlertInfo>? = when {
                 favorites.isEmpty() -> emptyList()
@@ -276,6 +290,12 @@ class FavoriteAlertsWidgetProvider : AppWidgetProvider() {
 
             // If a silent background refresh had no network AND no cache, leave existing rows intact
             if (!showLoading && fetchedAlerts == null && favorites.isNotEmpty()) {
+                ToBusDiagnosticsLog.record(
+                    category = DiagCategory.WIDGET,
+                    message = "Alerts widget preserva righe precedenti (rete/cache assenti)",
+                    detail = "favs=${favorites.size}",
+                    severity = DiagSeverity.WARN,
+                )
                 return
             }
 
@@ -290,6 +310,14 @@ class FavoriteAlertsWidgetProvider : AppWidgetProvider() {
                     nowEpochSeconds = nowMillis / 1000L,
                 )
             }
+
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.WIDGET,
+                message = "Alerts widget aggiornato (${targetIds.size}w) → ${rows.size} avvisi preferite",
+                detail = "favs=${favorites.size} rawAlerts=${fetchedAlerts?.size ?: -1} src=${if (preloadedAlerts != null) "sync" else "net/cache"}",
+                severity = if (fetchedAlerts == null && favorites.isNotEmpty()) DiagSeverity.WARN else DiagSeverity.OK,
+                timestampMillis = nowMillis,
+            )
 
             FavoriteAlertsWidgetCache.saveRows(context, rows)
 

@@ -9,6 +9,8 @@ import com.example.data.model.FavoriteStop
 import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
+import com.example.data.model.RouteColorPalette
+import com.example.data.model.ServiceAlertCategory
 import com.example.data.model.UserWidgetSettings
 import com.example.data.model.WidgetCameraMode
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -226,6 +228,20 @@ class ToBusPreferences private constructor(context: Context) {
         prefs.edit().putLong(KEY_LAST_WIDGET_REFRESH_MS, millis).apply()
     }
 
+    fun getLastWidgetRenderedLine(): String =
+        prefs.getString(KEY_LAST_WIDGET_RENDERED_LINE, "")?.trim()?.uppercase().orEmpty()
+
+    fun setLastWidgetRenderedLine(lineCode: String) {
+        prefs.edit().putString(KEY_LAST_WIDGET_RENDERED_LINE, lineCode.trim().uppercase()).apply()
+    }
+
+    fun getLastWidgetSuccessMillis(): Long =
+        prefs.getLong(KEY_LAST_WIDGET_SUCCESS_MS, 0L)
+
+    fun setLastWidgetSuccessMillis(millis: Long) {
+        prefs.edit().putLong(KEY_LAST_WIDGET_SUCCESS_MS, millis).apply()
+    }
+
     private fun readSettings(): UserWidgetSettings {
         val rawSelected = prefs.getString(KEY_LINE, "")?.trim()?.uppercase().orEmpty()
         val migratedSelected = if (rawSelected.isNotEmpty()) {
@@ -253,7 +269,14 @@ class ToBusPreferences private constructor(context: Context) {
             ),
             showVehicleLabels = prefs.getBoolean(KEY_SHOW_LABELS, false),
             showRouteLine = prefs.getBoolean(KEY_SHOW_ROUTE, true),
+            showStopsOnMap = prefs.getBoolean(KEY_SHOW_STOPS_MAP, true),
+            showDepotsOnMap = prefs.getBoolean(KEY_SHOW_DEPOTS_MAP, true),
             colorByDirection = prefs.getBoolean(KEY_COLOR_BY_DIR, true),
+            routeColorPalette = RouteColorPalette.fromId(
+                prefs.getString(KEY_ROUTE_COLOR_PALETTE, RouteColorPalette.TURIN_GOLD.id),
+            ),
+            showRouteInWidget = prefs.getBoolean(KEY_SHOW_ROUTE_WIDGET, true),
+            showFavoriteStopsInWidget = prefs.getBoolean(KEY_SHOW_FAV_STOPS_WIDGET, true),
             hideInactiveInWidget = prefs.getBoolean(KEY_HIDE_INACTIVE_WIDGET, true),
             refreshInterval = RefreshInterval.fromMinutes(prefs.getInt(KEY_REFRESH_MIN, 5)),
             dataSourceMode = DataSourceMode.fromId(prefs.getString(KEY_DATA_SOURCE_MODE, DataSourceMode.AUTO.id)),
@@ -261,8 +284,23 @@ class ToBusPreferences private constructor(context: Context) {
             keepScreenOn = prefs.getBoolean(KEY_KEEP_SCREEN_ON, false),
             showServiceAlerts = prefs.getBoolean(KEY_SHOW_SERVICE_ALERTS, true),
             notifyFavoriteLineAlerts = prefs.getBoolean(KEY_NOTIFY_FAVORITE_ALERTS, false),
+            notifyAlertCategories = readNotifyAlertCategories(),
             hideInactiveOnMap = prefs.getBoolean(KEY_HIDE_INACTIVE_MAP, false),
         )
+    }
+
+    private fun readNotifyAlertCategories(): Set<ServiceAlertCategory> {
+        if (!prefs.contains(KEY_NOTIFY_ALERT_CATEGORIES)) {
+            return ServiceAlertCategory.entries.toSet()
+        }
+        val raw = prefs.getString(KEY_NOTIFY_ALERT_CATEGORIES, null) ?: return ServiceAlertCategory.entries.toSet()
+        if (raw.isBlank()) return emptySet()
+        return raw.split(',')
+            .mapNotNull { token ->
+                val clean = token.trim()
+                ServiceAlertCategory.entries.firstOrNull { it.id.equals(clean, ignoreCase = true) }
+            }
+            .toSet()
     }
 
     private fun saveSettings(s: UserWidgetSettings) {
@@ -275,7 +313,12 @@ class ToBusPreferences private constructor(context: Context) {
             .putLong(KEY_FIXED_ZOOM, java.lang.Double.doubleToRawLongBits(s.fixedCamera.zoom))
             .putBoolean(KEY_SHOW_LABELS, s.showVehicleLabels)
             .putBoolean(KEY_SHOW_ROUTE, s.showRouteLine)
+            .putBoolean(KEY_SHOW_STOPS_MAP, s.showStopsOnMap)
+            .putBoolean(KEY_SHOW_DEPOTS_MAP, s.showDepotsOnMap)
             .putBoolean(KEY_COLOR_BY_DIR, s.colorByDirection)
+            .putString(KEY_ROUTE_COLOR_PALETTE, s.routeColorPalette.id)
+            .putBoolean(KEY_SHOW_ROUTE_WIDGET, s.showRouteInWidget)
+            .putBoolean(KEY_SHOW_FAV_STOPS_WIDGET, s.showFavoriteStopsInWidget)
             .putBoolean(KEY_HIDE_INACTIVE_WIDGET, s.hideInactiveInWidget)
             .putInt(KEY_REFRESH_MIN, s.refreshInterval.minutes)
             .putString(KEY_DATA_SOURCE_MODE, s.dataSourceMode.id)
@@ -283,6 +326,10 @@ class ToBusPreferences private constructor(context: Context) {
             .putBoolean(KEY_KEEP_SCREEN_ON, s.keepScreenOn)
             .putBoolean(KEY_SHOW_SERVICE_ALERTS, s.showServiceAlerts)
             .putBoolean(KEY_NOTIFY_FAVORITE_ALERTS, s.notifyFavoriteLineAlerts)
+            .putString(
+                KEY_NOTIFY_ALERT_CATEGORIES,
+                s.notifyAlertCategories.joinToString(",") { it.id },
+            )
             .putBoolean(KEY_HIDE_INACTIVE_MAP, s.hideInactiveOnMap)
             .apply()
     }
@@ -375,7 +422,12 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_FIXED_ZOOM = "fixed_zoom"
         private const val KEY_SHOW_LABELS = "show_vehicle_labels"
         private const val KEY_SHOW_ROUTE = "show_route_line"
+        private const val KEY_SHOW_STOPS_MAP = "show_stops_on_map"
+        private const val KEY_SHOW_DEPOTS_MAP = "show_depots_on_map"
         private const val KEY_COLOR_BY_DIR = "color_by_direction"
+        private const val KEY_ROUTE_COLOR_PALETTE = "route_color_palette"
+        private const val KEY_SHOW_ROUTE_WIDGET = "show_route_in_widget"
+        private const val KEY_SHOW_FAV_STOPS_WIDGET = "show_fav_stops_in_widget"
         private const val KEY_HIDE_INACTIVE_WIDGET = "hide_inactive_widget"
         private const val KEY_REFRESH_MIN = "refresh_minutes"
         private const val KEY_DATA_SOURCE_MODE = "data_source_mode"
@@ -383,6 +435,7 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
         private const val KEY_SHOW_SERVICE_ALERTS = "show_service_alerts"
         private const val KEY_NOTIFY_FAVORITE_ALERTS = "notify_favorite_line_alerts"
+        private const val KEY_NOTIFY_ALERT_CATEGORIES = "notify_alert_categories_v1"
         private const val KEY_SEEN_ALERT_FINGERPRINTS = "seen_alert_fingerprints_v1"
         private const val KEY_ALERT_BASELINE_SEEDED = "alert_baseline_seeded_v1"
         private const val KEY_HIDE_INACTIVE_MAP = "hide_inactive_map"
@@ -392,6 +445,8 @@ class ToBusPreferences private constructor(context: Context) {
         private const val KEY_GITHUB_REPO = "github_update_repo"
         private const val KEY_LAST_UPDATE_CHECK_MS = "github_last_update_check_ms"
         private const val KEY_LAST_WIDGET_REFRESH_MS = "last_widget_refresh_attempt_ms"
+        private const val KEY_LAST_WIDGET_RENDERED_LINE = "last_widget_rendered_line"
+        private const val KEY_LAST_WIDGET_SUCCESS_MS = "last_widget_success_ms"
         private const val KEY_DISMISSED_UPDATE_TAG = "github_dismissed_update_tag"
         private const val MAX_FAVORITES = 6
         private const val MAX_FAVORITE_LINES = 12

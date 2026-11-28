@@ -296,12 +296,12 @@ fun ToBusApp(
         }
         currentTab == AppDestination.MAP && uiState.selectedStop != null -> {
             if (uiState.settings.colorByDirection && uiState.selectedStop!!.directionId == 1) {
-                AccentCyan
+                Color(uiState.settings.routeColorPalette.secondaryArgb)
             } else {
-                AccentGold
+                Color(uiState.settings.routeColorPalette.primaryArgb)
             }
         }
-        currentTab == AppDestination.MAP -> AccentGold
+        currentTab == AppDestination.MAP -> Color(uiState.settings.routeColorPalette.primaryArgb)
         else -> when (uiState.settings.mapStyle) {
             MapStyle.DARK -> AccentCyan
             MapStyle.POSITRON -> Color(0xFF60A5FA)
@@ -491,6 +491,7 @@ fun ToBusApp(
                             onDismissGttOutage = viewModel::dismissGttOutageBanner,
                             openAlertsRequestSeq = openAlertsRequestSeq,
                             onAlertsDialogOpened = viewModel::markVisibleAlertsAsSeen,
+                            onRefreshAlerts = viewModel::refreshServiceAlerts,
                         )
 
                         AppDestination.WIDGET -> WidgetStudioScreen(
@@ -503,11 +504,18 @@ fun ToBusApp(
                             onCaptureCurrentMapArea = viewModel::saveCurrentMapAsWidgetArea,
                             onToggleVehicleLabels = viewModel::setShowVehicleLabels,
                             onToggleRouteLine = viewModel::setShowRouteLine,
+                            onToggleStopsOnMap = viewModel::setShowStopsOnMap,
+                            onToggleDepotsOnMap = viewModel::setShowDepotsOnMap,
                             onToggleColorByDirection = viewModel::setColorByDirection,
+                            onSelectRouteColorPalette = viewModel::setRouteColorPalette,
+                            onToggleRouteInWidget = viewModel::setShowRouteInWidget,
+                            onToggleFavoriteStopsInWidget = viewModel::setShowFavoriteStopsInWidget,
                             onToggleHideInactiveInWidget = viewModel::setHideInactiveInWidget,
                             onToggleHideInactiveOnMap = viewModel::setHideInactiveOnMap,
                             onToggleShowServiceAlerts = viewModel::setShowServiceAlerts,
                             onToggleNotifyFavoriteLineAlerts = handleToggleNotifyFavoriteAlerts,
+                            onToggleNotifyAlertCategory = viewModel::toggleNotifyAlertCategory,
+                            onToggleAllNotifyAlertCategories = viewModel::toggleAllNotifyAlertCategories,
                             onToggleKeepScreenOn = viewModel::setKeepScreenOn,
                             onSelectDataSourceMode = viewModel::setDataSourceMode,
                             onSelectLivePollInterval = viewModel::setLivePollInterval,

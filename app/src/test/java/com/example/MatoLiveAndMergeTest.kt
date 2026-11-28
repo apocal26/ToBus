@@ -440,12 +440,16 @@ class MatoLiveAndMergeTest {
         val pubAck = MatoMqttLiveClient.encodePubAckPacket(42)
         assertEquals(listOf(0x40, 0x02, 0x00, 0x2A), pubAck.map { it.toInt() and 0xFF })
 
-        // 6. Primary exact subscription group must include /map/v1/eta/12U & /gtt:12U with zero '#' wildcards
-        val exactGroup = MatoMqttLiveClient.buildLineSubscriptionGroups("12").first()
+        // 6. Primary subscription group stays minimal (zero '#' wildcards) to avoid duplicate retained dumps,
+        // while secondary fallback groups retain /gtt:12U and /map/v1/eta/12U
+        val allGroups = MatoMqttLiveClient.buildLineSubscriptionGroups("12")
+        val exactGroup = allGroups.first()
+        val allTopics = allGroups.flatten()
         assertTrue(exactGroup.contains("/12U"))
-        assertTrue(exactGroup.contains("/gtt:12U"))
-        assertTrue(exactGroup.contains("/map/v1/eta/12U"))
+        assertTrue(exactGroup.contains("/12/+"))
         assertFalse(exactGroup.any { it.contains("#") })
+        assertTrue(allTopics.contains("/gtt:12U"))
+        assertTrue(allTopics.contains("/map/v1/eta/12U"))
 
         // 7. Bare GTFS-RT VehiclePosition protobuf (no FeedMessage wrapper, route/veh inferred from topic)
         fun writeFixed32LE(out: ByteArrayOutputStream, bits: Int) {

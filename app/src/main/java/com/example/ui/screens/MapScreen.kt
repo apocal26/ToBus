@@ -153,6 +153,7 @@ fun MapScreen(
     onDismissGttOutage: () -> Unit = {},
     openAlertsRequestSeq: Long = 0L,
     onAlertsDialogOpened: () -> Unit = {},
+    onRefreshAlerts: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -246,7 +247,7 @@ fun MapScreen(
         }
     }
 
-    val spatialByVehicleId = remember(uiState.lineVehicles, uiState.routePatterns) {
+    val spatialByVehicleId = remember(uiState.lineVehicles, uiState.routePatterns, uiState.depotZones) {
         uiState.lineVehicles.associate { bus ->
             bus.vehicleId to GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
         }
@@ -270,10 +271,10 @@ fun MapScreen(
         healthByVehicleId.values.count { it.isInDepot }
     }
     val offRouteCount = remember(healthByVehicleId) {
-        healthByVehicleId.values.count { !it.isInDepot && !it.isStaleGps && !it.isStuck && it.isOffRoute }
+        healthByVehicleId.values.count { !it.isInDepot && !it.showBlockedWarningOnMap && it.isOffRoute }
     }
     val staleOrStuckCount = remember(healthByVehicleId) {
-        healthByVehicleId.values.count { !it.isInDepot && (it.isStaleGps || it.isStuck) }
+        healthByVehicleId.values.count { !it.isInDepot && it.showBlockedWarningOnMap }
     }
     var focusedDirectionFilter by remember(uiState.settings.selectedLine) { mutableStateOf<Int?>(null) }
     val directionTermini = remember(uiState.routePatterns) {
@@ -298,8 +299,31 @@ fun MapScreen(
         } else {
             uiState.lineVehicles.filter { bus ->
                 bus.vehicleId == uiState.selectedVehicleId ||
-                    healthByVehicleId[bus.vehicleId]?.let { !it.isInDepot && !it.isStaleGps } != false
+                    healthByVehicleId[bus.vehicleId]?.let { !it.isInDepot && !it.showBlockedWarningOnMap } != false
             }
+        }
+    }
+    LaunchedEffect(
+        uiState.settings.selectedLine,
+        uiState.settings.hideInactiveOnMap,
+        uiState.lineVehicles,
+        healthByVehicleId,
+    ) {
+        val line = uiState.settings.selectedLine.trim()
+        if (line.isNotEmpty()) {
+            val hiddenEntries = uiState.lineVehicles.mapNotNull { bus ->
+                val h = healthByVehicleId[bus.vehicleId] ?: return@mapNotNull null
+                when {
+                    h.isInDepot -> bus.vehicleId to "depot:${h.depotName?.removePrefix("Deposito ")?.trim() ?: "?"}"
+                    h.showBlockedWarningOnMap -> bus.vehicleId to "blockedWarn(stat=${h.stationarySeconds ?: -1}s,age=${h.gpsAgeSeconds ?: -1}s)"
+                    else -> null
+                }
+            }
+            com.example.data.network.GttRealtimeRepository.getInstance(context).recordMapUiHideState(
+                lineCode = line,
+                hideInactiveOnMap = uiState.settings.hideInactiveOnMap,
+                hiddenEntries = hiddenEntries,
+            )
         }
     }
     val sortedVehicles = remember(
@@ -318,8 +342,7 @@ fun MapScreen(
             .sortedWith(
                 compareBy<BusVehicle> { healthByVehicleId[it.vehicleId]?.isInDepot == true }
                     .thenBy { healthByVehicleId[it.vehicleId]?.isOffRoute == true }
-                    .thenBy { healthByVehicleId[it.vehicleId]?.isStaleGps == true }
-                    .thenBy { healthByVehicleId[it.vehicleId]?.isStuck == true }
+                    .thenBy { healthByVehicleId[it.vehicleId]?.showBlockedWarningOnMap == true }
                     .thenBy { it.vehicleId },
             )
     }
@@ -341,6 +364,7 @@ fun MapScreen(
             userLocation = uiState.userLocation,
             cameraFlyRequest = uiState.cameraFlyRequest,
             routePatterns = uiState.routePatterns,
+            depotZones = uiState.depotZones,
             selectedVehicleId = uiState.selectedVehicleId,
             selectedStop = uiState.selectedStop,
             selectedStopId = uiState.selectedStop?.stopId,
@@ -349,7 +373,10 @@ fun MapScreen(
             isForegroundActive = isForegroundActive,
             showVehicleLabels = uiState.settings.showVehicleLabels,
             showRouteLine = uiState.settings.showRouteLine,
+            showStopsOnMap = uiState.settings.showStopsOnMap,
+            showDepotsOnMap = uiState.settings.showDepotsOnMap,
             colorByDirection = uiState.settings.colorByDirection,
+            routeColorPalette = uiState.settings.routeColorPalette,
             focusedDirectionFilter = focusedDirectionFilter,
             shiftCameraForBottomSheet = !isWideScreen,
             precomputedHealthById = healthByVehicleId,
@@ -570,11 +597,13 @@ fun MapScreen(
                 ) {
                     if (hasTwoDirections) {
                         item(key = "direction_filter_chip") {
+                            val palettePrimary = Color(uiState.settings.routeColorPalette.primaryArgb)
+                            val paletteSecondary = Color(uiState.settings.routeColorPalette.secondaryArgb)
                             val dir0Name = directionTermini[0] ?: "Andata"
                             val dir1Name = directionTermini[1] ?: "Ritorno"
                             val activeAccent = when (focusedDirectionFilter) {
-                                0 -> AccentGold
-                                1 -> if (uiState.settings.colorByDirection) AccentCyan else AccentGold
+                                0 -> palettePrimary
+                                1 -> if (uiState.settings.colorByDirection) paletteSecondary else palettePrimary
                                 else -> TextPrimary
                             }
                             val isFiltered = focusedDirectionFilter != null
@@ -625,18 +654,22 @@ fun MapScreen(
                                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                                     ) {
                                         if (focusedDirectionFilter == null) {
-                                            // Dual Gold + Cyan dots indicating both directions active
+                                            // Dual palette dots indicating both directions active
                                             Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                                 Box(
                                                     modifier = Modifier
                                                         .size(7.dp)
-                                                        .background(AccentGold, CircleShape),
+                                                        .background(palettePrimary, CircleShape),
                                                 )
                                                 Box(
                                                     modifier = Modifier
                                                         .size(7.dp)
                                                         .background(
-                                                            color = if (uiState.settings.colorByDirection) AccentCyan else AccentGold,
+                                                            color = if (uiState.settings.colorByDirection) {
+                                                                paletteSecondary
+                                                            } else {
+                                                                palettePrimary
+                                                            },
                                                             shape = CircleShape,
                                                         ),
                                                 )
@@ -975,6 +1008,7 @@ fun MapScreen(
                                 currentStopName = currentStop?.name,
                                 nowMillis = uiState.nowMillis,
                                 colorByDirection = uiState.settings.colorByDirection,
+                                routeColorPalette = uiState.settings.routeColorPalette,
                                 onSwitchToLine = if (isExternal) {
                                     { onSelectLine(bus.lineCode) }
                                 } else {
@@ -1012,6 +1046,7 @@ fun MapScreen(
                                 isLightBasemap = isLightBasemap,
                                 nowMillis = uiState.nowMillis,
                                 colorByDirection = uiState.settings.colorByDirection,
+                                routeColorPalette = uiState.settings.routeColorPalette,
                                 maxScrollHeight = maxScrollHeight,
                                 onToggleFavorite = { onToggleFavoriteStop(stop) },
                                 onRefresh = onRefreshStopArrivals,
@@ -1027,6 +1062,8 @@ fun MapScreen(
 
         val activeBusChipsBar: @Composable () -> Unit = {
             if (sortedVehicles.isNotEmpty()) {
+                val palettePrimary = Color(uiState.settings.routeColorPalette.primaryArgb)
+                val paletteSecondary = Color(uiState.settings.routeColorPalette.secondaryArgb)
                 LazyRow(
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(horizontal = 16.dp),
@@ -1039,8 +1076,8 @@ fun MapScreen(
                         val resolvedDir = resolvedDirectionById[bus.vehicleId]
                         val directionAccent = when {
                             health.isInDepot || health.isOffRoute -> null
-                            uiState.settings.colorByDirection && resolvedDir == 1 -> AccentCyan
-                            else -> AccentGold
+                            uiState.settings.colorByDirection && resolvedDir == 1 -> paletteSecondary
+                            else -> palettePrimary
                         }
                         ActiveBusDirectionGlassPill(
                             bus = bus,
@@ -1208,8 +1245,11 @@ fun MapScreen(
     if (showAlertsDialog && uiState.settings.showServiceAlerts) {
         GttAlertsDialog(
             selectedLine = uiState.settings.selectedLine,
+            favoriteLines = uiState.favoriteLines,
             lineAlerts = uiState.lineAlerts,
             allAlerts = uiState.allAlerts,
+            isRefreshing = uiState.isRefreshingAlerts,
+            onRefresh = onRefreshAlerts,
             onDismiss = { showAlertsDialog = false },
         )
     }

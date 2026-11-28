@@ -7,7 +7,10 @@ import android.graphics.Paint
 import android.graphics.Path as AndroidPath
 import android.graphics.RectF
 import com.example.data.model.BusVehicle
+import com.example.data.model.GttDepot
+import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.MapStyle
+import com.example.data.model.RouteColorPalette
 import com.example.data.model.RoutePattern
 import com.example.data.model.TransitStop
 import com.example.data.model.VehicleHealthAssessment
@@ -15,6 +18,7 @@ import com.example.data.model.shortTurinPlaceName
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.CircleLayer
+import org.maplibre.android.style.layers.FillLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory
@@ -24,7 +28,11 @@ import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.LineString
 import org.maplibre.geojson.Point
+import org.maplibre.geojson.Polygon
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 internal object MapLibreTransitIds {
     const val CURATED_LANDMARKS_SOURCE = "tobus-curated-landmarks-source"
@@ -92,6 +100,14 @@ internal object MapLibreTransitIds {
 
     const val ICON_STALE = "tobus-bus-stale"
     const val ICON_STALE_SEL = "tobus-bus-stale-sel"
+
+    const val DEPOTS_SOURCE = "tobus-gtt-depots-source"
+    const val DEPOTS_LABELS_SOURCE = "tobus-gtt-depots-labels-source"
+    const val DEPOTS_FILL_LAYER = "tobus-gtt-depots-fill"
+    const val DEPOTS_PATTERN_LAYER = "tobus-gtt-depots-pattern"
+    const val DEPOTS_BORDER_LAYER = "tobus-gtt-depots-border"
+    const val DEPOTS_LABEL_LAYER = "tobus-gtt-depots-label"
+    const val ICON_DEPOT_PATTERN = "tobus-depot-hatch-pattern"
 
     const val LM_PARK = "tobus-lm-park"
     const val LM_RAIL = "tobus-lm-rail"
@@ -661,7 +677,7 @@ internal fun buildCuratedTurinLandmarksFeatureCollection(): FeatureCollection {
 }
 
 private val landmarkSpriteCache = java.util.concurrent.ConcurrentHashMap<String, Map<String, Bitmap>>()
-private val transitSpriteCache = java.util.concurrent.ConcurrentHashMap<Int, Map<String, Bitmap>>()
+private val transitSpriteCache = java.util.concurrent.ConcurrentHashMap<String, Map<String, Bitmap>>()
 
 /**
  * Generates and caches landmark dot bitmaps off the main thread so MapLibre style setup
@@ -755,12 +771,16 @@ private fun registerLandmarkDotSprites(
 /**
  * Generates and caches all bus/status/chevron/star marker bitmaps off the main thread.
  */
-internal fun getOrCreateTransitSprites(density: Float): Map<String, Bitmap> {
+internal fun getOrCreateTransitSprites(
+    density: Float,
+    palette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
+): Map<String, Bitmap> {
     val dpi = (density * 160f).roundToInt().coerceAtLeast(160)
-    transitSpriteCache[dpi]?.let { return it }
+    val cacheKey = "${dpi}_${palette.id}"
+    transitSpriteCache[cacheKey]?.let { return it }
 
-    val gold = AndroidColor.parseColor("#FFB300")
-    val cyan = AndroidColor.parseColor("#38BDF8")
+    val primary = palette.primaryArgb
+    val secondary = palette.secondaryArgb
     val emerald = AndroidColor.parseColor("#10B981")
     val darkInk = AndroidColor.parseColor("#0B0F17")
     val out = LinkedHashMap<String, Bitmap>(20)
@@ -775,24 +795,24 @@ internal fun getOrCreateTransitSprites(density: Float): Map<String, Bitmap> {
         )
     }
 
-    add(MapLibreTransitIds.ICON_GOLD, gold, hasArrow = true, selected = false)
-    add(MapLibreTransitIds.ICON_GOLD_SEL, gold, hasArrow = true, selected = true)
-    add(MapLibreTransitIds.ICON_GOLD_NODIR, gold, hasArrow = false, selected = false)
-    add(MapLibreTransitIds.ICON_GOLD_NODIR_SEL, gold, hasArrow = false, selected = true)
+    add(MapLibreTransitIds.ICON_GOLD, primary, hasArrow = true, selected = false)
+    add(MapLibreTransitIds.ICON_GOLD_SEL, primary, hasArrow = true, selected = true)
+    add(MapLibreTransitIds.ICON_GOLD_NODIR, primary, hasArrow = false, selected = false)
+    add(MapLibreTransitIds.ICON_GOLD_NODIR_SEL, primary, hasArrow = false, selected = true)
 
-    add(MapLibreTransitIds.ICON_CYAN, cyan, hasArrow = true, selected = false)
-    add(MapLibreTransitIds.ICON_CYAN_SEL, cyan, hasArrow = true, selected = true)
-    add(MapLibreTransitIds.ICON_CYAN_NODIR, cyan, hasArrow = false, selected = false)
-    add(MapLibreTransitIds.ICON_CYAN_NODIR_SEL, cyan, hasArrow = false, selected = true)
+    add(MapLibreTransitIds.ICON_CYAN, secondary, hasArrow = true, selected = false)
+    add(MapLibreTransitIds.ICON_CYAN_SEL, secondary, hasArrow = true, selected = true)
+    add(MapLibreTransitIds.ICON_CYAN_NODIR, secondary, hasArrow = false, selected = false)
+    add(MapLibreTransitIds.ICON_CYAN_NODIR_SEL, secondary, hasArrow = false, selected = true)
 
     add(MapLibreTransitIds.ICON_EXT_ARROW, emerald, hasArrow = true, selected = true)
     add(MapLibreTransitIds.ICON_EXT_NODIR, emerald, hasArrow = false, selected = true)
 
     // Always-upright status badges: Terminus (pause bars in line-colored ring), Depot/Off-Route (garage roof + D), Stale/Stuck (alert !)
-    out[MapLibreTransitIds.ICON_TERMINUS_GOLD] = createTerminusMarkerBitmap(gold, selected = false, density = density)
-    out[MapLibreTransitIds.ICON_TERMINUS_GOLD_SEL] = createTerminusMarkerBitmap(gold, selected = true, density = density)
-    out[MapLibreTransitIds.ICON_TERMINUS_CYAN] = createTerminusMarkerBitmap(cyan, selected = false, density = density)
-    out[MapLibreTransitIds.ICON_TERMINUS_CYAN_SEL] = createTerminusMarkerBitmap(cyan, selected = true, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_GOLD] = createTerminusMarkerBitmap(primary, selected = false, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_GOLD_SEL] = createTerminusMarkerBitmap(primary, selected = true, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_CYAN] = createTerminusMarkerBitmap(secondary, selected = false, density = density)
+    out[MapLibreTransitIds.ICON_TERMINUS_CYAN_SEL] = createTerminusMarkerBitmap(secondary, selected = true, density = density)
 
     out[MapLibreTransitIds.ICON_DEPOT] = createDepotMarkerBitmap(selected = false, density = density)
     out[MapLibreTransitIds.ICON_DEPOT_SEL] = createDepotMarkerBitmap(selected = true, density = density)
@@ -803,16 +823,17 @@ internal fun getOrCreateTransitSprites(density: Float): Map<String, Bitmap> {
     out[MapLibreTransitIds.ICON_ROUTE_CHEVRON] = createRouteChevronBitmap(density = density)
     out[MapLibreTransitIds.ICON_FAV_STOP_STAR] = createFavoriteStarBitmap(density = density)
 
-    transitSpriteCache[dpi] = out
+    transitSpriteCache[cacheKey] = out
     return out
 }
 
 internal fun registerTransitSprites(
     style: Style,
     density: Float,
+    palette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
     preRendered: Map<String, Bitmap>? = null,
 ) {
-    val sprites = preRendered ?: getOrCreateTransitSprites(density)
+    val sprites = preRendered ?: getOrCreateTransitSprites(density, palette)
     for ((id, bmp) in sprites) {
         style.addImage(id, bmp, false)
     }
@@ -1208,7 +1229,272 @@ private fun createStaleAlertMarkerBitmap(
     return bitmap
 }
 
-internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
+/**
+ * Emits exact closed OpenStreetMap footprint polygons for Turin GTT bus & tram depots.
+ * Safety invariant: ONLY depots with a real, verified OSM polygon ([GttDepot.hasVerifiedPolygon])
+ * are rendered on the map — NEVER approximate guessed circles that could spill onto homes.
+ */
+internal fun buildGttDepotsPolygonCollection(
+    depots: List<GttDepot> = GttFleetAnalyzer.TURIN_DEPOTS,
+): FeatureCollection {
+    val features = depots.mapNotNull { depot ->
+        if (!depot.hasVerifiedPolygon) return@mapNotNull null
+        val ring = ArrayList<Point>(depot.polygon.size + 1)
+        for (pt in depot.polygon) {
+            ring.add(Point.fromLngLat(pt.lon, pt.lat))
+        }
+        if (ring.size < 4) return@mapNotNull null
+        val first = ring.first()
+        val last = ring.last()
+        if (first.latitude() != last.latitude() || first.longitude() != last.longitude()) {
+            ring.add(first)
+        }
+        Feature.fromGeometry(Polygon.fromLngLats(listOf(ring))).apply {
+            addStringProperty("name", depot.name)
+        }
+    }
+    return FeatureCollection.fromFeatures(features)
+}
+
+/**
+ * Centroid point features for discreet zoom-gated GTT depot labels.
+ * Emitted strictly for depots with verified real OSM polygons.
+ */
+internal fun buildGttDepotsLabelCollection(
+    depots: List<GttDepot> = GttFleetAnalyzer.TURIN_DEPOTS,
+): FeatureCollection {
+    val features = depots.mapNotNull { depot ->
+        if (!depot.hasVerifiedPolygon) return@mapNotNull null
+        Feature.fromGeometry(Point.fromLngLat(depot.lon, depot.lat)).apply {
+            addStringProperty("name", depot.name)
+        }
+    }
+    return FeatureCollection.fromFeatures(features)
+}
+
+/**
+ * Creates a seamless, tileable 14dp diagonal 45° architectural micro-hatch tile for depot zones.
+ * Ultra-lightweight single-pass Canvas tile (~32x32–42x42 px) with whisper-quiet opacity so streets,
+ * routes, stops, and buses remain effortlessly dominant.
+ */
+private fun createDepotHatchPatternBitmap(
+    isDarkBasemap: Boolean,
+    density: Float,
+): Bitmap {
+    val tilePx = (14f * density).roundToInt().coerceIn(20, 48)
+    val bitmap = Bitmap.createBitmap(tilePx, tilePx, Bitmap.Config.ARGB_8888)
+    bitmap.density = (density * 160f).roundToInt().coerceAtLeast(160)
+    val canvas = Canvas(bitmap)
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = (1.0f * density).coerceIn(1.0f, 2.4f)
+        color = if (isDarkBasemap) {
+            AndroidColor.argb(38, 245, 158, 11) // subtle warm amber-gold hairlines on dark navy
+        } else {
+            AndroidColor.argb(40, 161, 98, 7) // subtle architectural ochre hairlines on light basemap
+        }
+    }
+    val s = tilePx.toFloat()
+    // Draw diagonal stripe + wrapped corner offsets so MapLibre tiles repeat with zero visible seam
+    canvas.drawLine(-s, s, s, -s, paint)
+    canvas.drawLine(0f, s, s, 0f, paint)
+    canvas.drawLine(0f, 2f * s, 2f * s, 0f, paint)
+    return bitmap
+}
+
+/**
+ * Installs subtle, architectural GTT Bus Depot geofence overlays beneath landmarks, transit routes,
+ * stops, and vehicle markers so users immediately understand when a bus is parked inside a depot.
+ */
+internal fun installGttDepotsLayer(
+    style: Style,
+    isDarkBasemap: Boolean,
+    density: Float,
+    depots: List<GttDepot> = GttFleetAnalyzer.TURIN_DEPOTS,
+) {
+    if (style.getSource(MapLibreTransitIds.DEPOTS_SOURCE) == null) {
+        style.addSource(
+            GeoJsonSource(
+                MapLibreTransitIds.DEPOTS_SOURCE,
+                buildGttDepotsPolygonCollection(depots),
+            ),
+        )
+    }
+    if (style.getSource(MapLibreTransitIds.DEPOTS_LABELS_SOURCE) == null) {
+        style.addSource(
+            GeoJsonSource(
+                MapLibreTransitIds.DEPOTS_LABELS_SOURCE,
+                buildGttDepotsLabelCollection(depots),
+            ),
+        )
+    }
+
+    val patternBmp = createDepotHatchPatternBitmap(isDarkBasemap = isDarkBasemap, density = density)
+    style.addImage(MapLibreTransitIds.ICON_DEPOT_PATTERN, patternBmp)
+
+    // 1. Delicate warm-tinted architectural veil
+    if (style.getLayer(MapLibreTransitIds.DEPOTS_FILL_LAYER) == null) {
+        style.addLayer(
+            FillLayer(MapLibreTransitIds.DEPOTS_FILL_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
+                PropertyFactory.fillColor(
+                    if (isDarkBasemap) "#F59E0B" else "#B45309",
+                ),
+                PropertyFactory.fillOpacity(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(9.8, 0.03f),
+                        Expression.stop(11.5, if (isDarkBasemap) 0.065f else 0.06f),
+                        Expression.stop(15.0, if (isDarkBasemap) 0.085f else 0.075f),
+                    ),
+                ),
+                PropertyFactory.fillAntialias(true),
+            ),
+        )
+    }
+
+    // 2. Crisp diagonal micro-hatch emerging gently from neighborhood zoom onward
+    if (style.getLayer(MapLibreTransitIds.DEPOTS_PATTERN_LAYER) == null) {
+        style.addLayer(
+            FillLayer(MapLibreTransitIds.DEPOTS_PATTERN_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
+                PropertyFactory.fillPattern(MapLibreTransitIds.ICON_DEPOT_PATTERN),
+                PropertyFactory.fillOpacity(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(10.5, 0.0f),
+                        Expression.stop(12.0, 0.72f),
+                        Expression.stop(15.0, 0.88f),
+                    ),
+                ),
+            ),
+        )
+    }
+
+    // 3. Hairline dashed perimeter matching the exact depot geofence boundary
+    if (style.getLayer(MapLibreTransitIds.DEPOTS_BORDER_LAYER) == null) {
+        style.addLayer(
+            LineLayer(MapLibreTransitIds.DEPOTS_BORDER_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
+                PropertyFactory.lineColor(
+                    if (isDarkBasemap) "#F59E0B" else "#B45309",
+                ),
+                PropertyFactory.lineOpacity(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(9.8, 0.16f),
+                        Expression.stop(12.2, if (isDarkBasemap) 0.34f else 0.38f),
+                        Expression.stop(15.0, if (isDarkBasemap) 0.46f else 0.48f),
+                    ),
+                ),
+                PropertyFactory.lineWidth(
+                    Expression.interpolate(
+                        Expression.linear(),
+                        Expression.zoom(),
+                        Expression.stop(10.0, 0.85f),
+                        Expression.stop(13.5, 1.15f),
+                        Expression.stop(16.5, 1.45f),
+                    ),
+                ),
+                PropertyFactory.lineDasharray(arrayOf(3.2f, 3.2f)),
+                PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+            ),
+        )
+    }
+
+    // 4. Discreet, non-intrusive depot name label (zoom >= 12.2, yields to streets/stops/landmarks)
+    if (style.getLayer(MapLibreTransitIds.DEPOTS_LABEL_LAYER) == null) {
+        style.addLayer(
+            SymbolLayer(MapLibreTransitIds.DEPOTS_LABEL_LAYER, MapLibreTransitIds.DEPOTS_LABELS_SOURCE).apply {
+                minZoom = 12.2f
+                setProperties(
+                    PropertyFactory.textField(Expression.get("name")),
+                    PropertyFactory.textFont(arrayOf("Noto Sans Bold")),
+                    PropertyFactory.textSize(
+                        Expression.interpolate(
+                            Expression.linear(),
+                            Expression.zoom(),
+                            Expression.stop(12.2, 9.6f),
+                            Expression.stop(14.5, 10.8f),
+                            Expression.stop(16.5, 11.6f),
+                        ),
+                    ),
+                    PropertyFactory.textLetterSpacing(0.04f),
+                    PropertyFactory.textColor(
+                        if (isDarkBasemap) "rgba(252, 211, 77, 0.72)" else "rgba(146, 64, 14, 0.76)",
+                    ),
+                    PropertyFactory.textHaloColor(
+                        if (isDarkBasemap) "rgba(10, 14, 22, 0.90)" else "rgba(248, 250, 253, 0.94)",
+                    ),
+                    PropertyFactory.textHaloWidth(1.3f),
+                    PropertyFactory.textMaxWidth(9.0f),
+                    PropertyFactory.textAllowOverlap(false),
+                    PropertyFactory.textIgnorePlacement(false),
+                    PropertyFactory.textOptional(true),
+                )
+            },
+        )
+    }
+}
+
+internal fun setGttDepotsVisibility(style: Style, visible: Boolean) {
+    val vis = if (visible) Property.VISIBLE else Property.NONE
+    style.getLayer(MapLibreTransitIds.DEPOTS_FILL_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+    style.getLayer(MapLibreTransitIds.DEPOTS_PATTERN_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+    style.getLayer(MapLibreTransitIds.DEPOTS_BORDER_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+    style.getLayer(MapLibreTransitIds.DEPOTS_LABEL_LAYER)?.setProperties(PropertyFactory.visibility(vis))
+}
+
+internal fun applyTransitPaletteToStyle(
+    style: Style,
+    density: Float,
+    palette: RouteColorPalette,
+    preRenderedSprites: Map<String, Bitmap>? = null,
+) {
+    registerTransitSprites(style, density, palette = palette, preRendered = preRenderedSprites)
+    val routeColorExpr = Expression.match(
+        Expression.get("dir"),
+        Expression.literal(palette.primaryHex),
+        Expression.stop(1, Expression.literal(palette.secondaryHex)),
+    )
+    val routeGlowExpr = Expression.match(
+        Expression.get("dir"),
+        Expression.literal(palette.primaryGlowRgba),
+        Expression.stop(1, Expression.literal(palette.secondaryGlowRgba)),
+    )
+    val isStopSelected = Expression.eq(Expression.get("isSelected"), Expression.literal(true))
+    val isStopFav = Expression.eq(Expression.get("isFav"), Expression.literal(true))
+    style.getLayer(MapLibreTransitIds.ROUTE_CORE_LAYER)?.setProperties(PropertyFactory.lineColor(routeColorExpr))
+    style.getLayer(MapLibreTransitIds.ROUTE_GLOW_LAYER)?.setProperties(PropertyFactory.lineColor(routeGlowExpr))
+    style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER)?.setProperties(
+        PropertyFactory.circleColor(
+            Expression.switchCase(
+                isStopFav,
+                Expression.literal("#EC4899"),
+                Expression.literal(palette.primaryHex),
+            ),
+        ),
+    )
+    style.getLayer(MapLibreTransitIds.STOPS_DOT_LAYER)?.setProperties(
+        PropertyFactory.circleStrokeColor(
+            Expression.switchCase(
+                Expression.all(isStopSelected, isStopFav),
+                Expression.literal("#FFFFFF"),
+                isStopFav,
+                Expression.literal("#FFFFFF"),
+                isStopSelected,
+                Expression.literal(palette.primaryHex),
+                routeColorExpr,
+            ),
+        ),
+    )
+}
+
+internal fun installTransitLayers(
+    style: Style,
+    isDarkBasemap: Boolean,
+    palette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
+) {
     if (style.getSource(MapLibreTransitIds.ROUTE_SOURCE) == null) {
         style.addSource(GeoJsonSource(MapLibreTransitIds.ROUTE_SOURCE))
     }
@@ -1230,13 +1516,13 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
 
     val routeColorExpr = Expression.match(
         Expression.get("dir"),
-        Expression.literal("#FFB300"),
-        Expression.stop(1, Expression.literal("#38BDF8")),
+        Expression.literal(palette.primaryHex),
+        Expression.stop(1, Expression.literal(palette.secondaryHex)),
     )
     val routeGlowExpr = Expression.match(
         Expression.get("dir"),
-        Expression.literal("rgba(255, 179, 0, 0.24)"),
-        Expression.stop(1, Expression.literal("rgba(56, 189, 248, 0.24)")),
+        Expression.literal(palette.primaryGlowRgba),
+        Expression.stop(1, Expression.literal(palette.secondaryGlowRgba)),
     )
     val routeOffsetExpr = Expression.match(
         Expression.get("offsetSign"),
@@ -1412,8 +1698,8 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
     )
     val stopStrokeColor = Expression.match(
         Expression.get("dir"),
-        Expression.literal("#FFB300"),
-        Expression.stop(1, Expression.literal("#38BDF8")),
+        Expression.literal(palette.primaryHex),
+        Expression.stop(1, Expression.literal(palette.secondaryHex)),
     )
 
     if (style.getLayer(MapLibreTransitIds.STOPS_HALO_LAYER) == null) {
@@ -1423,7 +1709,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                     Expression.switchCase(
                         isStopFav,
                         Expression.literal("#EC4899"),
-                        Expression.literal("#FFB300"),
+                        Expression.literal(palette.primaryHex),
                     ),
                 ),
                 PropertyFactory.circleOpacity(
@@ -1473,7 +1759,7 @@ internal fun installTransitLayers(style: Style, isDarkBasemap: Boolean) {
                         isStopFav,
                         Expression.literal("#FFFFFF"),
                         isStopSelected,
-                        Expression.literal("#FFB300"),
+                        Expression.literal(palette.primaryHex),
                         stopStrokeColor,
                     ),
                 ),
@@ -1824,16 +2110,15 @@ internal fun buildBusesFeatureCollection(
         val isSelected = bus.vehicleId == selectedVehicleId
         val health = busHealthById[bus.vehicleId]
         val isDepotOrOffRoute = health != null && (health.isInDepot || health.isOffRoute)
-        val isStaleGps = health != null && !isDepotOrOffRoute && health.isStaleGps
-        val isStuck = health != null && !isDepotOrOffRoute && !isStaleGps && health.isStuck
-        val isAtTerminus = health != null && !isDepotOrOffRoute && !isStaleGps && !isStuck && health.isAtTerminus
+        val isBlockedWarning = health != null && !isDepotOrOffRoute && health.showBlockedWarningOnMap
+        val isAtTerminus = health != null && !isDepotOrOffRoute && !isBlockedWarning && health.isAtTerminus
         val resolvedDir = resolvedDirectionById[bus.vehicleId] ?: bus.directionId
         val isCyan = colorByDirection && resolvedDir == 1
-        val isMovingArrow = bearing != null && !isDepotOrOffRoute && !isStaleGps && !isStuck && !isAtTerminus
+        val isMovingArrow = bearing != null && !isDepotOrOffRoute && !isBlockedWarning && !isAtTerminus
 
         val iconId = when {
             isDepotOrOffRoute -> if (isSelected) MapLibreTransitIds.ICON_DEPOT_SEL else MapLibreTransitIds.ICON_DEPOT
-            isStaleGps -> if (isSelected) MapLibreTransitIds.ICON_STALE_SEL else MapLibreTransitIds.ICON_STALE
+            isBlockedWarning -> if (isSelected) MapLibreTransitIds.ICON_STALE_SEL else MapLibreTransitIds.ICON_STALE
             isAtTerminus -> when {
                 isCyan && isSelected -> MapLibreTransitIds.ICON_TERMINUS_CYAN_SEL
                 isCyan -> MapLibreTransitIds.ICON_TERMINUS_CYAN
@@ -1855,10 +2140,10 @@ internal fun buildBusesFeatureCollection(
         }
 
         val markerOpacity = when {
-            isSelected && (isStuck || isStaleGps || isDepotOrOffRoute) -> 0.90
+            isSelected && (isBlockedWarning || isDepotOrOffRoute) -> 0.92
             isSelected -> 1.0
-            isStuck -> 0.45
-            isStaleGps || isDepotOrOffRoute -> 0.62
+            isBlockedWarning -> 0.68
+            isDepotOrOffRoute -> 0.62
             else -> 1.0
         }
 
@@ -1866,7 +2151,7 @@ internal fun buildBusesFeatureCollection(
         val label = if (showVehicleLabels) "#$displayId" else ""
         val sortKey = when {
             isSelected -> 100
-            isDepotOrOffRoute || isStaleGps || isStuck -> 1
+            isDepotOrOffRoute || isBlockedWarning -> 1
             isAtTerminus -> 6
             else -> 10
         }

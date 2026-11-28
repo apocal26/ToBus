@@ -327,6 +327,10 @@ internal class SourceHealthTracker {
             var eligibleFocusCount = 0
             var recentlyMovedFocusCount = 0
 
+            // Measure elapsed stationary/frozen spans against this source's ACTUAL last recorded
+            // poll (`mem.lastPollAtMillis`), not the wall clock of an interleaved MQTT overlay tick,
+            // so a healthy 25s-polled HTTP feed never falsely ages into `stuck` before its next poll.
+            val evalNow = mem.lastPollAtMillis
             for (v in currentVehicles) {
                 val vid = GtfsRtProtobufParser.canonicalFleetId(v.vehicleId)
                 if (vid.isEmpty()) continue
@@ -335,9 +339,9 @@ internal class SourceHealthTracker {
                 nonDepotCount++
                 latestPositions[vid] = rec.lat to rec.lon
 
-                val seenDurationMs = nowMillis - rec.firstObservedInSourceMillis
-                val stationaryMs = nowMillis - rec.firstSeenAtPositionMillis
-                val sinceLastMoveMs = nowMillis - rec.lastMovedAtMillis
+                val seenDurationMs = (evalNow - rec.firstObservedInSourceMillis).coerceAtLeast(0L)
+                val stationaryMs = (evalNow - rec.firstSeenAtPositionMillis).coerceAtLeast(0L)
+                val sinceLastMoveMs = (evalNow - rec.lastMovedAtMillis).coerceAtLeast(0L)
 
                 if (rec.hasEverMoved && sinceLastMoveMs <= RECENT_MOVEMENT_WINDOW_MS) {
                     confirmedMoving.add(vid)
@@ -359,8 +363,8 @@ internal class SourceHealthTracker {
                 }
             }
 
-            val observedSpanMs = nowMillis - mem.firstPollAtMillis
-            val frozenForMs = (nowMillis - mem.lastAnyMovementAtMillis).coerceAtLeast(0L)
+            val observedSpanMs = (evalNow - mem.firstPollAtMillis).coerceAtLeast(0L)
+            val frozenForMs = (evalNow - mem.lastAnyMovementAtMillis).coerceAtLeast(0L)
             val fleetFrozen = mem.distinctPollCount >= MIN_POLLS_FOR_FREEZE &&
                 observedSpanMs >= FREEZE_DURATION_THRESHOLD_MS &&
                 eligibleFleetCount >= MIN_FLEET_VEHICLES_FOR_FREEZE &&

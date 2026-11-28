@@ -10,13 +10,17 @@ import com.example.data.model.DataSourceMode
 import com.example.data.model.DataSourceStatus
 import com.example.data.model.FavoriteStop
 import com.example.data.model.GttDataOutageReport
+import com.example.data.model.GttDepot
 import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LineSummary
 import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
+import com.example.data.model.RouteColorPalette
 import com.example.data.model.RoutePattern
+import com.example.data.model.ServiceAlertCategory
 import com.example.data.model.ServiceAlertInfo
+import com.example.data.model.ServiceAlertOrganizer
 import com.example.data.model.StopArrival
 import com.example.data.model.StopSearchEntry
 import com.example.data.model.TransitStop
@@ -97,10 +101,12 @@ data class ToBusUiState(
     val lineVehicles: List<BusVehicle> = emptyList(),
     val allActiveLines: List<LineSummary> = emptyList(),
     val routePatterns: List<RoutePattern> = emptyList(),
+    val depotZones: List<GttDepot> = emptyList(),
     val stopNames: Map<String, String> = emptyMap(),
     val sourceStatuses: List<DataSourceStatus> = emptyList(),
     val allAlerts: List<ServiceAlertInfo> = emptyList(),
     val lineAlerts: List<ServiceAlertInfo> = emptyList(),
+    val isRefreshingAlerts: Boolean = false,
     val selectedVehicleId: String? = null,
     val focusedExternalVehicle: BusVehicle? = null,
     val focusedExternalTerminus: String? = null,
@@ -257,6 +263,17 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     init {
         if (initialSettings.hasSelectedLine) {
             loadRouteGeometry(initialSettings.selectedLine, isInitialRouteLoad = true)
+        }
+        // Hydrate verified OSM GTT depot compound polygons (instant from 30-day disk cache, or Overpass fetch).
+        viewModelScope.launch(Dispatchers.IO) {
+            val cachedDepots = repository.getCachedVerifiedDepotsFast()
+            if (cachedDepots.isNotEmpty()) {
+                _uiState.update { it.copy(depotZones = cachedDepots) }
+            }
+            val loadedDepots = repository.ensureDepotPolygonsLoaded()
+            if (loadedDepots.isNotEmpty() && loadedDepots != _uiState.value.depotZones) {
+                _uiState.update { it.copy(depotZones = loadedDepots) }
+            }
         }
         // Hydrate active line list immediately from tiny disk cache or static GTFS routes.txt (~1.5 KB)
         // for instant Line Picker before the first live HTTP poll completes.
@@ -541,6 +558,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                                 vehicles = rawLineVehicles,
                                 routePatterns = currentPatterns,
                                 nowMillis = evalNowMillis,
+                                healthyOfficialGtfsOnline = snapshot.healthyOfficialGtfsOnline,
                             )
                         }
 
@@ -720,6 +738,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 vehicles = rawLineVehicles,
                 routePatterns = currentPatterns,
                 nowMillis = evalNowMillis,
+                healthyOfficialGtfsOnline = snapshot.healthyOfficialGtfsOnline,
             )
 
             if (snapshot.allVehicles.isNotEmpty()) {
@@ -771,6 +790,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         val cleaned = com.example.data.network.GtfsRtProtobufParser.normalizeGttLineCode(raw)
             .takeIf { it.isNotBlank() && it != "?" } ?: raw
         val updated = preferences.updateSettings { it.copy(selectedLine = cleaned) }
+        repository.notifyFocusLineSwitched(cleaned)
         if (GttRealtimeRepository.shouldRunMatoStream(updated.dataSourceMode)) {
             repository.startMatoLiveStream(cleaned) { onMatoLivePush() }
             repository.updateMatoLiveLine(cleaned)
@@ -794,15 +814,11 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             }
             ?.sortedBy { it.vehicleId }
             .orEmpty()
-        val candidatePatterns = if (isSameLoadedLine) {
-            previousState.routePatterns
-        } else {
-            repository.getMemoryCachedRoutePatterns(cleaned)
-        }
         val filtered = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
             vehicles = rawFiltered,
-            routePatterns = candidatePatterns,
+            routePatterns = if (isSameLoadedLine) previousState.routePatterns else emptyList(),
             nowMillis = System.currentTimeMillis(),
+            healthyOfficialGtfsOnline = cachedSnapshot?.healthyOfficialGtfsOnline ?: false,
         )
 
         val allAlerts = if (updated.showServiceAlerts) cachedSnapshot?.alerts.orEmpty() else emptyList()
@@ -845,7 +861,17 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
         syncLinePickerState()
 
         if (!isSameLoadedLine) {
-            loadRouteGeometry(cleaned, isInitialRouteLoad = true)
+            val initialLiveTripIds = filtered
+                .mapNotNull { it.tripId?.trim()?.takeIf { t -> t.isNotEmpty() } }
+                .toSet()
+            if (initialLiveTripIds.isNotEmpty()) {
+                hasVerifiedLiveRouteForLine = cleaned
+            }
+            loadRouteGeometry(
+                lineCode = cleaned,
+                activeTripIds = initialLiveTripIds,
+                isInitialRouteLoad = true,
+            )
         }
         resolveMissingVehicleStopNames(filtered)
         if (filtered.isEmpty() || updated.dataSourceMode == DataSourceMode.MATO_LIVE) {
@@ -917,6 +943,21 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
                 if (patterns.isNotEmpty()) {
+                    val existingPatterns = _uiState.value.routePatterns
+                    val isUnchangedRefresh = !isInitialRouteLoad &&
+                        !needsRouteRefit &&
+                        existingPatterns.size == patterns.size &&
+                        existingPatterns.indices.all { i ->
+                            val a = existingPatterns[i]
+                            val b = patterns[i]
+                            a.id == b.id &&
+                                a.directionId == b.directionId &&
+                                a.stops.size == b.stops.size &&
+                                a.points.size == b.points.size
+                        }
+                    if (isUnchangedRefresh) {
+                        return@launch
+                    }
                     val shouldRefit = needsRouteRefit &&
                         _uiState.value.selectedStop == null &&
                         _uiState.value.selectedVehicleId == null
@@ -936,14 +977,20 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         null
                     }
+                    val postRouteDrops = mutableListOf<Pair<BusVehicle, String>>()
                     _uiState.update { state ->
                         if (state.lineSelectionEpoch != epochAtStart) return@update state
                         val evalNow = System.currentTimeMillis()
-                        val cleanedVehicles = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
+                        val audit = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhostsWithAudit(
                             vehicles = state.lineVehicles,
                             routePatterns = patterns,
                             nowMillis = evalNow,
+                            healthyOfficialGtfsOnline = repository.getLastCachedSnapshot()?.healthyOfficialGtfsOnline ?: false,
                         )
+                        val cleanedVehicles = audit.kept
+                        if (audit.dropped.isNotEmpty() && postRouteDrops.isEmpty()) {
+                            postRouteDrops.addAll(audit.dropped)
+                        }
                         val keepSel = state.selectedVehicleId?.takeIf { selId ->
                             cleanedVehicles.any { it.vehicleId == selId } ||
                                 state.focusedExternalVehicle?.vehicleId == selId
@@ -956,6 +1003,14 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                             isLoadingInitialRoute = false,
                             camera = fittedTarget ?: state.camera,
                             cameraFlyRequest = refitFly ?: state.cameraFlyRequest,
+                        )
+                    }
+                    if (postRouteDrops.isNotEmpty()) {
+                        com.example.data.network.ToBusDiagnosticsLog.record(
+                            category = com.example.data.network.DiagCategory.VEHICLE,
+                            message = "Percorso L.$lineCode caricato → scartati ${postRouteDrops.size} mezzi",
+                            detail = postRouteDrops.joinToString(", ") { (b, r) -> "#${b.vehicleId}:$r" },
+                            severity = com.example.data.network.DiagSeverity.WARN,
                         )
                     }
                     regenerateWidgetPreview()
@@ -1497,12 +1552,42 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     fun setShowRouteLine(show: Boolean) {
         val updated = preferences.updateSettings { it.copy(showRouteLine = show) }
         _uiState.update { it.copy(settings = updated) }
-        regenerateWidgetPreview()
-        requestWidgetUpdatesAsync(includeMap = true)
+    }
+
+    fun setShowStopsOnMap(show: Boolean) {
+        val updated = preferences.updateSettings { it.copy(showStopsOnMap = show) }
+        _uiState.update { it.copy(settings = updated) }
+    }
+
+    fun setShowDepotsOnMap(show: Boolean) {
+        val updated = preferences.updateSettings { it.copy(showDepotsOnMap = show) }
+        _uiState.update { it.copy(settings = updated) }
     }
 
     fun setColorByDirection(enabled: Boolean) {
         val updated = preferences.updateSettings { it.copy(colorByDirection = enabled) }
+        _uiState.update { it.copy(settings = updated) }
+        regenerateWidgetPreview()
+        requestWidgetUpdatesAsync(includeMap = true, includeStops = true)
+    }
+
+    fun setRouteColorPalette(palette: RouteColorPalette) {
+        if (_uiState.value.settings.routeColorPalette == palette) return
+        val updated = preferences.updateSettings { it.copy(routeColorPalette = palette) }
+        _uiState.update { it.copy(settings = updated) }
+        regenerateWidgetPreview()
+        requestWidgetUpdatesAsync(includeMap = true)
+    }
+
+    fun setShowRouteInWidget(show: Boolean) {
+        val updated = preferences.updateSettings { it.copy(showRouteInWidget = show) }
+        _uiState.update { it.copy(settings = updated) }
+        regenerateWidgetPreview()
+        requestWidgetUpdatesAsync(includeMap = true)
+    }
+
+    fun setShowFavoriteStopsInWidget(show: Boolean) {
+        val updated = preferences.updateSettings { it.copy(showFavoriteStopsInWidget = show) }
         _uiState.update { it.copy(settings = updated) }
         regenerateWidgetPreview()
         requestWidgetUpdatesAsync(includeMap = true)
@@ -1625,6 +1710,77 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 enabled = false,
                 hasFavoriteLines = false,
             )
+        }
+    }
+
+    fun toggleNotifyAlertCategory(category: ServiceAlertCategory) {
+        val current = preferences.currentSettings().notifyAlertCategories
+        val next = if (category in current) current - category else current + category
+        updateNotifyAlertCategories(next, newlyAdded = if (category !in current) setOf(category) else emptySet())
+    }
+
+    fun toggleAllNotifyAlertCategories(selectAll: Boolean) {
+        val current = preferences.currentSettings().notifyAlertCategories
+        val all = ServiceAlertCategory.entries.toSet()
+        val next = if (selectAll) all else emptySet()
+        updateNotifyAlertCategories(next, newlyAdded = next - current)
+    }
+
+    private fun updateNotifyAlertCategories(
+        next: Set<ServiceAlertCategory>,
+        newlyAdded: Set<ServiceAlertCategory>,
+    ) {
+        val updated = preferences.updateSettings { it.copy(notifyAlertCategories = next) }
+        _uiState.update { it.copy(settings = updated) }
+        if (updated.notifyFavoriteLineAlerts && newlyAdded.isNotEmpty()) {
+            val favorites = _uiState.value.favoriteLines
+            viewModelScope.launch(Dispatchers.IO) {
+                val active = _uiState.value.allAlerts
+                    .ifEmpty { repository.getLastCachedSnapshot()?.alerts.orEmpty() }
+                    .filter { it.classifyCategory() in newlyAdded }
+                if (active.isNotEmpty()) {
+                    FavoriteAlertNotifier.markAlertsSeen(
+                        context = appContext,
+                        alerts = active,
+                        favoriteLines = favorites.ifEmpty { null },
+                    )
+                }
+            }
+        }
+    }
+
+    fun refreshServiceAlerts() {
+        if (!_uiState.value.settings.showServiceAlerts || _uiState.value.isRefreshingAlerts) return
+        _uiState.update { it.copy(isRefreshingAlerts = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val fresh = repository.fetchServiceAlertsNow()
+                if (fresh != null) {
+                    val activeLine = preferences.currentSettings().selectedLine
+                    val lineAlerts = if (activeLine.isBlank()) {
+                        emptyList()
+                    } else {
+                        filterAlertsForLine(fresh, activeLine)
+                    }
+                    _uiState.update { state ->
+                        state.copy(
+                            allAlerts = fresh,
+                            lineAlerts = lineAlerts,
+                            isRefreshingAlerts = false,
+                        )
+                    }
+                    FavoriteAlertsWidgetProvider.syncWithAlerts(appContext, fresh)
+                } else {
+                    _uiState.update { state ->
+                        state.copy(
+                            isRefreshingAlerts = false,
+                            statusToast = "Impossibile aggiornare gli avvisi GTT ora",
+                        )
+                    }
+                }
+            } catch (_: Exception) {
+                _uiState.update { it.copy(isRefreshingAlerts = false) }
+            }
         }
     }
 

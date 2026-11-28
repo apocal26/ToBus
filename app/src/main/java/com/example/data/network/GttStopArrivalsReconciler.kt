@@ -119,8 +119,7 @@ internal object GttStopArrivalsReconciler {
             val health = GttFleetAnalyzer.assess(bus, targetLinePatterns, nowMillis)
             if (health.isInDepot ||
                 health.isStaleGps ||
-                GttFleetAnalyzer.isConfirmedMatoPhantom(bus, targetLinePatterns, nowMillis) ||
-                GttFleetAnalyzer.isConfirmedDeadGhost(bus, targetLinePatterns, nowMillis)
+                GttFleetAnalyzer.isConfirmedMatoPhantom(bus, targetLinePatterns, nowMillis)
             ) {
                 return false
             }
@@ -179,8 +178,7 @@ internal object GttStopArrivalsReconciler {
             val candidateHealth = GttFleetAnalyzer.assess(bus, targetLinePatterns, nowMillis)
             if (candidateHealth.isInDepot ||
                 candidateHealth.isStaleGps ||
-                GttFleetAnalyzer.isConfirmedMatoPhantom(bus, targetLinePatterns, nowMillis) ||
-                GttFleetAnalyzer.isConfirmedDeadGhost(bus, targetLinePatterns, nowMillis)
+                GttFleetAnalyzer.isConfirmedMatoPhantom(bus, targetLinePatterns, nowMillis)
             ) {
                 return@mapNotNull null
             }
@@ -243,7 +241,7 @@ internal object GttStopArrivalsReconciler {
         val prefOriginPoint = dirPattern?.stops?.firstOrNull()?.let { GeoPoint(it.lat, it.lon) }
             ?: dirPattern?.points?.firstOrNull()
 
-        val prefLineVehicles = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
+        val prefLineVehicles = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
             vehicles = liveVehicles.filter {
                 it.lineCode.equals(normPref, ignoreCase = true) ||
                     it.rawRouteId.equals(normPref, ignoreCase = true)
@@ -319,7 +317,7 @@ internal object GttStopArrivalsReconciler {
             }
             val otherOriginPoint = otherDirPat?.stops?.firstOrNull()?.let { GeoPoint(it.lat, it.lon) }
                 ?: otherDirPat?.points?.firstOrNull()
-            val otherBuses = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
+            val otherBuses = GttFleetAnalyzer.filterOutConfirmedMatoPhantoms(
                 vehicles = reliableLiveByLine[lineKey].orEmpty(),
                 routePatterns = patterns,
                 nowMillis = nowMillis,

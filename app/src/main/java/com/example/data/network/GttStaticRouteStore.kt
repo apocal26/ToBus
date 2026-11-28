@@ -638,17 +638,19 @@ class GttStaticRouteStore(context: Context) {
                     val idxShapeId = cols["shape_id"] ?: -1
                     val idxHeadsign = cols["trip_headsign"] ?: -1
 
+                    val wantedRoutesArr = matchingRouteIds.toTypedArray()
                     var line = reader.readLine()
                     while (line != null) {
-                        if (line.isNotBlank()) {
-                            val fields = parseCsvLine(line)
-                            val routeId = fields.getOrNull(idxRouteId)?.trim().orEmpty()
-                            if (routeId in matchingRouteIds) {
-                                val parsedDirId = if (idxDirId >= 0) {
-                                    fields.getOrNull(idxDirId)?.trim()?.toIntOrNull()
-                                } else {
-                                    null
-                                }
+                        if (line.isNotEmpty()) {
+                            if (idxRouteId != 0 || matchesFirstCsvColumn(line, wantedRoutesArr)) {
+                                val fields = parseCsvLine(line)
+                                val routeId = fields.getOrNull(idxRouteId)?.trim().orEmpty()
+                                if (routeId in matchingRouteIds) {
+                                    val parsedDirId = if (idxDirId >= 0) {
+                                        fields.getOrNull(idxDirId)?.trim()?.toIntOrNull()
+                                    } else {
+                                        null
+                                    }
                                 if (parsedDirId != null) hasExplicitDirectionId = true
                                 val dirId = parsedDirId ?: 0
                                 val shapeId = if (idxShapeId >= 0) fields.getOrNull(idxShapeId)?.trim().orEmpty() else ""
@@ -698,6 +700,7 @@ class GttStaticRouteStore(context: Context) {
                                 } else if (tripId.isNotEmpty() && (!fallbackTripByDir.containsKey(dirId) || isTodayTrip || isLiveTrip)) {
                                     fallbackTripByDir[dirId] = tripId
                                 }
+                            }
                             }
                         }
                         line = reader.readLine()
@@ -749,8 +752,9 @@ class GttStaticRouteStore(context: Context) {
                 val rawShapePoints = HashMap<String, MutableList<Pair<Int, GeoPoint>>>(wantedIds.size)
                 wantedIds.forEach { rawShapePoints[it] = ArrayList(256) }
 
+                val wantedIdsArr = wantedIds.toTypedArray()
                 zip.getInputStream(shapesEntry).use { stream ->
-                    BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 64 * 1024).use { reader ->
+                    BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 128 * 1024).use { reader ->
                         val headerLine = reader.readLine() ?: return emptyList()
                         val cols = parseCsvHeader(headerLine)
                         val idxShapeId = cols["shape_id"] ?: return emptyList()
@@ -761,15 +765,8 @@ class GttStaticRouteStore(context: Context) {
                         var line = reader.readLine()
                         var seqFallback = 0
                         while (line != null) {
-                            if (line.isNotBlank()) {
-                                val quickId = if (idxShapeId == 0) {
-                                    val comma = line.indexOf(',')
-                                    if (comma > 0) line.substring(0, comma).trim().removeSurrounding("\"") else null
-                                } else {
-                                    null
-                                }
-
-                                if (quickId == null || quickId in wantedIds) {
+                            if (line.isNotEmpty()) {
+                                if (idxShapeId != 0 || matchesFirstCsvColumn(line, wantedIdsArr)) {
                                     val fields = parseCsvLine(line)
                                     val shapeId = fields.getOrNull(idxShapeId)?.trim().orEmpty()
                                     val list = rawShapePoints[shapeId]
@@ -870,8 +867,9 @@ class GttStaticRouteStore(context: Context) {
         val dirByTrip = tripByDir.entries.associate { (d, t) -> t to d.coerceIn(0, 1) }
         val tripStops = HashMap<String, MutableList<Pair<Int, String>>>()
 
+        val wantedTripsArr = wantedTrips.toTypedArray()
         zip.getInputStream(stopTimesEntry).use { stream ->
-            BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 64 * 1024).use { reader ->
+            BufferedReader(InputStreamReader(stream, StandardCharsets.UTF_8), 128 * 1024).use { reader ->
                 val header = reader.readLine() ?: return emptyMap()
                 val cols = parseCsvHeader(header)
                 val idxTrip = cols["trip_id"] ?: return emptyMap()
@@ -881,14 +879,8 @@ class GttStaticRouteStore(context: Context) {
                 var line = reader.readLine()
                 var seqFallback = 0
                 while (line != null) {
-                    if (line.isNotBlank()) {
-                        val quickTrip = if (idxTrip == 0) {
-                            val comma = line.indexOf(',')
-                            if (comma > 0) line.substring(0, comma).trim().removeSurrounding("\"") else null
-                        } else {
-                            null
-                        }
-                        if (quickTrip == null || quickTrip in wantedTrips) {
+                    if (line.isNotEmpty()) {
+                        if (idxTrip != 0 || matchesFirstCsvColumn(line, wantedTripsArr)) {
                             val fields = parseCsvLine(line)
                             val tripId = fields.getOrNull(idxTrip)?.trim().orEmpty()
                             if (tripId in wantedTrips) {
@@ -933,22 +925,38 @@ class GttStaticRouteStore(context: Context) {
 
                 var line = reader.readLine()
                 while (line != null) {
-                    if (line.isNotBlank()) {
-                        val fields = parseCsvLine(line)
-                        val stopId = fields.getOrNull(idxStop)?.trim().orEmpty()
-                        if (stopId in neededStopIds) {
-                            val lat = fields.getOrNull(idxLat)?.trim()?.toDoubleOrNull()
-                            val lon = fields.getOrNull(idxLon)?.trim()?.toDoubleOrNull()
-                            if (lat != null && lon != null && lat in 44.0..46.0 && lon in 6.5..9.0) {
-                                val code = if (idxCode >= 0) fields.getOrNull(idxCode)?.trim().orEmpty() else ""
-                                val name = if (idxName >= 0) fields.getOrNull(idxName)?.trim().orEmpty() else ""
-                                stopMeta[stopId] = RawStopMeta(
-                                    stopId = stopId,
-                                    stopCode = code.ifBlank { stopId },
-                                    name = name.ifBlank { "Fermata $stopId" },
-                                    lat = lat,
-                                    lon = lon,
-                                )
+                    if (line.isNotEmpty()) {
+                        val quickStop = if (idxStop == 0) {
+                            val comma = line.indexOf(',')
+                            if (comma > 0) {
+                                if (line[0] == '"' && comma >= 2 && line[comma - 1] == '"') {
+                                    line.substring(1, comma - 1).trim()
+                                } else {
+                                    line.substring(0, comma).trim()
+                                }
+                            } else {
+                                null
+                            }
+                        } else {
+                            null
+                        }
+                        if (quickStop == null || quickStop in neededStopIds) {
+                            val fields = parseCsvLine(line)
+                            val stopId = fields.getOrNull(idxStop)?.trim().orEmpty()
+                            if (stopId in neededStopIds) {
+                                val lat = fields.getOrNull(idxLat)?.trim()?.toDoubleOrNull()
+                                val lon = fields.getOrNull(idxLon)?.trim()?.toDoubleOrNull()
+                                if (lat != null && lon != null && lat in 44.0..46.0 && lon in 6.5..9.0) {
+                                    val code = if (idxCode >= 0) fields.getOrNull(idxCode)?.trim().orEmpty() else ""
+                                    val name = if (idxName >= 0) fields.getOrNull(idxName)?.trim().orEmpty() else ""
+                                    stopMeta[stopId] = RawStopMeta(
+                                        stopId = stopId,
+                                        stopCode = code.ifBlank { stopId },
+                                        name = name.ifBlank { "Fermata $stopId" },
+                                        lat = lat,
+                                        lon = lon,
+                                    )
+                                }
                             }
                         }
                     }
@@ -972,6 +980,35 @@ class GttStaticRouteStore(context: Context) {
                 )
             }
         }
+    }
+
+    /**
+     * Zero-allocation check whether the first CSV column of [line] matches any target in [wanted].
+     * Eliminates millions of temporary substring/trim allocations when scanning `stop_times.txt`
+     * and `shapes.txt` inside the local GTFS zip.
+     */
+    private fun matchesFirstCsvColumn(line: String, wanted: Array<String>): Boolean {
+        val comma = line.indexOf(',')
+        if (comma <= 0) return false
+        var start = 0
+        var end = comma
+        while (start < end && line[start] <= ' ') start++
+        while (end > start && line[end - 1] <= ' ') end--
+        if (end - start >= 2 && line[start] == '"' && line[end - 1] == '"') {
+            start++
+            end--
+            while (start < end && line[start] <= ' ') start++
+            while (end > start && line[end - 1] <= ' ') end--
+        }
+        val len = end - start
+        if (len <= 0) return false
+        for (i in wanted.indices) {
+            val w = wanted[i]
+            if (w.length == len && line.regionMatches(start, w, 0, len)) {
+                return true
+            }
+        }
+        return false
     }
 
     internal fun extractStopNamesFromZip(
@@ -1719,10 +1756,10 @@ class GttStaticRouteStore(context: Context) {
             if (normPref.isNotEmpty() && normPref in entry.searchLinesUpper) {
                 score += 18.0
             }
-            val dist = if (hasUserLoc) {
+            val dist = if (userLat != null && userLon != null) {
                 val d = com.example.data.model.GttFleetAnalyzer.haversineMeters(
-                    userLat!!,
-                    userLon!!,
+                    userLat,
+                    userLon,
                     entry.lat,
                     entry.lon,
                 )

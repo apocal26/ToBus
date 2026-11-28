@@ -263,12 +263,12 @@ class GttOutageAndDiagnosticsTest {
     @Test
     fun diagnosticsLog_capsRingBufferFiltersCategoriesAndFormatsReport() {
         ToBusDiagnosticsLog.clear()
-        repeat(260) { idx ->
+        repeat(ToBusDiagnosticsLog.MAX_ENTRIES + 40) { idx ->
             val cat = if (idx % 2 == 0) DiagCategory.POLL else DiagCategory.MQTT
             ToBusDiagnosticsLog.record(cat, "Event #$idx", detail = "d=$idx", severity = DiagSeverity.INFO)
         }
-        // Ring buffer stays bounded (<= 220)
-        assertEquals(220, ToBusDiagnosticsLog.count())
+        // Ring buffer stays bounded (<= MAX_ENTRIES)
+        assertEquals(ToBusDiagnosticsLog.MAX_ENTRIES, ToBusDiagnosticsLog.count())
 
         val mqttOnly = ToBusDiagnosticsLog.snapshot(categories = setOf(DiagCategory.MQTT))
         assertTrue(mqttOnly.isNotEmpty())

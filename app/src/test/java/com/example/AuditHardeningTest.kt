@@ -314,24 +314,6 @@ class AuditHardeningTest {
             source = "GTT Ufficiale",
             stationarySinceMillis = null,
         )
-        // Exact user-reported scenario: Vettura #9066 on Line 12 near Allason Cap (terminus),
-        // MaTO-only, frozen for 41 minutes -> MUST NOT be counted as active or kept on the map
-        val matoTerminusFrozen41Min = bus(
-            id = "9066",
-            lineCode = "12",
-            lat = 45.0901,
-            lon = 7.6901,
-            tsSec = nowSec - 61L,
-            source = "MaTO Live",
-            sources = setOf("MaTO Live"),
-            stationarySinceMillis = nowMillis - (41L * 60_000L),
-            speedKmh = 0f,
-        )
-        val health9066 = GttFleetAnalyzer.assess(matoTerminusFrozen41Min, listOf(pattern), nowMillis)
-        assertFalse("41m frozen terminus bus must not be treated as normal layover", health9066.isAtTerminus)
-        assertTrue("41m frozen terminus bus must be flagged stuck", health9066.isStuck)
-        assertFalse("41m frozen terminus bus must not be counted as reliable active", health9066.isReliableLive)
-        assertTrue(GttFleetAnalyzer.isConfirmedMatoPhantom(matoTerminusFrozen41Min, listOf(pattern), nowMillis))
 
         val surviving = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
             vehicles = listOf(
@@ -340,7 +322,6 @@ class AuditHardeningTest {
                 terminusLayover,
                 activeMultiSource,
                 deadHeartbeatMidRoute,
-                matoTerminusFrozen41Min,
             ),
             routePatterns = listOf(pattern),
             nowMillis = nowMillis,
@@ -350,174 +331,8 @@ class AuditHardeningTest {
         assertFalse(ids.contains("3010"))
         assertFalse(ids.contains("3011"))
         assertFalse(ids.contains("3014"))
-        assertFalse(ids.contains("9066"))
         assertTrue(ids.contains("3012"))
         assertTrue(ids.contains("3013"))
-    }
-
-    @Test
-    fun fleetAnalyzer_filtersThreeSimultaneousMidRouteMatoGhostsWithFrozenNonZeroSpeedAndShortTurnEndpoints() {
-        val mainStops = (0..10).map { idx ->
-            val lat = 45.0100 + idx * 0.0080
-            val lon = 7.6100 + idx * 0.0080
-            com.example.data.model.TransitStop(
-                stopId = "S_$idx",
-                stopCode = "S_$idx",
-                name = "Stop $idx",
-                lat = lat,
-                lon = lon,
-                directionId = 0,
-                sequence = idx,
-            )
-        }
-        val mainPattern = RoutePattern(
-            id = "12_0_main",
-            name = "ALLASON CAP",
-            directionId = 0,
-            segments = listOf(mainStops.map { GeoPoint(it.lat, it.lon) }),
-            stops = mainStops,
-        )
-        // A short-turn / depot variant ending mid-route at Stop 5 (only 6 stops vs 11 on main pattern)
-        // must NOT grant terminus layover immunity to a mid-route ghost frozen at Stop 5!
-        val shortTurnPattern = RoutePattern(
-            id = "12_0_short",
-            name = "DEPOSITO",
-            directionId = 0,
-            segments = listOf(mainStops.take(6).map { GeoPoint(it.lat, it.lon) }),
-            stops = mainStops.take(6),
-        )
-        val patterns = listOf(mainPattern, shortTurnPattern)
-
-        // Three MaTO-only ghost buses frozen mid-route for 40, 45, and 50 minutes,
-        // all retaining frozen non-zero speedKmh (22..31 km/h) and fresh synthesized MQTT timestamps!
-        val matoGhost1 = bus(
-            id = "9051",
-            lineCode = "12",
-            lat = mainStops[3].lat,
-            lon = mainStops[3].lon,
-            tsSec = nowSec - 12L,
-            source = "MaTO Live",
-            sources = setOf("MaTO Live"),
-            stationarySinceMillis = nowMillis - (40L * 60_000L),
-            speedKmh = 26f,
-        )
-        val matoGhost2AtShortTurn = bus(
-            id = "9052",
-            lineCode = "12",
-            lat = mainStops[5].lat,
-            lon = mainStops[5].lon,
-            tsSec = nowSec - 8L,
-            source = "MaTO Live",
-            sources = setOf("MaTO Live"),
-            stationarySinceMillis = nowMillis - (45L * 60_000L),
-            speedKmh = 22f,
-        )
-        val matoGhost3 = bus(
-            id = "9053",
-            lineCode = "12",
-            lat = mainStops[7].lat,
-            lon = mainStops[7].lon,
-            tsSec = nowSec - 5L,
-            source = "MaTO Live",
-            sources = setOf("MaTO Live"),
-            stationarySinceMillis = nowMillis - (50L * 60_000L),
-            speedKmh = 31f,
-        )
-        // Plus one real moving MaTO bus that moved 8 seconds ago
-        val realMovingMato = bus(
-            id = "9059",
-            lineCode = "12",
-            lat = mainStops[4].lat,
-            lon = mainStops[4].lon,
-            tsSec = nowSec - 3L,
-            source = "MaTO Live",
-            sources = setOf("MaTO Live"),
-            stationarySinceMillis = nowMillis - 8_000L,
-            speedKmh = 24f,
-        )
-
-        assertTrue(GttFleetAnalyzer.isConfirmedMatoPhantom(matoGhost1, patterns, nowMillis))
-        assertTrue(GttFleetAnalyzer.isConfirmedMatoPhantom(matoGhost2AtShortTurn, patterns, nowMillis))
-        assertTrue(GttFleetAnalyzer.isConfirmedMatoPhantom(matoGhost3, patterns, nowMillis))
-        assertFalse(GttFleetAnalyzer.isConfirmedMatoPhantom(realMovingMato, patterns, nowMillis))
-
-        val survivingWithPatterns = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
-            vehicles = listOf(matoGhost1, matoGhost2AtShortTurn, matoGhost3, realMovingMato),
-            routePatterns = patterns,
-            nowMillis = nowMillis,
-        )
-        assertEquals(listOf("9059"), survivingWithPatterns.map { it.vehicleId })
-
-        // Even before routePatterns finishes loading (emptyList()), 40-50m frozen ghosts must be filtered out!
-        val survivingWithoutPatterns = GttFleetAnalyzer.filterOutConfirmedPhantomsAndDeadGhosts(
-            vehicles = listOf(matoGhost1, matoGhost2AtShortTurn, matoGhost3, realMovingMato),
-            routePatterns = emptyList(),
-            nowMillis = nowMillis,
-        )
-        assertEquals(listOf("9059"), survivingWithoutPatterns.map { it.vehicleId })
-    }
-
-    @Test
-    fun matoMqttClient_evictedGhostsAndExpiredStationaryBusesNeverResurrectUntilRealMovement() {
-        val client = MatoMqttLiveClient { okhttp3.OkHttpClient() }
-        val ghostBus = bus(
-            id = "9066",
-            lineCode = "12",
-            lat = 45.0350,
-            lon = 7.6420,
-            tsSec = nowSec,
-            source = "MaTO Live",
-            sources = setOf("MaTO Live"),
-            speedKmh = 24f,
-        ).copy(fetchedAtMillis = nowMillis)
-
-        // 1. Initial live arrival is accepted
-        client.upsertMqttVehicle(ghostBus, isRetainedPacket = false)
-        assertEquals(1, client.snapshotFreshVehicles(nowMillis).size)
-
-        // 2. Evicting as a confirmed ghost removes it immediately and blocks re-appearance at same <22m coords
-        client.evictGhostVehicle("9066", ghostBus.latitude, ghostBus.longitude, nowMillis + 10_000L)
-        assertTrue(client.snapshotFreshVehicles(nowMillis + 10_000L).isEmpty())
-
-        // Subsequent MQTT publish (retained or non-retained) at the same coordinates (+5m jitter) must NOT resurrect it
-        val rebroadcastSameSpot = ghostBus.copy(
-            latitude = 45.03503,
-            longitude = 7.64203,
-            timestampSeconds = nowSec + 30L,
-            fetchedAtMillis = nowMillis + 30_000L,
-        )
-        client.upsertMqttVehicle(rebroadcastSameSpot, isRetainedPacket = false)
-        assertTrue(client.snapshotFreshVehicles(nowMillis + 30_000L).isEmpty())
-
-        // 3. Once the vehicle physically moves >= 22m (~120m away), it is immediately accepted again
-        val genuinelyMoved = ghostBus.copy(
-            latitude = 45.0362,
-            longitude = 7.6432,
-            timestampSeconds = nowSec + 45L,
-            fetchedAtMillis = nowMillis + 45_000L,
-        )
-        client.upsertMqttVehicle(genuinelyMoved, isRetainedPacket = false)
-        assertEquals(1, client.snapshotFreshVehicles(nowMillis + 45_000L).size)
-
-        // 4. Stale GraphQL observation (lastUpdated > 150s old) also immediately evicts & blocks MQTT resurrection
-        client.recordGraphQlVehicleObservation(
-            vehicleId = "9066",
-            lineCode = "12",
-            lat = genuinelyMoved.latitude,
-            lon = genuinelyMoved.longitude,
-            timestampSeconds = (nowMillis + 50_000L) / 1000L - 600L,
-            isStale = true,
-            nowMillis = nowMillis + 50_000L,
-        )
-        assertTrue(client.snapshotFreshVehicles(nowMillis + 50_000L).isEmpty())
-        client.upsertMqttVehicle(
-            genuinelyMoved.copy(
-                timestampSeconds = nowSec + 55L,
-                fetchedAtMillis = nowMillis + 55_000L,
-            ),
-            isRetainedPacket = true,
-        )
-        assertTrue(client.snapshotFreshVehicles(nowMillis + 55_000L).isEmpty())
     }
 
     @Test

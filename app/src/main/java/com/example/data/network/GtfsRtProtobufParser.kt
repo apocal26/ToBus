@@ -745,7 +745,10 @@ object GtfsRtProtobufParser {
                         val iField = iTag ushr 3
                         val iWire = iTag and 0x07
                         if (iField == 2 && iWire == WIRE_LENGTH_DELIMITED) {
-                            lines.add(normalizeGttLineCode(sub.readString()))
+                            val norm = normalizeGttLineCode(sub.readString())
+                            if (norm.isNotBlank() && norm != "?") {
+                                lines.add(norm)
+                            }
                         } else {
                             sub.skipField(iWire)
                         }
@@ -759,11 +762,13 @@ object GtfsRtProtobufParser {
             }
         }
 
-        if (header.isBlank() && desc.isBlank()) return null
+        val cleanHeader = com.example.data.model.ServiceAlertOrganizer.cleanText(header)
+        val cleanDesc = com.example.data.model.ServiceAlertOrganizer.cleanText(desc)
+        if (cleanHeader.isBlank() && cleanDesc.isBlank()) return null
         return ServiceAlertInfo(
-            id = id.ifBlank { header.take(24) },
-            headerText = header.ifBlank { desc.take(80) },
-            descriptionText = desc,
+            id = id.ifBlank { cleanHeader.ifBlank { cleanDesc }.take(32) },
+            headerText = cleanHeader.ifBlank { cleanDesc.lineSequence().firstOrNull { it.isNotBlank() }.orEmpty().take(92) },
+            descriptionText = cleanDesc,
             affectedLines = lines,
             activePeriods = periods,
             gtfsCause = cause,

@@ -17,7 +17,9 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.data.model.ServiceAlertCategory
 import com.example.data.model.ServiceAlertInfo
+import com.example.data.model.ServiceAlertOrganizer
 import com.example.data.preferences.ToBusPreferences
 import java.security.MessageDigest
 import java.text.Normalizer
@@ -49,6 +51,7 @@ object FavoriteAlertNotifier {
     const val EXTRA_OPEN_ALERTS_DIALOG = "extra_open_alerts_dialog"
     private const val SUMMARY_NOTIFICATION_ID = 42_000
     private const val MAX_INDIVIDUAL_NOTIFICATIONS = 3
+    internal const val NETWORK_WIDE_MATCH_TOKEN = "RETE_GTT"
 
     private val DIACRITICS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
     private val NON_ALNUM_REGEX = Regex("[^a-z0-9]+")
@@ -97,20 +100,21 @@ object FavoriteAlertNotifier {
 
     /**
      * Pure selection function: returns ONLY current/upcoming alerts that affect at least one
-     * favorite line and have NEVER been seen before (by content hash OR entity ID), deduplicated
-     * within the batch so multi-line notices produce a single concise alert.
+     * favorite line (or are network-wide critical strikes), match one of [allowedCategories],
+     * and have NEVER been seen before (by content hash OR entity ID), deduplicated within the batch.
      */
     fun findNewFavoriteLineAlerts(
         alerts: List<ServiceAlertInfo>,
         favoriteLines: List<String>,
         seenFingerprints: Set<String>,
         nowEpochSeconds: Long = System.currentTimeMillis() / 1000L,
+        allowedCategories: Set<ServiceAlertCategory> = ServiceAlertCategory.entries.toSet(),
     ): List<MatchedFavoriteAlert> {
         val favOrdered = favoriteLines
             .map { it.trim().uppercase(Locale.ROOT) }
             .filter { it.isNotEmpty() }
             .distinct()
-        if (favOrdered.isEmpty() || alerts.isEmpty()) return emptyList()
+        if (favOrdered.isEmpty() || alerts.isEmpty() || allowedCategories.isEmpty()) return emptyList()
         val favSet = favOrdered.toSet()
 
         val batchSeenContent = HashSet<String>()
@@ -120,11 +124,19 @@ object FavoriteAlertNotifier {
             if (!alert.isCurrentOrUpcoming(nowEpochSeconds = nowEpochSeconds, maxHorizonDays = 7)) {
                 continue
             }
+            val category = alert.classifyCategory()
+            if (category !in allowedCategories) continue
+
             val affectedUpper = alert.affectedLines
                 .map { it.trim().uppercase(Locale.ROOT) }
-                .filter { it.isNotEmpty() }
+                .filter { it.isNotEmpty() && it != "?" }
                 .toSet()
-            val matchingFavs = favOrdered.filter { it in affectedUpper && it in favSet }
+            val matchingFavs = when {
+                affectedUpper.isNotEmpty() -> favOrdered.filter { it in affectedUpper && it in favSet }
+                ServiceAlertOrganizer.isNetworkWide(alert) && category == ServiceAlertCategory.CRITICAL ->
+                    listOf(NETWORK_WIDE_MATCH_TOKEN)
+                else -> favOrdered.filter { ServiceAlertOrganizer.matchesLine(alert, it) }
+            }
             if (matchingFavs.isEmpty()) continue
 
             val contentFp = computeContentFingerprint(alert)
@@ -236,6 +248,7 @@ object FavoriteAlertNotifier {
                 favoriteLines = favorites,
                 seenFingerprints = seenMap.keys,
                 nowEpochSeconds = nowMillis / 1000L,
+                allowedCategories = settings.notifyAlertCategories,
             )
             if (matches.isEmpty()) return 0
 
@@ -352,14 +365,21 @@ object FavoriteAlertNotifier {
 
         return try {
             if (matches.size > MAX_INDIVIDUAL_NOTIFICATIONS) {
-                val allLines = matches.flatMap { it.matchedLines }.distinct()
-                val primaryLine = allLines.firstOrNull().orEmpty()
+                val allLines = matches
+                    .flatMap { it.matchedLines }
+                    .map { if (it == NETWORK_WIDE_MATCH_TOKEN) "Rete GTT" else it }
+                    .distinct()
+                val primaryLine = matches
+                    .flatMap { it.matchedLines }
+                    .firstOrNull { it != NETWORK_WIDE_MATCH_TOKEN }
+                    .orEmpty()
                 val linesLabel = allLines.take(5).joinToString(", ") + if (allLines.size > 5) "…" else ""
-                val title = "${matches.size} nuovi avvisi GTT · Linee $linesLabel"
+                val title = "${matches.size} nuovi avvisi GTT · $linesLabel"
                 val previewLines = matches.take(4).joinToString("\n") { m ->
-                    val prefix = m.matchedLines.take(2).joinToString("/")
+                    val isNetwork = m.matchedLines.size == 1 && m.matchedLines.first() == NETWORK_WIDE_MATCH_TOKEN
+                    val prefix = if (isNetwork) "Rete GTT" else "Linea ${m.matchedLines.take(2).joinToString("/")}"
                     val header = m.alert.headerText.ifBlank { m.alert.descriptionText }.trim()
-                    "• Linea $prefix: $header"
+                    "• $prefix: $header"
                 }
                 val notification = NotificationCompat.Builder(context, CHANNEL_ID)
                     .setSmallIcon(R.drawable.ic_stat_tobus_alert)
@@ -376,10 +396,11 @@ object FavoriteAlertNotifier {
             } else {
                 var posted = 0
                 for (match in matches) {
-                    val linesPrefix = if (match.matchedLines.size == 1) {
-                        "Avviso Linea ${match.matchedLines.first()}"
-                    } else {
-                        "Avviso Linee ${match.matchedLines.take(4).joinToString(", ")}"
+                    val isNetworkWide = match.matchedLines.size == 1 && match.matchedLines.first() == NETWORK_WIDE_MATCH_TOKEN
+                    val linesPrefix = when {
+                        isNetworkWide -> "Avviso Rete GTT"
+                        match.matchedLines.size == 1 -> "Avviso Linea ${match.matchedLines.first()}"
+                        else -> "Avviso Linee ${match.matchedLines.take(4).joinToString(", ")}"
                     }
                     val header = match.alert.headerText.trim()
                     val body = match.alert.descriptionText.trim().ifBlank { header }
@@ -389,7 +410,7 @@ object FavoriteAlertNotifier {
                         linesPrefix
                     }
                     val notifId = 42_100 + (match.contentFingerprint.hashCode() and 0x7FFF)
-                    val primaryLine = match.matchedLines.first()
+                    val primaryLine = if (isNetworkWide) "" else match.matchedLines.first()
                     val notification = NotificationCompat.Builder(context, CHANNEL_ID)
                         .setSmallIcon(R.drawable.ic_stat_tobus_alert)
                         .setContentTitle(contentTitle)

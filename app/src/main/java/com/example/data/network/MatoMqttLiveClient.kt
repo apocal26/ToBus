@@ -57,28 +57,24 @@ class MatoMqttLiveClient(
             .build()
     }
 
-    private data class MqttPoseHistory(
-        val lineCode: String,
-        val anchorLat: Double,
-        val anchorLon: Double,
-        val firstSeenAtAnchorMillis: Long,
-        val anchorTimestampSeconds: Long,
-        val lastObservedMillis: Long,
-        val evictedAsGhost: Boolean = false,
-    )
-
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val vehiclesById = ConcurrentHashMap<String, BusVehicle>()
+    private val retainedCandidatesById = ConcurrentHashMap<String, BusVehicle>()
     private val pendingTeleportById = ConcurrentHashMap<String, BusVehicle>()
-    private val poseHistoryById = ConcurrentHashMap<String, MqttPoseHistory>()
+    private val subscribedTopicsForConn = ConcurrentHashMap.newKeySet<String>()
+    private val subscribedTopicsByLine = ConcurrentHashMap<String, MutableSet<String>>()
     private val packetIdGen = AtomicInteger(1)
     private val connectionGen = AtomicLong(0L)
     private val isActiveDesired = AtomicBoolean(false)
     private val isMqttConnected = AtomicBoolean(false)
     private val lastMessageReceivedAtMillis = AtomicLong(0L)
     private val lastParsedVehicleAtMillis = AtomicLong(0L)
+    private val lastLiveParsedVehicleAtMillis = AtomicLong(0L)
+    private val lastPingRespAtMillis = AtomicLong(0L)
     private val connectedSinceMillis = AtomicLong(0L)
     private val rawPublishCount = AtomicLong(0L)
+    private val livePublishCount = AtomicLong(0L)
+    private val retainedPublishCount = AtomicLong(0L)
     private val parsedVehicleCount = AtomicLong(0L)
     private val subAckAcceptedCount = AtomicInteger(0)
     private val subAckRejectedCount = AtomicInteger(0)
@@ -116,9 +112,6 @@ class MatoMqttLiveClient(
     @Volatile
     private var hasPushedFocusedVehicle: Boolean = false
 
-    @Volatile
-    private var subscribedLineOnActiveSocket: String = ""
-
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
     private var keepAliveJob: Job? = null
@@ -137,6 +130,12 @@ class MatoMqttLiveClient(
     fun connectedSinceMillis(): Long = connectedSinceMillis.get()
 
     fun rawPublishCount(): Long = rawPublishCount.get()
+
+    fun livePublishCount(): Long = livePublishCount.get()
+
+    fun retainedPublishCount(): Long = retainedPublishCount.get()
+
+    fun stagedRetainedCount(): Int = retainedCandidatesById.size
 
     fun parsedVehicleCount(): Long = parsedVehicleCount.get()
 
@@ -189,7 +188,8 @@ class MatoMqttLiveClient(
     fun start(lineCode: String, onFocusedUpdate: () -> Unit) {
         val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
         if (norm.isEmpty() || norm == "?") return
-        val lineChanged = norm != focusedLine
+        val prevLine = focusedLine
+        val lineChanged = norm != prevLine
         focusedLine = norm
         onFocusedLineUpdate = onFocusedUpdate
         if (lineChanged) hasPushedFocusedVehicle = false
@@ -198,9 +198,12 @@ class MatoMqttLiveClient(
             if (!wasActive || activeWebSocket == null) {
                 reconnectAttempt = 0
                 openSocket()
-            } else if (isMqttConnected.get() && (lineChanged || !subscribedLineOnActiveSocket.equals(norm, ignoreCase = true))) {
+            } else if (isMqttConnected.get()) {
                 val ws = activeWebSocket
                 val gen = connectionGen.get()
+                if (lineChanged && prevLine.isNotEmpty()) {
+                    unsubscribeForLine(ws, prevLine)
+                }
                 subscribeForLine(ws, focusedLine, includeSecondaryGroups = false)
                 if (ws != null && connectionGen.get() == gen) {
                     val hasLineCached = vehiclesById.values.any {
@@ -218,12 +221,16 @@ class MatoMqttLiveClient(
     fun setFocusedLine(lineCode: String) {
         val norm = GtfsRtProtobufParser.normalizeGttLineCode(lineCode)
         if (norm.isEmpty() || norm == "?" || norm == focusedLine) return
+        val prevLine = focusedLine
         focusedLine = norm
         hasPushedFocusedVehicle = false
         if (isMqttConnected.get()) {
             val ws = activeWebSocket
             val gen = connectionGen.get()
             scope.launch {
+                if (prevLine.isNotEmpty()) {
+                    unsubscribeForLine(ws, prevLine)
+                }
                 subscribeForLine(ws, norm, includeSecondaryGroups = false)
                 val hasLineCached = vehiclesById.values.any {
                     it.lineCode.equals(norm, ignoreCase = true) ||
@@ -241,21 +248,34 @@ class MatoMqttLiveClient(
 
     /**
      * Self-healing liveness check called during periodic foreground polls:
-     * if the MQTT WebSocket silently stalled after a Wi-Fi/5G switch or screen sleep,
-     * force a clean reconnect so live MaTO telemetry resumes automatically.
+     * reconnects ONLY when the WebSocket actually dropped or stopped answering MQTT keep-alive
+     * (`PINGRESP`) and traffic for > 95s — never killing a healthy quiet connection on a line
+     * with few/zero moving buses!
      */
     fun ensureHealthyConnection(nowMillis: Long = System.currentTimeMillis()) {
         if (!isActiveDesired.get()) return
         val ws = activeWebSocket
-        val lastParsed = lastParsedVehicleAtMillis.get()
-        val lastRaw = lastMessageReceivedAtMillis.get()
-        val lastActivity = maxOf(lastParsed, lastRaw)
+        val lastActivity = maxOf(
+            lastParsedVehicleAtMillis.get(),
+            lastMessageReceivedAtMillis.get(),
+            lastPingRespAtMillis.get(),
+        )
         val connSince = connectedSinceMillis.get()
         val stalled = isMqttConnected.get() &&
             connSince > 0L &&
-            (nowMillis - connSince) > 65_000L &&
-            (lastActivity == 0L || (nowMillis - lastActivity) > 70_000L)
+            (nowMillis - connSince) > 95_000L &&
+            (lastActivity == 0L || (nowMillis - lastActivity) > 95_000L)
         if (ws == null || stalled) {
+            if (stalled) {
+                val idleSec = if (lastActivity > 0L) (nowMillis - lastActivity) / 1000L else (nowMillis - connSince) / 1000L
+                ToBusDiagnosticsLog.record(
+                    category = DiagCategory.MQTT,
+                    message = "Socket MaTO MQTT bloccato (idle=${idleSec}s) → riconnessione",
+                    detail = "linea=$focusedLine raw=${rawPublishCount.get()} parsed=${parsedVehicleCount.get()}",
+                    severity = DiagSeverity.WARN,
+                    timestampMillis = nowMillis,
+                )
+            }
             scope.launch {
                 if (!isActiveDesired.get()) return@launch
                 reconnectAttempt = 0
@@ -265,16 +285,16 @@ class MatoMqttLiveClient(
     }
 
     /**
-     * Non-destructive subscription nudge: NEVER kills a freshly connected WebSocket before
-     * `scheduleSilentTopicFallback` finishes! Only re-subscribes while connected, or reconnects
-     * if disconnected / truly silent for >= 25s after connect.
+     * Non-destructive subscription nudge: NEVER kills a healthy connected WebSocket that is
+     * receiving PINGRESP/SUBACK! Only subscribes missing secondary groups if not yet sent,
+     * or reconnects when truly disconnected / dead-socket stalled (> 95s without any frame).
      */
     fun nudgeFocusedLineSubscription(
         lineCode: String?,
         nowMillis: Long = System.currentTimeMillis(),
     ) {
         if (!isActiveDesired.get()) return
-        if (nowMillis - lastNudgeMillis < 25_000L) return
+        if (nowMillis - lastNudgeMillis < 30_000L) return
         lastNudgeMillis = nowMillis
 
         val targetLine = lineCode?.let { GtfsRtProtobufParser.normalizeGttLineCode(it) }
@@ -285,27 +305,23 @@ class MatoMqttLiveClient(
         val ws = activeWebSocket
         val connSince = connectedSinceMillis.get()
         val connectedAgeMs = if (connSince > 0L) nowMillis - connSince else 0L
-        val lastParsed = lastParsedVehicleAtMillis.get()
-        val staleAfterWarmup = connectedAgeMs >= 25_000L &&
-            (lastParsed == 0L || (nowMillis - lastParsed) > 40_000L)
+        val lastActivity = maxOf(
+            lastParsedVehicleAtMillis.get(),
+            lastMessageReceivedAtMillis.get(),
+            lastPingRespAtMillis.get(),
+        )
+        val socketTrulyDead = connectedAgeMs >= 95_000L &&
+            (lastActivity == 0L || (nowMillis - lastActivity) > 95_000L)
 
         scope.launch {
             if (!isActiveDesired.get()) return@launch
-            if (ws != null && isMqttConnected.get() && !staleAfterWarmup) {
-                val alreadySubscribedToTarget = subscribedLineOnActiveSocket.equals(targetLine, ignoreCase = true)
-                val hasFocusedCached = vehiclesById.values.any {
-                    it.lineCode.equals(targetLine, ignoreCase = true) ||
-                        it.rawRouteId.equals(targetLine, ignoreCase = true)
-                }
-                if (!alreadySubscribedToTarget || !hasFocusedCached) {
-                    subscribeForLine(ws, targetLine, includeSecondaryGroups = true)
-                }
-                if (connectedAgeMs >= 6_000L && lastParsed < connSince) {
+            if (ws != null && isMqttConnected.get() && !socketTrulyDead) {
+                subscribeForLine(ws, targetLine, includeSecondaryGroups = true)
+                if (connectedAgeMs >= 8_000L && lastParsedVehicleAtMillis.get() < connSince) {
                     sendBroadFallbackSubscriptions(ws)
                 }
-            } else if (ws == null || !isMqttConnected.get() || staleAfterWarmup) {
-                if (staleAfterWarmup) {
-                    // Advance handshake profile on silent-stall reconnect instead of retrying the same one forever
+            } else if (ws == null || !isMqttConnected.get() || socketTrulyDead) {
+                if (socketTrulyDead) {
                     reconnectAttempt = (reconnectAttempt + 1) % HANDSHAKE_PROFILES.size
                 } else {
                     reconnectAttempt = 0
@@ -336,17 +352,32 @@ class MatoMqttLiveClient(
     }
 
     /**
-     * Returns all fresh MaTO vehicles received within the last [LIVE_TTL_MILLIS] (95 seconds),
-     * pruning expired entries automatically so parked/finished buses vanish cleanly.
+     * Returns ONLY confirmed live (non-retained) MaTO vehicles received within [LIVE_TTL_MILLIS]
+     * (120 seconds), pruning expired entries automatically. Old broker RETAINED packets are NEVER
+     * returned here — they remain quarantined in [retainedCandidatesById] until confirmed by a
+     * fresh live PUBLISH or corroborated by GTT/BusOne.
      */
     fun snapshotFreshVehicles(nowMillis: Long = System.currentTimeMillis()): List<BusVehicle> {
         val cutoff = nowMillis - LIVE_TTL_MILLIS
         val out = ArrayList<BusVehicle>(vehiclesById.size)
         val iterator = vehiclesById.entries.iterator()
+        val focus = focusedLine
         while (iterator.hasNext()) {
             val entry = iterator.next()
             val v = entry.value
             if (v.fetchedAtMillis < cutoff) {
+                if (focus.isNotEmpty() &&
+                    (v.lineCode.equals(focus, ignoreCase = true) || v.rawRouteId.equals(focus, ignoreCase = true))
+                ) {
+                    val silentSec = ((nowMillis - v.fetchedAtMillis) / 1000L).coerceAtLeast(0L)
+                    ToBusDiagnosticsLog.record(
+                        category = DiagCategory.VEHICLE,
+                        message = "#${v.vehicleId} L.${v.lineCode} MQTT_LIVE_EXPIRED",
+                        detail = "silent=${silentSec}s>${LIVE_TTL_MILLIS / 1000L}s age=${ToBusDiagnosticsLog.formatDurationCompact(v.gpsAgeSeconds(nowMillis))} pos=${ToBusDiagnosticsLog.formatCoordPair(v.latitude, v.longitude)}",
+                        severity = DiagSeverity.WARN,
+                        timestampMillis = nowMillis,
+                    )
+                }
                 iterator.remove()
             } else {
                 out.add(v)
@@ -355,187 +386,110 @@ class MatoMqttLiveClient(
         return out
     }
 
-    fun clearGhostHistory() {
-        poseHistoryById.clear()
-        pendingTeleportById.clear()
-    }
-
     /**
-     * Evicts a confirmed phantom/ghost vehicle from [vehiclesById] and blacklists its frozen
-     * anchor coordinates (<22m) in [poseHistoryById] so repeated MQTT broker rebroadcasts or
-     * retained messages can NEVER resurrect it until the bus physically moves >= 22 meters.
+     * Returns staged MQTT `RETAIN=1` candidates that have not yet received a live non-retained
+     * update, so the merge engine can promote ONLY those corroborated by healthy GTT/BusOne feeds.
      */
-    fun evictGhostVehicle(
-        vehicleId: String,
-        lat: Double,
-        lon: Double,
-        nowMillis: Long = System.currentTimeMillis(),
-    ) {
-        val canonId = GtfsRtProtobufParser.canonicalFleetId(vehicleId).ifBlank { vehicleId.trim() }
-        if (canonId.isEmpty()) return
-        val existing = vehiclesById[canonId]
-        if (existing != null) {
-            val d = GttVehicleMergeEngine.haversineMeters(existing.latitude, existing.longitude, lat, lon)
-            if (d < 30.0) {
-                vehiclesById.remove(canonId)
-                pendingTeleportById.remove(canonId)
+    fun snapshotRetainedCandidates(nowMillis: Long = System.currentTimeMillis()): List<BusVehicle> {
+        val cutoff = nowMillis - RETAINED_STAGING_TTL_MILLIS
+        val out = ArrayList<BusVehicle>(retainedCandidatesById.size)
+        val iterator = retainedCandidatesById.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            val v = entry.value
+            if (v.fetchedAtMillis < cutoff || vehiclesById.containsKey(entry.key)) {
+                iterator.remove()
+            } else {
+                out.add(v)
             }
         }
-        val prev = poseHistoryById[canonId]
-        val sameAnchor = prev != null &&
-            GttVehicleMergeEngine.haversineMeters(prev.anchorLat, prev.anchorLon, lat, lon) < 25.0
-        val firstSeen = if (sameAnchor && prev != null) prev.firstSeenAtAnchorMillis else nowMillis - 300_000L
-        val anchorTs = if (sameAnchor && prev != null) prev.anchorTimestampSeconds else (nowMillis / 1000L) - 300L
-        poseHistoryById[canonId] = MqttPoseHistory(
-            lineCode = existing?.lineCode ?: prev?.lineCode.orEmpty(),
-            anchorLat = lat,
-            anchorLon = lon,
-            firstSeenAtAnchorMillis = firstSeen,
-            anchorTimestampSeconds = anchorTs,
-            lastObservedMillis = nowMillis,
-            evictedAsGhost = true,
-        )
+        return out
     }
 
     /**
-     * Cross-references authoritative MaTO GraphQL `lastUpdated` timestamps against the MQTT stream.
-     * When GraphQL reports that a vehicle is stale (>150s old), any MQTT entry at the same coordinates
-     * is immediately evicted and blocked from resurrecting via retained MQTT messages.
-     */
-    fun recordGraphQlVehicleObservation(
-        vehicleId: String,
-        lineCode: String,
-        lat: Double,
-        lon: Double,
-        timestampSeconds: Long,
-        isStale: Boolean,
-        nowMillis: Long = System.currentTimeMillis(),
-    ) {
-        val canonId = GtfsRtProtobufParser.canonicalFleetId(vehicleId).ifBlank { vehicleId.trim() }
-        if (canonId.isEmpty() || timestampSeconds <= 0L) return
-        if (isStale) {
-            val existing = vehiclesById[canonId]
-            if (existing != null) {
-                val d = GttVehicleMergeEngine.haversineMeters(existing.latitude, existing.longitude, lat, lon)
-                if (d < 30.0) {
-                    vehiclesById.remove(canonId)
-                    pendingTeleportById.remove(canonId)
-                }
-            }
-            poseHistoryById[canonId] = MqttPoseHistory(
-                lineCode = lineCode,
-                anchorLat = lat,
-                anchorLon = lon,
-                firstSeenAtAnchorMillis = timestampSeconds * 1000L,
-                anchorTimestampSeconds = timestampSeconds,
-                lastObservedMillis = nowMillis,
-                evictedAsGhost = true,
-            )
-        } else {
-            val prev = poseHistoryById[canonId]
-            if (prev != null && !prev.evictedAsGhost) {
-                val d = GttVehicleMergeEngine.haversineMeters(prev.anchorLat, prev.anchorLon, lat, lon)
-                if (d < 22.0 && timestampSeconds < prev.anchorTimestampSeconds) {
-                    poseHistoryById[canonId] = prev.copy(
-                        anchorTimestampSeconds = timestampSeconds,
-                        firstSeenAtAnchorMillis = minOf(prev.firstSeenAtAnchorMillis, timestampSeconds * 1000L),
-                    )
-                }
-            }
-        }
-    }
-
-    /**
-     * Inserts or updates an incoming MaTO MQTT vehicle in [vehiclesById] using its canonical fleet ID,
-     * automatically collapsing any provisional `tripId`-keyed entry when the real physical matricola
-     * arrives (or refreshing the physical entry if a later frame omits `veh`).
+     * Inserts or updates an incoming MaTO MQTT vehicle using its canonical fleet ID:
+     * - Retained (`isRetained = true`): NEVER enters [vehiclesById] directly! Placed in
+     *   [retainedCandidatesById] without refreshing timestamps on duplicate re-subscribe deliveries.
+     * - Live (`isRetained = false`): promotes/clears any retained staging entry, collapses
+     *   provisional `tripId`-keyed entries when the real physical matricola arrives, and guards
+     *   against regressive timestamps and single-frame teleports.
      */
     internal fun upsertMqttVehicle(
         bus: BusVehicle,
-        isRetainedPacket: Boolean = false,
+        isRetained: Boolean = bus.isMqttRetained,
     ) {
         val normTrip = GtfsRtProtobufParser.normalizeTripId(bus.tripId)
         val canonId = GtfsRtProtobufParser.canonicalFleetId(bus.vehicleId).ifBlank { bus.vehicleId.trim() }
         if (canonId.isEmpty()) return
         val canonLabel = GtfsRtProtobufParser.canonicalFleetId(bus.label).ifBlank { canonId }
-        val normalizedBus = if (canonId == bus.vehicleId && canonLabel == bus.label && normTrip == bus.tripId) {
-            bus
-        } else {
-            bus.copy(vehicleId = canonId, label = canonLabel, tripId = normTrip)
-        }
+        val normalizedBus = bus.copy(
+            vehicleId = canonId,
+            label = canonLabel,
+            tripId = normTrip,
+            isMqttRetained = isRetained,
+        )
 
-        val nowMillis = normalizedBus.fetchedAtMillis
-        val nowSec = nowMillis / 1000L
-        if (normalizedBus.timestampSeconds > 0L && (nowSec - normalizedBus.timestampSeconds) > 150L) {
-            vehiclesById.remove(canonId)
-            pendingTeleportById.remove(canonId)
-            evictGhostVehicle(canonId, normalizedBus.latitude, normalizedBus.longitude, nowMillis)
+        val focus = focusedLine
+        val isFocused = focus.isNotEmpty() &&
+            (normalizedBus.lineCode.equals(focus, ignoreCase = true) || normalizedBus.rawRouteId.equals(focus, ignoreCase = true))
+
+        if (isRetained) {
+            // If this vehicle already sent a genuine live non-retained packet, NEVER overwrite or
+            // refresh it with an old retained copy from a re-subscribe!
+            if (vehiclesById.containsKey(canonId)) return
+            val existingRetained = retainedCandidatesById[canonId]
+            if (existingRetained != null &&
+                existingRetained.lineCode.equals(normalizedBus.lineCode, ignoreCase = true)
+            ) {
+                val distM = GttVehicleMergeEngine.haversineMeters(
+                    existingRetained.latitude,
+                    existingRetained.longitude,
+                    normalizedBus.latitude,
+                    normalizedBus.longitude,
+                )
+                // Re-subscribing delivers the exact same retained coordinates again -> keep original
+                // arrival time so retained ghosts can NEVER artificially stay "fresh" forever!
+                if (distM <= 5.0) return
+            }
+            retainedCandidatesById[canonId] = normalizedBus
+            if (isFocused && existingRetained == null) {
+                ToBusDiagnosticsLog.record(
+                    category = DiagCategory.VEHICLE,
+                    message = "#$canonId L.${normalizedBus.lineCode} MQTT_STAGED_RETAINED",
+                    detail = "age=${ToBusDiagnosticsLog.formatDurationCompact(normalizedBus.gpsAgeSeconds(normalizedBus.fetchedAtMillis))} pos=${ToBusDiagnosticsLog.formatCoordPair(normalizedBus.latitude, normalizedBus.longitude)} waiting=GTT/BusOne_or_live",
+                    severity = DiagSeverity.INFO,
+                    timestampMillis = normalizedBus.fetchedAtMillis,
+                )
+            }
             return
         }
 
-        val isSynthesizedClockTs = kotlin.math.abs(normalizedBus.timestampSeconds - nowSec) <= 2L
-        val prevPose = poseHistoryById[canonId]
-        var effectiveAnchorTs = normalizedBus.timestampSeconds
-        if (prevPose != null) {
-            val anchorDistM = GttVehicleMergeEngine.haversineMeters(
-                prevPose.anchorLat,
-                prevPose.anchorLon,
+        // Genuine LIVE (non-retained) update -> promote out of retained staging pool
+        val promotedFromRetained = retainedCandidatesById.remove(canonId)
+        if (isFocused && promotedFromRetained != null) {
+            val deltaM = GttVehicleMergeEngine.haversineMeters(
+                promotedFromRetained.latitude,
+                promotedFromRetained.longitude,
                 normalizedBus.latitude,
                 normalizedBus.longitude,
+            ).toInt()
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.VEHICLE,
+                message = "#$canonId L.${normalizedBus.lineCode} MQTT_PROMOTED_LIVE",
+                detail = "from=retained delta=${deltaM}m age=${ToBusDiagnosticsLog.formatDurationCompact(normalizedBus.gpsAgeSeconds(normalizedBus.fetchedAtMillis))} pos=${ToBusDiagnosticsLog.formatCoordPair(normalizedBus.latitude, normalizedBus.longitude)}",
+                severity = DiagSeverity.OK,
+                timestampMillis = normalizedBus.fetchedAtMillis,
             )
-            if (anchorDistM < 22.0) {
-                // Vehicle has NOT moved 22m from its previously observed anchor
-                if (prevPose.evictedAsGhost) {
-                    vehiclesById.remove(canonId)
-                    pendingTeleportById.remove(canonId)
-                    return
-                }
-                val stationaryAnchorMs = (nowMillis - prevPose.firstSeenAtAnchorMillis).coerceAtLeast(0L)
-                if (isSynthesizedClockTs && !vehiclesById.containsKey(canonId) &&
-                    (isRetainedPacket || stationaryAnchorMs >= LIVE_TTL_MILLIS)
-                ) {
-                    // This vehicle already expired from the 95s live window once; a re-delivered
-                    // broker message at the exact same coordinates without a new onboard timestamp must NOT resurrect it.
-                    return
-                }
-                if (isSynthesizedClockTs && prevPose.anchorTimestampSeconds in 1L until normalizedBus.timestampSeconds) {
-                    effectiveAnchorTs = prevPose.anchorTimestampSeconds
-                }
-                poseHistoryById[canonId] = prevPose.copy(
-                    lastObservedMillis = nowMillis,
-                    anchorTimestampSeconds = effectiveAnchorTs,
-                )
-            } else {
-                // Genuine physical movement >= 22m -> reset anchor and clear any ghost eviction
-                poseHistoryById[canonId] = MqttPoseHistory(
-                    lineCode = normalizedBus.lineCode,
-                    anchorLat = normalizedBus.latitude,
-                    anchorLon = normalizedBus.longitude,
-                    firstSeenAtAnchorMillis = nowMillis,
-                    anchorTimestampSeconds = normalizedBus.timestampSeconds,
-                    lastObservedMillis = nowMillis,
-                    evictedAsGhost = false,
-                )
-            }
-        } else {
-            poseHistoryById[canonId] = MqttPoseHistory(
-                lineCode = normalizedBus.lineCode,
-                anchorLat = normalizedBus.latitude,
-                anchorLon = normalizedBus.longitude,
-                firstSeenAtAnchorMillis = nowMillis,
-                anchorTimestampSeconds = normalizedBus.timestampSeconds,
-                lastObservedMillis = nowMillis,
-                evictedAsGhost = false,
-            )
-        }
-
-        if (poseHistoryById.size > 1000) {
-            val cutoff = nowMillis - (2L * 60L * 60_000L)
-            poseHistoryById.entries.removeIf { it.value.lastObservedMillis < cutoff }
         }
 
         if (normTrip != null) {
             val isIncomingPhysical = GtfsRtProtobufParser.isPhysicalFleetId(canonId)
+            retainedCandidatesById.entries.removeIf { (key, staged) ->
+                key != canonId &&
+                    !GtfsRtProtobufParser.isPhysicalFleetId(key) &&
+                    staged.lineCode.equals(normalizedBus.lineCode, ignoreCase = true) &&
+                    GtfsRtProtobufParser.normalizeTripId(staged.tripId)?.equals(normTrip, ignoreCase = true) == true
+            }
             val matching = vehiclesById.entries.filter { (key, existing) ->
                 key != canonId &&
                     existing.lineCode.equals(normalizedBus.lineCode, ignoreCase = true) &&
@@ -548,6 +502,14 @@ class MatoMqttLiveClient(
                     pendingTeleportById.remove(oldKey)
                 } else if (!isIncomingPhysical && isExistingPhysical) {
                     if (isRegressiveTimestamp(existing.timestampSeconds, normalizedBus.timestampSeconds)) {
+                        if (isFocused) {
+                            ToBusDiagnosticsLog.record(
+                                category = DiagCategory.MQTT,
+                                message = "#$oldKey L.${normalizedBus.lineCode} MQTT_TS_REGRESS (scartato)",
+                                detail = "existingTs=${existing.timestampSeconds} incomingTs=${normalizedBus.timestampSeconds} delta=${existing.timestampSeconds - normalizedBus.timestampSeconds}s",
+                                severity = DiagSeverity.INFO,
+                            )
+                        }
                         return
                     }
                     if (!acceptsKinematicUpdate(oldKey, existing, normalizedBus)) {
@@ -558,45 +520,38 @@ class MatoMqttLiveClient(
                         longitude = normalizedBus.longitude,
                         bearing = normalizedBus.bearing ?: existing.bearing,
                         speedKmh = normalizedBus.speedKmh ?: existing.speedKmh,
-                        timestampSeconds = effectiveAnchorTs.coerceAtLeast(existing.timestampSeconds),
+                        timestampSeconds = maxOf(existing.timestampSeconds, normalizedBus.timestampSeconds),
                         stopId = normalizedBus.stopId ?: existing.stopId,
                         nextStopId = normalizedBus.nextStopId ?: existing.nextStopId,
                         directionId = normalizedBus.directionId ?: existing.directionId,
                         fetchedAtMillis = maxOf(existing.fetchedAtMillis, normalizedBus.fetchedAtMillis),
+                        isMqttRetained = false,
+                        hasExplicitTimestamp = existing.hasExplicitTimestamp || normalizedBus.hasExplicitTimestamp,
                     )
                     return
                 }
             }
         }
         val existing = vehiclesById[canonId]
-        var busToStore = if (effectiveAnchorTs != normalizedBus.timestampSeconds) {
-            normalizedBus.copy(timestampSeconds = effectiveAnchorTs)
-        } else {
-            normalizedBus
-        }
         if (existing != null) {
             if (isRegressiveTimestamp(existing.timestampSeconds, normalizedBus.timestampSeconds)) {
+                if (isFocused) {
+                    ToBusDiagnosticsLog.record(
+                        category = DiagCategory.MQTT,
+                        message = "#$canonId L.${normalizedBus.lineCode} MQTT_TS_REGRESS (scartato)",
+                        detail = "existingTs=${existing.timestampSeconds} incomingTs=${normalizedBus.timestampSeconds} delta=${existing.timestampSeconds - normalizedBus.timestampSeconds}s",
+                        severity = DiagSeverity.INFO,
+                    )
+                }
                 return
             }
             if (!acceptsKinematicUpdate(canonId, existing, normalizedBus)) {
                 return
             }
-            val distM = GttVehicleMergeEngine.haversineMeters(
-                existing.latitude,
-                existing.longitude,
-                normalizedBus.latitude,
-                normalizedBus.longitude,
-            )
-            if (distM < 22.0 && isSynthesizedClockTs && existing.timestampSeconds in 1L until busToStore.timestampSeconds) {
-                busToStore = busToStore.copy(timestampSeconds = existing.timestampSeconds)
-            }
-            if (distM < 22.0 && isRetainedPacket && isSynthesizedClockTs) {
-                busToStore = busToStore.copy(fetchedAtMillis = existing.fetchedAtMillis)
-            }
         } else {
             pendingTeleportById.remove(canonId)
         }
-        vehiclesById[canonId] = busToStore
+        vehiclesById[canonId] = normalizedBus
     }
 
     private fun acceptsKinematicUpdate(
@@ -640,15 +595,19 @@ class MatoMqttLiveClient(
         val myGen = connectionGen.incrementAndGet()
         activeWebSocket?.cancel()
         activeWebSocket = null
+        subscribedTopicsForConn.clear()
+        subscribedTopicsByLine.clear()
         rawPublishCount.set(0L)
+        livePublishCount.set(0L)
+        retainedPublishCount.set(0L)
         parsedVehicleCount.set(0L)
+        lastPingRespAtMillis.set(0L)
         subAckAcceptedCount.set(0)
         subAckRejectedCount.set(0)
         lastSampleTopic = null
         lastPayloadPreview = null
         rootWildcardSentAtMillis = 0L
         hasPushedFocusedVehicle = false
-        subscribedLineOnActiveSocket = ""
 
         val profileIdx = if (workingProfileIdx in HANDSHAKE_PROFILES.indices && reconnectAttempt == 0) {
             workingProfileIdx
@@ -756,18 +715,33 @@ class MatoMqttLiveClient(
                                 }
                                 lastMessageReceivedAtMillis.set(nowMillis)
                                 val count = rawPublishCount.incrementAndGet()
+                                if (pkt.isRetained) {
+                                    retainedPublishCount.incrementAndGet()
+                                } else {
+                                    livePublishCount.incrementAndGet()
+                                }
                                 if (pkt.topic.isNotBlank()) {
                                     lastSampleTopic = pkt.topic.take(64)
                                 }
-                                val parsed = parseMatoMessage(pkt.topic, pkt.payload, nowMillis)
+                                val parsed = parseMatoMessage(
+                                    topic = pkt.topic,
+                                    payload = pkt.payload,
+                                    nowMillis = nowMillis,
+                                    isRetained = pkt.isRetained,
+                                )
                                 if (parsed.isNotEmpty()) {
                                     lastParsedVehicleAtMillis.set(nowMillis)
-                                    parsedVehicleCount.addAndGet(parsed.size.toLong())
-                                    parsedAnyNow = true
+                                    if (!pkt.isRetained) {
+                                        lastLiveParsedVehicleAtMillis.set(nowMillis)
+                                        parsedVehicleCount.addAndGet(parsed.size.toLong())
+                                        parsedAnyNow = true
+                                    }
                                     for (bus in parsed) {
-                                        upsertMqttVehicle(bus, isRetainedPacket = pkt.retain)
-                                        if (bus.lineCode.equals(focusedLine, ignoreCase = true) ||
-                                            bus.rawRouteId.equals(focusedLine, ignoreCase = true)
+                                        upsertMqttVehicle(bus, isRetained = pkt.isRetained)
+                                        if (!pkt.isRetained && (
+                                                bus.lineCode.equals(focusedLine, ignoreCase = true) ||
+                                                    bus.rawRouteId.equals(focusedLine, ignoreCase = true)
+                                                )
                                         ) {
                                             touchedFocusedLine = true
                                         }
@@ -785,7 +759,10 @@ class MatoMqttLiveClient(
                                     }
                                 }
                             }
-                            is MqttPacket.PingResp -> Unit
+                            is MqttPacket.PingResp -> {
+                                lastPingRespAtMillis.set(nowMillis)
+                                lastMessageReceivedAtMillis.set(nowMillis)
+                            }
                         }
                     }
 
@@ -814,6 +791,8 @@ class MatoMqttLiveClient(
                         isMqttConnected.set(true)
                         workingProfileIdx = profileIdx
                         lastParsedVehicleAtMillis.set(nowMillis)
+                        lastLiveParsedVehicleAtMillis.set(nowMillis)
+                        livePublishCount.incrementAndGet()
                         parsedVehicleCount.addAndGet(parsed.size.toLong())
                         var touched = false
                         for (bus in parsed) {
@@ -890,6 +869,54 @@ class MatoMqttLiveClient(
         }
     }
 
+    private fun sendUniqueSubscriptions(
+        webSocket: WebSocket,
+        topics: List<String>,
+        onePerPacket: Boolean,
+        ownerLine: String? = null,
+    ) {
+        val fresh = topics.filter { topic -> subscribedTopicsForConn.add(topic) }
+        if (fresh.isEmpty()) return
+        if (!ownerLine.isNullOrBlank()) {
+            subscribedTopicsByLine
+                .computeIfAbsent(ownerLine.uppercase()) { ConcurrentHashMap.newKeySet() }
+                .addAll(fresh)
+        }
+        if (onePerPacket) {
+            for (singleTopic in fresh) {
+                val packetId = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
+                runCatching {
+                    webSocket.send(encodeSubscribePacket(packetId, listOf(singleTopic)).toByteString())
+                }
+            }
+        } else {
+            for (batch in fresh.chunked(4)) {
+                val packetId = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
+                runCatching {
+                    webSocket.send(encodeSubscribePacket(packetId, batch).toByteString())
+                }
+            }
+        }
+    }
+
+    private fun unsubscribeForLine(
+        webSocket: WebSocket?,
+        lineCode: String,
+    ) {
+        val ws = webSocket ?: return
+        val key = lineCode.trim().uppercase()
+        if (key.isEmpty()) return
+        val topics = subscribedTopicsByLine.remove(key)?.toList().orEmpty()
+        if (topics.isEmpty()) return
+        subscribedTopicsForConn.removeAll(topics.toSet())
+        for (batch in topics.chunked(6)) {
+            val packetId = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
+            runCatching {
+                ws.send(encodeUnsubscribePacket(packetId, batch).toByteString())
+            }
+        }
+    }
+
     private fun subscribeForLine(
         webSocket: WebSocket?,
         lineCode: String,
@@ -897,37 +924,24 @@ class MatoMqttLiveClient(
     ) {
         val ws = webSocket ?: return
         if (lineCode.isBlank() || lineCode == "?") return
-        subscribedLineOnActiveSocket = lineCode
         val groups = buildLineSubscriptionGroups(lineCode)
-        // Stage 0: Primary exact & single-level 5T/MaTO topics sent 1-per-SUBSCRIBE packet
-        // so strict ACL brokers never drop valid topics or hit inflight limits.
-        groups.getOrNull(0)?.forEach { singleTopic ->
-            val packetId = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
-            runCatching {
-                ws.send(encodeSubscribePacket(packetId, listOf(singleTopic)).toByteString())
-            }
-        }
-        // Stage 1: Direct line multi-level wildcards (e.g. /12U/#, 12U/#, /12/#, /12F/#)
-        groups.getOrNull(1)?.chunked(4)?.forEach { batch ->
-            val packetId = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
-            runCatching {
-                ws.send(encodeSubscribePacket(packetId, batch).toByteString())
-            }
-        }
+        // Stage 0: Minimal exact & single-level 5T/MaTO topics sent 1-per-SUBSCRIBE packet
+        // (deduplicated per connection so re-subscribes NEVER trigger retained ghost bursts!)
+        groups.getOrNull(0)?.let { sendUniqueSubscriptions(ws, it, onePerPacket = true, ownerLine = lineCode) }
         if (includeSecondaryGroups) {
-            sendSecondaryLineGroups(ws, groups)
+            groups.getOrNull(1)?.let { sendUniqueSubscriptions(ws, it, onePerPacket = false, ownerLine = lineCode) }
+            sendSecondaryLineGroups(ws, groups, ownerLine = lineCode)
         }
     }
 
-    private fun sendSecondaryLineGroups(webSocket: WebSocket, groups: List<List<String>>) {
-        for (topics in groups.drop(2)) {
+    private fun sendSecondaryLineGroups(
+        webSocket: WebSocket,
+        groups: List<List<String>>,
+        ownerLine: String? = null,
+    ) {
+        for (topics in groups.drop(1)) {
             if (topics.isEmpty()) continue
-            for (batch in topics.chunked(4)) {
-                val packetId = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
-                runCatching {
-                    webSocket.send(encodeSubscribePacket(packetId, batch).toByteString())
-                }
-            }
+            sendUniqueSubscriptions(webSocket, topics, onePerPacket = false, ownerLine = ownerLine)
         }
     }
 
@@ -941,12 +955,7 @@ class MatoMqttLiveClient(
             "/+/#",
             "+/#",
         )
-        for (topic in broadTopics) {
-            val pid = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
-            runCatching {
-                webSocket.send(encodeSubscribePacket(pid, listOf(topic)).toByteString())
-            }
-        }
+        sendUniqueSubscriptions(webSocket, broadTopics, onePerPacket = true)
     }
 
     /**
@@ -967,13 +976,25 @@ class MatoMqttLiveClient(
             if (!isActive || connectionGen.get() != myGen || !isMqttConnected.get()) return@launch
             if (lastParsedVehicleAtMillis.get() >= onlyIfNoParsedSince) return@launch
 
-            sendSecondaryLineGroups(webSocket, buildLineSubscriptionGroups(lineCode))
+            sendSecondaryLineGroups(webSocket, buildLineSubscriptionGroups(lineCode), ownerLine = lineCode)
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.MQTT,
+                message = "Escalation topic L.$lineCode: gruppi secondari (+2s silenzio)",
+                detail = "raw=${rawPublishCount.get()} parsed=${parsedVehicleCount.get()}",
+                severity = DiagSeverity.INFO,
+            )
 
             delay(2_000L)
             if (!isActive || connectionGen.get() != myGen || !isMqttConnected.get()) return@launch
             if (lastParsedVehicleAtMillis.get() >= onlyIfNoParsedSince) return@launch
 
             sendBroadFallbackSubscriptions(webSocket)
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.MQTT,
+                message = "Escalation topic L.$lineCode: fallback ampio /ALL (+4s silenzio)",
+                detail = "raw=${rawPublishCount.get()} parsed=${parsedVehicleCount.get()}",
+                severity = DiagSeverity.INFO,
+            )
 
             delay(3_000L)
             if (!isActive || connectionGen.get() != myGen || !isMqttConnected.get()) return@launch
@@ -981,6 +1002,12 @@ class MatoMqttLiveClient(
             if (rootWildcardDisallowed) return@launch
 
             rootWildcardSentAtMillis = System.currentTimeMillis()
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.MQTT,
+                message = "Escalation topic L.$lineCode: wildcard /# (+7s silenzio)",
+                detail = "raw=${rawPublishCount.get()} parsed=${parsedVehicleCount.get()}",
+                severity = DiagSeverity.WARN,
+            )
             for (rootTopic in listOf("/#", "#")) {
                 val pid = (packetIdGen.getAndIncrement() and 0x7FFF).coerceAtLeast(1)
                 runCatching {
@@ -1035,7 +1062,7 @@ class MatoMqttLiveClient(
             val payload: ByteArray,
             val qos: Int = 0,
             val packetId: Int? = null,
-            val retain: Boolean = false,
+            val isRetained: Boolean = false,
         ) : MqttPacket()
         data object PingResp : MqttPacket()
     }
@@ -1086,9 +1113,9 @@ class MatoMqttLiveClient(
                             packets.add(MqttPacket.ConnAck(rc))
                         }
                     }
-                    3 -> { // PUBLISH
+                    3 -> { // PUBLISH (bit 0 = RETAIN, bits 1-2 = QoS, bit 3 = DUP)
                         val qos = (header and 0x06) ushr 1
-                        val retain = (header and 0x01) != 0
+                        val isRetained = (header and 0x01) != 0
                         if (remainingLength >= 2) {
                             val topicLen = ((combined[bodyStart].toInt() and 0xFF) shl 8) or
                                 (combined[bodyStart + 1].toInt() and 0xFF)
@@ -1103,7 +1130,7 @@ class MatoMqttLiveClient(
                             }
                             val payloadStart = (topicEnd + if (qos > 0) 2 else 0).coerceAtMost(packetEnd)
                             val payload = combined.copyOfRange(payloadStart, packetEnd)
-                            packets.add(MqttPacket.Publish(topic, payload, qos, packetId, retain))
+                            packets.add(MqttPacket.Publish(topic, payload, qos, packetId, isRetained))
                         }
                     }
                     9 -> { // SUBACK
@@ -1131,7 +1158,8 @@ class MatoMqttLiveClient(
 
     companion object {
         private const val TAG = "MatoMqttLive"
-        private const val LIVE_TTL_MILLIS = 95_000L
+        private const val LIVE_TTL_MILLIS = 120_000L
+        private const val RETAINED_STAGING_TTL_MILLIS = 10 * 60_000L
         private const val NOTIFY_DEBOUNCE_MS = 1_500L
         private const val BROWSER_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
@@ -1184,21 +1212,23 @@ class MatoMqttLiveClient(
             val prefixedGroup = mutableListOf<String>()
             val gtfsRtGroup = mutableListOf<String>()
 
-            // Group 0: Clean exact / single-level topics sent 1-per-SUBSCRIBE packet first
+            // Group 0: Minimal, non-overlapping primary 5T topics (avoids 40-topic duplicate delivery bursts!)
             for (v in primaryVariants) {
                 exactPrimary.add("/$v/+")
-                exactPrimary.add("$v/+")
                 exactPrimary.add("/$v")
+                exactPrimary.add("$v/+")
                 exactPrimary.add(v)
-                exactPrimary.add("/gtt:$v")
-                exactPrimary.add("gtt:$v")
-                exactPrimary.add("/map/v1/eta/$v")
-                exactPrimary.add("/map/v1/eta/$v/+")
-                exactPrimary.add("/map/v1/eta/gtt:$v")
-                exactPrimary.add("/gtt/$v")
             }
 
-            // Group 1: Direct multi-level wildcards + secondary route suffixes (F/E)
+            // Group 1: Secondary prefixed/wildcard topics (sent ONLY if Group 0 stays silent)
+            for (v in primaryVariants) {
+                wildcardGroup.add("/gtt:$v")
+                wildcardGroup.add("gtt:$v")
+                wildcardGroup.add("/map/v1/eta/$v")
+                wildcardGroup.add("/map/v1/eta/$v/+")
+                wildcardGroup.add("/map/v1/eta/gtt:$v")
+                wildcardGroup.add("/gtt/$v")
+            }
             for (v in allVariants) {
                 wildcardGroup.add("/$v/#")
                 wildcardGroup.add("$v/#")
@@ -1271,6 +1301,19 @@ class MatoMqttLiveClient(
             return wrapFixedHeader(0x82, body.toByteArray())
         }
 
+        internal fun encodeUnsubscribePacket(
+            packetId: Int,
+            topics: List<String>,
+        ): ByteArray {
+            val body = ByteArrayOutputStream()
+            body.write((packetId ushr 8) and 0xFF)
+            body.write(packetId and 0xFF)
+            for (topic in topics) {
+                writeMqttString(body, topic)
+            }
+            return wrapFixedHeader(0xA2, body.toByteArray())
+        }
+
         internal fun encodePubAckPacket(packetId: Int): ByteArray = byteArrayOf(
             0x40,
             0x02,
@@ -1317,6 +1360,20 @@ class MatoMqttLiveClient(
             topic: String,
             payload: ByteArray,
             nowMillis: Long = System.currentTimeMillis(),
+            isRetained: Boolean = false,
+        ): List<BusVehicle> {
+            val parsed = parseMatoMessageRaw(topic, payload, nowMillis)
+            return if (!isRetained || parsed.isEmpty()) {
+                parsed
+            } else {
+                parsed.map { it.copy(isMqttRetained = true) }
+            }
+        }
+
+        private fun parseMatoMessageRaw(
+            topic: String,
+            payload: ByteArray,
+            nowMillis: Long,
         ): List<BusVehicle> {
             if (payload.isEmpty()) return emptyList()
             val effectivePayload = if (
@@ -1446,6 +1503,7 @@ class MatoMqttLiveClient(
                         contributingSources = setOf("MaTO Live"),
                         nextStopId = topicMeta.nextStopId,
                         fetchedAtMillis = nowMillis,
+                        hasExplicitTimestamp = false,
                     ),
                 )
             }
@@ -1619,10 +1677,10 @@ class MatoMqttLiveClient(
             if (cleanVehId.isEmpty()) return null
 
             val nowSec = nowMillis / 1000L
-            val optionalTs = doubleAt(7)?.toLong()?.let { raw ->
+            val explicitTs = doubleAt(7)?.toLong()?.let { raw ->
                 val sec = if (raw > 1_000_000_000_000L) raw / 1000L else raw
                 sec.takeIf { it in 1_600_000_000L..(nowSec + 120L) }
-            } ?: nowSec
+            }
 
             return BusVehicle(
                 entityId = "mato_${cleanVehId}_$normalizedLine",
@@ -1636,13 +1694,14 @@ class MatoMqttLiveClient(
                 longitude = lon,
                 bearing = heading,
                 speedKmh = speedKmh,
-                timestampSeconds = optionalTs,
+                timestampSeconds = explicitTs ?: nowSec,
                 stopId = nextStop,
                 status = VehicleStopStatus.IN_TRANSIT_TO,
                 sourceName = "MaTO Live",
                 contributingSources = setOf("MaTO Live"),
                 nextStopId = nextStop,
                 fetchedAtMillis = nowMillis,
+                hasExplicitTimestamp = explicitTs != null,
             )
         }
 
@@ -1873,7 +1932,8 @@ class MatoMqttLiveClient(
                 ?.substringAfterLast(":")
                 ?: topicMeta.nextStopId
 
-            val tsSeconds = parseTimestampSeconds(fields, nowMillis)
+            val explicitTs = parseExplicitTimestampSeconds(fields, nowMillis)
+            val tsSeconds = explicitTs ?: (nowMillis / 1000L)
 
             return BusVehicle(
                 entityId = "mato_${cleanVehId}_$normalizedLine",
@@ -1894,6 +1954,7 @@ class MatoMqttLiveClient(
                 contributingSources = setOf("MaTO Live"),
                 nextStopId = nextStop,
                 fetchedAtMillis = nowMillis,
+                hasExplicitTimestamp = explicitTs != null,
             )
         }
 
@@ -2162,7 +2223,7 @@ class MatoMqttLiveClient(
             return null
         }
 
-        private fun parseTimestampSeconds(fields: Map<String, String>, nowMillis: Long): Long {
+        private fun parseExplicitTimestampSeconds(fields: Map<String, String>, nowMillis: Long): Long? {
             val nowSec = nowMillis / 1000L
             for (k in listOf("tsi", "timestamp", "ts", "lastupdated", "last_updated", "time", "t")) {
                 val rawStr = fields[k]?.trim() ?: continue
@@ -2177,7 +2238,7 @@ class MatoMqttLiveClient(
                     ?.takeIf { it in 1_600_000_000L..(nowSec + 120L) }
                     ?.let { return it }
             }
-            return nowSec
+            return null
         }
 
         internal fun isRegressiveTimestamp(existingTsSec: Long, incomingTsSec: Long): Boolean {

@@ -18,7 +18,10 @@ import com.example.data.model.FavoriteStop
 import com.example.data.model.StopArrival
 import com.example.data.model.isGenericDirectionLabel
 import com.example.data.model.shortTurinPlaceName
+import com.example.data.network.DiagCategory
+import com.example.data.network.DiagSeverity
 import com.example.data.network.GttRealtimeRepository
+import com.example.data.network.ToBusDiagnosticsLog
 import com.example.data.preferences.ToBusPreferences
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -218,6 +221,19 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
                 }
             }
 
+            // On silent background ticks during standby/Doze offline, preserve the existing board
+            // and let JobScheduler retry the instant connectivity returns.
+            if (!showLoading && !BusMapWidgetProvider.isNetworkReadyForWidget(context)) {
+                ToBusDiagnosticsLog.record(
+                    category = DiagCategory.WIDGET,
+                    message = "Stops widget skip standby/offline (${targetIds.size}w)",
+                    detail = "netReady=false -> JobScheduler retry",
+                    severity = DiagSeverity.INFO,
+                )
+                WidgetRefreshJobScheduler.scheduleNetworkRetry(context)
+                return
+            }
+
             val distinctStops = stopByWidgetId.values.map { it.second }.distinctBy { it.stopId }
             val repo = GttRealtimeRepository.getInstance(context)
             val fetchNow = System.currentTimeMillis()
@@ -238,34 +254,60 @@ class StopArrivalsWidgetProvider : AppWidgetProvider() {
                 cached
             }
 
-            // Fetch ALL lines arriving at each active widget's stop in parallel
+            // Fetch ALL lines arriving at each active widget's stop in parallel, distinguishing
+            // network/timeout failures (null) from genuine 0-bus responses (emptyList)
+            var anyStopTimedOut = false
             val arrivalsByStopId: Map<String, List<StopArrival>> = coroutineScope {
                 distinctStops.map { fav ->
                     async {
                         val lineVehicles = snap?.allVehicles?.filter {
                             it.lineCode.equals(fav.lineCode, ignoreCase = true)
                         }.orEmpty()
-                        val list = withTimeoutOrNull(4_500L) {
+                        val fetchedOrNull = withTimeoutOrNull(4_500L) {
                             runCatching {
                                 repo.fetchStopArrivals(
                                     stop = fav.toTransitStop(),
                                     preferredLine = fav.lineCode.ifBlank { settings.selectedLine },
                                     liveVehicles = lineVehicles,
                                 )
-                            }.getOrDefault(emptyList())
-                        }.orEmpty()
-                        fav.stopId to list
+                            }.getOrNull()
+                        }
+                        if (fetchedOrNull == null) {
+                            anyStopTimedOut = true
+                        }
+                        fav.stopId to fetchedOrNull.orEmpty()
                     }
                 }.awaitAll().toMap()
             }
 
-            // On silent background ticks, if the network completely timed out, keep previous cached rows intact
+            // On silent background ticks, if the network/stop fetch timed out (even when an older in-memory
+            // vehicle snapshot still existed), keep previous cached rows intact instead of blanking the widget.
             val allEmpty = arrivalsByStopId.values.all { it.isEmpty() }
-            if (!showLoading && snap == null && allEmpty) {
+            val snapStale = snap == null || (fetchNow - snap.fetchedAtMillis > 5 * 60_000L)
+            if (!showLoading && allEmpty && (anyStopTimedOut || snapStale)) {
+                ToBusDiagnosticsLog.record(
+                    category = DiagCategory.WIDGET,
+                    message = "Stops widget preserva board precedente (timeout rete)",
+                    detail = "stops=${distinctStops.joinToString(",") { it.stopCode }} timedOut=$anyStopTimedOut snapStale=$snapStale -> JobScheduler retry",
+                    severity = DiagSeverity.WARN,
+                )
+                WidgetRefreshJobScheduler.scheduleNetworkRetry(context)
                 return
             }
 
             val nowMillis = System.currentTimeMillis()
+            val stopsSummary = distinctStops.joinToString(" ") { fav ->
+                val arrs = arrivalsByStopId[fav.stopId].orEmpty()
+                val live = arrs.count { it.isRealtime }
+                "#${fav.stopCode}:${arrs.size}(live=$live)"
+            }
+            ToBusDiagnosticsLog.record(
+                category = DiagCategory.WIDGET,
+                message = "Stops widget aggiornato (${targetIds.size}w${if (showLoading) ",manual" else ",auto"})",
+                detail = "$stopsSummary · snapVeh=${snap?.allVehicles?.size ?: 0}",
+                severity = if (allEmpty && snap == null) DiagSeverity.WARN else DiagSeverity.OK,
+                timestampMillis = nowMillis,
+            )
             val timeStr = SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(nowMillis))
 
             for (id in targetIds) {

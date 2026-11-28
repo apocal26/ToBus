@@ -27,9 +27,13 @@ internal class GttMatoGraphQlClient(
     var preferredVpQueryIdx: Int = 0
         private set
 
+    @Volatile
+    private var vpUnavailableUntilMillis: Long = 0L
+
     fun resetPreferredEndpoints() {
         preferredVpEndpointIdx = 0
         preferredVpQueryIdx = 0
+        vpUnavailableUntilMillis = 0L
     }
 
     /**
@@ -39,10 +43,10 @@ internal class GttMatoGraphQlClient(
     fun fetchVehiclePositions(
         lineCode: String,
         nowMillis: Long,
-        onVehicleTimestampObserved: ((vehicleId: String, lineCode: String, lat: Double, lon: Double, timestampSeconds: Long, isStale: Boolean) -> Unit)? = null,
     ): List<BusVehicle> {
         val cleanLine = lineCode.trim().uppercase()
         if (cleanLine.isEmpty()) return emptyList()
+        if (nowMillis < vpUnavailableUntilMillis) return emptyList()
         val safeLine = cleanLine.replace("\"", "").replace("\\", "")
         val queries = listOf(
             """
@@ -99,6 +103,7 @@ internal class GttMatoGraphQlClient(
 
         val endpointOrder = VP_ENDPOINTS.indices.sortedBy { if (it == preferredVpEndpointIdx) 0 else 1 }
         val queryOrder = queries.indices.sortedBy { if (it == preferredVpQueryIdx) 0 else 1 }
+        var anyValidVpSchemaResponse = false
 
         for (epIdx in endpointOrder) {
             val endpoint = VP_ENDPOINTS[epIdx]
@@ -133,8 +138,8 @@ internal class GttMatoGraphQlClient(
                             }
                             continue
                         }
+                        anyValidVpSchemaResponse = true
                         val out = mutableListOf<BusVehicle>()
-                        var sawMatchingRoute = false
 
                         for (r in 0 until routes.length()) {
                             val routeObj = routes.optJSONObject(r) ?: continue
@@ -146,7 +151,6 @@ internal class GttMatoGraphQlClient(
                             ) {
                                 continue
                             }
-                            sawMatchingRoute = true
 
                             val patterns = routeObj.optJSONArray("patterns") ?: continue
                             for (p in 0 until patterns.length()) {
@@ -177,21 +181,14 @@ internal class GttMatoGraphQlClient(
                                     }
                                     val lastUpdRaw = vp.optLong("lastUpdated", 0L)
                                     val normalizedUpd = if (lastUpdRaw > 1_000_000_000_000L) lastUpdRaw / 1000L else lastUpdRaw
+                                    val hasExplicitTs = normalizedUpd >= 1_600_000_000L
                                     val tsSec = when {
-                                        normalizedUpd <= 0L -> 0L
+                                        !hasExplicitTs -> nowSec
                                         normalizedUpd > nowSec + 120L -> nowSec
-                                        normalizedUpd >= 1_600_000_000L -> normalizedUpd
-                                        else -> 0L
+                                        else -> normalizedUpd
                                     }
-                                    // If MaTO OTP GraphQL itself reports a vehicle position older than 2.5 minutes,
-                                    // notify the repository/MQTT client so any retained MQTT packet for this zombie
-                                    // is immediately evicted too, then skip it.
-                                    if (tsSec > 0L) {
-                                        val isStale = (nowSec - tsSec) > 150L
-                                        onVehicleTimestampObserved?.invoke(cleanVeh, normRoute, lat, lon, tsSec, isStale)
-                                        if (isStale) {
-                                            continue
-                                        }
+                                    if (hasExplicitTs && (nowSec - tsSec) > GttVehicleMergeEngine.MAX_VEHICLE_ZOMBIE_AGE_SECONDS) {
+                                        continue
                                     }
                                     val tripId = GtfsRtProtobufParser.normalizeTripId(
                                         vp.optJSONObject("trip")?.optString("gtfsId"),
@@ -225,7 +222,8 @@ internal class GttMatoGraphQlClient(
                                             sourceName = "MaTO Live",
                                             contributingSources = setOf("MaTO Live"),
                                             nextStopId = stopId,
-                                            fetchedAtMillis = if (tsSec > 0L) tsSec * 1000L else nowMillis,
+                                            fetchedAtMillis = nowMillis,
+                                            hasExplicitTimestamp = hasExplicitTs,
                                         ),
                                     )
                                 }
@@ -234,10 +232,8 @@ internal class GttMatoGraphQlClient(
                         if (out.isNotEmpty()) {
                             preferredVpEndpointIdx = epIdx
                             preferredVpQueryIdx = qIdx
+                            vpUnavailableUntilMillis = 0L
                             return out
-                        }
-                        if (sawMatchingRoute) {
-                            break
                         }
                     }
                 } catch (e: Exception) {
@@ -245,6 +241,9 @@ internal class GttMatoGraphQlClient(
                     Log.d(TAG, "MaTO GraphQL VP skip $endpoint: ${e.message}")
                 }
             }
+        }
+        if (!anyValidVpSchemaResponse) {
+            vpUnavailableUntilMillis = nowMillis + VP_UNAVAILABLE_COOLDOWN_MS
         }
         return emptyList()
     }
@@ -337,6 +336,7 @@ internal class GttMatoGraphQlClient(
 
     companion object {
         private const val TAG = "GttMatoGraphQlClient"
+        private const val VP_UNAVAILABLE_COOLDOWN_MS = 5L * 60L * 1000L
 
         private val VP_ENDPOINTS = listOf(
             "https://mato.muoversiatorino.it/otp/gtfs/v1",

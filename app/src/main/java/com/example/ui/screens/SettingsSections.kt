@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -55,6 +56,8 @@ import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
+import com.example.data.model.RouteColorPalette
+import com.example.data.model.ServiceAlertCategory
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.shortTurinPlaceName
 import com.example.ui.glass.AccentIconBadge
@@ -62,6 +65,7 @@ import com.example.ui.glass.DirectionColorBadge
 import com.example.ui.glass.GlassBand
 import com.example.ui.glass.GlassCard
 import com.example.ui.glass.GlassCircleIconButton
+import com.example.ui.glass.LiquidGlassCheckbox
 import com.example.ui.glass.LiquidGlassSwitch
 import com.example.ui.glass.SlidingGlassSegmentedControl
 import com.example.ui.glass.glassInteractive
@@ -82,6 +86,7 @@ import com.example.ui.theme.TextBody
 import com.example.ui.theme.TextHero
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSubtitle
+import com.example.ui.theme.visualStyle
 import com.example.ui.viewmodel.ToBusUiState
 
 @Composable
@@ -93,11 +98,18 @@ internal fun WidgetControlsColumn(
     onCaptureCurrentMapArea: () -> Unit,
     onToggleVehicleLabels: (Boolean) -> Unit,
     onToggleRouteLine: (Boolean) -> Unit,
+    onToggleStopsOnMap: (Boolean) -> Unit = {},
+    onToggleDepotsOnMap: (Boolean) -> Unit = {},
     onToggleColorByDirection: (Boolean) -> Unit,
+    onSelectRouteColorPalette: (RouteColorPalette) -> Unit = {},
+    onToggleRouteInWidget: (Boolean) -> Unit = {},
+    onToggleFavoriteStopsInWidget: (Boolean) -> Unit = {},
     onToggleHideInactiveInWidget: (Boolean) -> Unit,
     onToggleHideInactiveOnMap: (Boolean) -> Unit,
     onToggleShowServiceAlerts: (Boolean) -> Unit,
     onToggleNotifyFavoriteLineAlerts: (Boolean) -> Unit,
+    onToggleNotifyAlertCategory: (ServiceAlertCategory) -> Unit = {},
+    onToggleAllNotifyAlertCategories: (Boolean) -> Unit = {},
     onToggleKeepScreenOn: (Boolean) -> Unit,
     onSelectDataSourceMode: (DataSourceMode) -> Unit,
     onSelectLivePollInterval: (LivePollInterval) -> Unit,
@@ -259,7 +271,11 @@ internal fun WidgetControlsColumn(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
-                                val favAccent = if (settings.colorByDirection && fav.directionId == 1) AccentCyan else AccentGold
+                                val favAccent = if (settings.colorByDirection && fav.directionId == 1) {
+                                    Color(settings.routeColorPalette.secondaryArgb)
+                                } else {
+                                    Color(settings.routeColorPalette.primaryArgb)
+                                }
                                 val favTerminus = fav.terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName)
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
@@ -307,6 +323,26 @@ internal fun WidgetControlsColumn(
                 checked = settings.showRouteLine,
                 onCheckedChange = onToggleRouteLine,
                 testTag = "toggle_route_line",
+            )
+            SettingsRowDivider()
+            GlassToggleRow(
+                title = "Pallini delle fermate",
+                subtitle = "Mostra le fermate lungo il percorso",
+                icon = Icons.Rounded.Place,
+                iconAccent = AccentCyan,
+                checked = settings.showStopsOnMap,
+                onCheckedChange = onToggleStopsOnMap,
+                testTag = "toggle_stops_on_map",
+            )
+            SettingsRowDivider()
+            GlassToggleRow(
+                title = "Depositi GTT sulla mappa",
+                subtitle = "Evidenzia i piazzali e depositi GTT di Torino",
+                icon = ToBusIcons.DirectionsBus,
+                iconAccent = AccentGold,
+                checked = settings.showDepotsOnMap,
+                onCheckedChange = onToggleDepotsOnMap,
+                testTag = "toggle_depots_on_map",
             )
             SettingsRowDivider()
             GlassToggleRow(
@@ -371,6 +407,15 @@ internal fun WidgetControlsColumn(
 
             Spacer(modifier = Modifier.height(14.dp))
             HorizontalDivider(color = GlassBandBorder)
+            Spacer(modifier = Modifier.height(12.dp))
+
+            RoutePalettePickerRow(
+                selected = settings.routeColorPalette,
+                onSelect = onSelectRouteColorPalette,
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+            HorizontalDivider(color = GlassBandBorder)
             Spacer(modifier = Modifier.height(4.dp))
 
             val dir0Short = uiState.terminusForDirection(0)?.let(::shortTurinPlaceName)
@@ -378,6 +423,7 @@ internal fun WidgetControlsColumn(
             DirectionColorsToggleRow(
                 dir0Name = dir0Short,
                 dir1Name = dir1Short,
+                palette = settings.routeColorPalette,
                 checked = settings.colorByDirection,
                 onCheckedChange = onToggleColorByDirection,
             )
@@ -386,11 +432,18 @@ internal fun WidgetControlsColumn(
         // ═══════════════════════════════════════════════════════════════════════
         // 4. NOTIFICHE E AVVISI
         // ═══════════════════════════════════════════════════════════════════════
+        val totalCategories = ServiceAlertCategory.entries.size
+        val activeCategoriesCount = settings.notifyAlertCategories.size
         SettingsSection(
             title = "NOTIFICHE E AVVISI",
             icon = ToBusIcons.NotificationsActive,
             accent = AccentOrange,
-            trailingBadge = if (settings.notifyFavoriteLineAlerts) "Attive" else null,
+            trailingBadge = when {
+                !settings.notifyFavoriteLineAlerts -> null
+                activeCategoriesCount == totalCategories -> "Tutte"
+                activeCategoriesCount == 0 -> "Nessuna"
+                else -> "$activeCategoriesCount/$totalCategories tipi"
+            },
         ) {
             val favLinesPreview = remember(uiState.favoriteLines) {
                 if (uiState.favoriteLines.isEmpty()) {
@@ -410,6 +463,13 @@ internal fun WidgetControlsColumn(
                 onCheckedChange = onToggleNotifyFavoriteLineAlerts,
                 testTag = "toggle_notify_favorite_alerts",
             )
+            AnimatedVisibility(visible = settings.notifyFavoriteLineAlerts) {
+                NotifyAlertCategoriesChecklist(
+                    selectedCategories = settings.notifyAlertCategories,
+                    onToggleCategory = onToggleNotifyAlertCategory,
+                    onToggleAll = onToggleAllNotifyAlertCategories,
+                )
+            }
             SettingsRowDivider()
             GlassToggleRow(
                 title = "Avvisi e deviazioni GTT",
@@ -514,6 +574,26 @@ internal fun WidgetControlsColumn(
             HorizontalDivider(color = GlassBandBorder)
             Spacer(modifier = Modifier.height(4.dp))
 
+            GlassToggleRow(
+                title = "Percorso nel widget",
+                subtitle = "Disegna il tracciato della linea nella mappa del widget",
+                icon = ToBusIcons.MapRounded,
+                iconAccent = AccentCyan,
+                checked = settings.showRouteInWidget,
+                onCheckedChange = onToggleRouteInWidget,
+                testTag = "toggle_route_in_widget",
+            )
+            SettingsRowDivider()
+            GlassToggleRow(
+                title = "Fermate preferite nel widget",
+                subtitle = "Mostra i segnaposto delle tue fermate ★ nel widget",
+                icon = Icons.Rounded.Place,
+                iconAccent = AccentGold,
+                checked = settings.showFavoriteStopsInWidget,
+                onCheckedChange = onToggleFavoriteStopsInWidget,
+                testTag = "toggle_fav_stops_widget",
+            )
+            SettingsRowDivider()
             GlassToggleRow(
                 title = "Nascondi mezzi fermi nel widget",
                 subtitle = "Esclude dal widget bus in deposito o con GPS vecchio",
@@ -982,14 +1062,93 @@ private fun GlassToggleRow(
     }
 }
 
+@Composable
+private fun RoutePalettePickerRow(
+    selected: RouteColorPalette,
+    onSelect: (RouteColorPalette) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = "Colori linee e mezzi",
+            style = MaterialTheme.typography.titleSmall,
+            color = TextPrimary,
+        )
+        Spacer(modifier = Modifier.height(3.dp))
+        Text(
+            text = "Tonalità di percorsi, fermate e pullman su mappa e widget.",
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSubtitle,
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            RouteColorPalette.entries.forEach { palette ->
+                val isSelected = palette == selected
+                val primaryColor = Color(palette.primaryArgb)
+                val secondaryColor = Color(palette.secondaryArgb)
+                val interaction = remember(palette.id) { MutableInteractionSource() }
+                val shape = RoundedCornerShape(14.dp)
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 52.dp)
+                        .glassInteractive(interaction, enableHoverScale = false) { onSelect(palette) }
+                        .background(if (isSelected) GlassRowActiveFill else GlassRowFill, shape)
+                        .border(
+                            width = if (isSelected) 1.25.dp else 1.dp,
+                            color = if (isSelected) primaryColor.copy(alpha = 0.75f) else GlassRowBorder,
+                            shape = shape,
+                        )
+                        .padding(horizontal = 6.dp, vertical = 9.dp)
+                        .testTag("route_palette_${palette.id}"),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(11.dp)
+                                .background(primaryColor, CircleShape)
+                                .border(1.dp, Color.White.copy(alpha = if (isSelected) 0.72f else 0.30f), CircleShape),
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(11.dp)
+                                .background(secondaryColor, CircleShape)
+                                .border(1.dp, Color.White.copy(alpha = if (isSelected) 0.72f else 0.30f), CircleShape),
+                        )
+                    }
+                    Text(
+                        text = palette.labelIt,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                        ),
+                        color = if (isSelected) TextPrimary else TextSubtitle,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DirectionColorsToggleRow(
     dir0Name: String?,
     dir1Name: String?,
+    palette: RouteColorPalette,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
 ) {
+    val primaryColor = Color(palette.primaryArgb)
+    val secondaryColor = Color(palette.secondaryArgb)
     val interaction = remember { MutableInteractionSource() }
     Row(
         modifier = Modifier
@@ -1002,12 +1161,12 @@ private fun DirectionColorsToggleRow(
             modifier = Modifier
                 .size(34.dp)
                 .background(
-                    color = if (checked) AccentGold.copy(alpha = 0.15f) else Color(0x12FFFFFF),
+                    color = if (checked) primaryColor.copy(alpha = 0.15f) else Color(0x12FFFFFF),
                     shape = RoundedCornerShape(11.dp),
                 )
                 .border(
                     width = 1.dp,
-                    color = if (checked) AccentGold.copy(alpha = 0.34f) else GlassRowBorder,
+                    color = if (checked) primaryColor.copy(alpha = 0.34f) else GlassRowBorder,
                     shape = RoundedCornerShape(11.dp),
                 ),
             contentAlignment = Alignment.Center,
@@ -1015,7 +1174,7 @@ private fun DirectionColorsToggleRow(
             Icon(
                 imageVector = Icons.Rounded.Refresh,
                 contentDescription = null,
-                tint = if (checked) AccentGold else TextSubtitle,
+                tint = if (checked) primaryColor else TextSubtitle,
                 modifier = Modifier.size(17.dp),
             )
         }
@@ -1036,11 +1195,11 @@ private fun DirectionColorsToggleRow(
                 ) {
                     DirectionColorBadge(
                         label = dir0Name,
-                        accent = AccentGold,
+                        accent = primaryColor,
                     )
                     DirectionColorBadge(
                         label = dir1Name,
-                        accent = AccentCyan,
+                        accent = secondaryColor,
                     )
                 }
             } else {
@@ -1057,5 +1216,130 @@ private fun DirectionColorsToggleRow(
             onCheckedChange = onCheckedChange,
             modifier = Modifier.testTag("toggle_color_direction"),
         )
+    }
+}
+
+@Composable
+private fun NotifyAlertCategoriesChecklist(
+    selectedCategories: Set<ServiceAlertCategory>,
+    onToggleCategory: (ServiceAlertCategory) -> Unit,
+    onToggleAll: (Boolean) -> Unit,
+) {
+    val allCategories = ServiceAlertCategory.entries
+    val allSelected = selectedCategories.size == allCategories.size
+    val partiallySelected = selectedCategories.isNotEmpty() && !allSelected
+    val shape = RoundedCornerShape(14.dp)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp, bottom = 10.dp)
+            .background(GlassRowFill, shape)
+            .border(1.dp, GlassRowBorder, shape)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        // Master "Tutte le categorie" glass checkbox row
+        val allInt = remember { MutableInteractionSource() }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .glassInteractive(allInt, enableHoverScale = false) { onToggleAll(!allSelected) }
+                .padding(horizontal = 2.dp)
+                .testTag("notify_cat_all"),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            LiquidGlassCheckbox(
+                checked = allSelected,
+                indeterminate = partiallySelected,
+                onCheckedChange = null,
+                accentColor = AccentGold,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = "Tutte le categorie",
+                style = MaterialTheme.typography.titleSmall,
+                color = TextPrimary,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                modifier = Modifier
+                    .background(
+                        color = if (selectedCategories.isEmpty()) {
+                            AccentOrange.copy(alpha = 0.14f)
+                        } else {
+                            AccentGold.copy(alpha = 0.14f)
+                        },
+                        shape = RoundedCornerShape(999.dp),
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (selectedCategories.isEmpty()) {
+                            AccentOrange.copy(alpha = 0.35f)
+                        } else {
+                            AccentGold.copy(alpha = 0.35f)
+                        },
+                        shape = RoundedCornerShape(999.dp),
+                    )
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = "${selectedCategories.size}/${allCategories.size}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (selectedCategories.isEmpty()) AccentOrange else AccentGold,
+                )
+            }
+        }
+
+        HorizontalDivider(
+            modifier = Modifier.padding(vertical = 2.dp),
+            color = GlassBandBorder,
+        )
+
+        allCategories.forEach { category ->
+            val isChecked = category in selectedCategories
+            val style = category.visualStyle()
+            val rowInt = remember(category.id) { MutableInteractionSource() }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .glassInteractive(rowInt, enableHoverScale = false) { onToggleCategory(category) }
+                    .padding(horizontal = 2.dp)
+                    .testTag("notify_cat_${category.id}"),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                LiquidGlassCheckbox(
+                    checked = isChecked,
+                    onCheckedChange = null,
+                    accentColor = style.accent,
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .background(
+                            color = if (isChecked) style.accent else style.accent.copy(alpha = 0.35f),
+                            shape = CircleShape,
+                        ),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = category.filterLabelIt,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (isChecked) TextPrimary else TextSubtitle,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+
+        if (selectedCategories.isEmpty()) {
+            Text(
+                text = "Seleziona almeno un tipo di avviso per ricevere notifiche.",
+                style = MaterialTheme.typography.labelSmall,
+                color = AccentOrange,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp),
+            )
+        }
     }
 }

@@ -389,4 +389,145 @@ class FavoriteAlertNotifierAndCatalogTest {
             listOf(extraBuses, metroElevator, diversion, strike).maxByOrNull { it.classifyCategory().priority }?.classifyCategory(),
         )
     }
+
+    @Test
+    fun serviceAlertOrganizer_cleansHtmlMergesPerLineClonesAndOrganizesWithoutDuplicates() {
+        val now = 1_764_200_000L
+        val activePeriod = listOf(AlertTimeRange(startEpochSeconds = now - 600L, endEpochSeconds = now + 7_200L))
+
+        val rawAlerts = listOf(
+            // Per-line clones of the same event (should merge into 1 alert covering lines 4 and 11)
+            ServiceAlertInfo(
+                id = "e_101",
+                headerText = "Linea 4 - Deviazione in Piazza Castello",
+                descriptionText = "Cantiere &amp; chiusura temporanea:<br>percorso deviato su corso Vittorio Emanuele II.",
+                affectedLines = setOf("4"),
+                activePeriods = activePeriod,
+            ),
+            ServiceAlertInfo(
+                id = "e_102",
+                headerText = "Linea 11 - Deviazione in Piazza Castello",
+                descriptionText = "Cantiere & chiusura temporanea: percorso deviato su corso Vittorio Emanuele II.",
+                affectedLines = setOf("11"),
+                activePeriods = activePeriod,
+            ),
+            // Exact duplicate with punctuation & whitespace difference
+            ServiceAlertInfo(
+                id = "e_103",
+                headerText = "  Linea 11 - deviazione in piazza castello! ",
+                descriptionText = "Cantiere &amp; chiusura temporanea: percorso deviato su corso Vittorio Emanuele II",
+                affectedLines = setOf("11", "?"),
+                activePeriods = activePeriod,
+            ),
+            // Favorite-only line alert
+            ServiceAlertInfo(
+                id = "e_200",
+                headerText = "Fermata spostata",
+                descriptionText = "Fermata 471 spostata di 30 metri per lavori.",
+                affectedLines = setOf("15"),
+                activePeriods = activePeriod,
+            ),
+            // General network-wide strike (empty affectedLines)
+            ServiceAlertInfo(
+                id = "e_300",
+                headerText = "Sciopero nazionale del trasporto pubblico",
+                descriptionText = "Possibili cancellazioni su tutte le linee urbane e suburbane.&nbsp;",
+                affectedLines = emptySet(),
+                activePeriods = activePeriod,
+            ),
+            // Other city line alert
+            ServiceAlertInfo(
+                id = "e_400",
+                headerText = "Potenziamento linea 68",
+                descriptionText = "Corse aggiuntive per evento serale.",
+                affectedLines = setOf("68"),
+                activePeriods = activePeriod,
+            ),
+        )
+
+        val cleaned = com.example.data.model.ServiceAlertOrganizer.cleanAndDeduplicate(rawAlerts, nowEpochSeconds = now)
+        assertEquals(4, cleaned.size)
+
+        val mergedDetour = cleaned.first { it.affectedLines.contains("4") }
+        assertEquals(setOf("4", "11"), mergedDetour.affectedLines)
+        assertEquals("Deviazione in Piazza Castello", mergedDetour.headerText)
+        assertTrue(!mergedDetour.descriptionText.contains("<br>"))
+        assertTrue(!mergedDetour.descriptionText.contains("&amp;"))
+
+        val organized = com.example.data.model.ServiceAlertOrganizer.organize(
+            alerts = cleaned,
+            selectedLine = "4",
+            favoriteLines = listOf("4", "15"),
+            nowEpochSeconds = now,
+        )
+        assertEquals(1, organized.selectedLineAlerts.size)
+        assertEquals(1, organized.favoriteLineAlerts.size)
+        assertEquals(1, organized.networkWideAlerts.size)
+        assertEquals(1, organized.otherLineAlerts.size)
+        assertEquals(4, organized.totalCount)
+        assertEquals(setOf("15"), organized.favoriteLineAlerts.first().affectedLines)
+        assertTrue(organized.networkWideAlerts.first().affectedLines.isEmpty())
+        assertEquals(setOf("68"), organized.otherLineAlerts.first().affectedLines)
+    }
+
+    @Test
+    fun findNewFavoriteLineAlerts_respectsAllowedCategoriesCheckboxesAndNetworkCritical() {
+        val now = 1_764_200_000L
+        val period = listOf(AlertTimeRange(startEpochSeconds = now - 300L, endEpochSeconds = now + 7_200L))
+
+        val strikeGeneral = ServiceAlertInfo(
+            id = "cat_crit",
+            headerText = "Sciopero generale GTT",
+            descriptionText = "Servizio sospeso su tutte le linee dalle 9 alle 12.",
+            affectedLines = emptySet(),
+            activePeriods = period,
+        )
+        val detourFav = ServiceAlertInfo(
+            id = "cat_detour",
+            headerText = "Deviazione linea 12 per lavori",
+            descriptionText = "Percorso deviato in corso Orbassano.",
+            affectedLines = setOf("12"),
+            activePeriods = period,
+        )
+        val infoFav = ServiceAlertInfo(
+            id = "cat_info",
+            headerText = "Orario festivo linea 12",
+            descriptionText = "Domenica in vigore l'orario festivo.",
+            affectedLines = setOf("12"),
+            activePeriods = period,
+        )
+        val allAlerts = listOf(strikeGeneral, detourFav, infoFav)
+
+        // Only disruptions selected -> only detourFav notifies
+        val onlyDisruptions = FavoriteAlertNotifier.findNewFavoriteLineAlerts(
+            alerts = allAlerts,
+            favoriteLines = listOf("12"),
+            seenFingerprints = emptySet(),
+            nowEpochSeconds = now,
+            allowedCategories = setOf(com.example.data.model.ServiceAlertCategory.DISRUPTION),
+        )
+        assertEquals(1, onlyDisruptions.size)
+        assertEquals("cat_detour", onlyDisruptions.first().alert.id)
+
+        // Only critical selected -> general GTT strike notifies
+        val onlyCritical = FavoriteAlertNotifier.findNewFavoriteLineAlerts(
+            alerts = allAlerts,
+            favoriteLines = listOf("12"),
+            seenFingerprints = emptySet(),
+            nowEpochSeconds = now,
+            allowedCategories = setOf(com.example.data.model.ServiceAlertCategory.CRITICAL),
+        )
+        assertEquals(1, onlyCritical.size)
+        assertEquals("cat_crit", onlyCritical.first().alert.id)
+
+        // Empty selection -> 0 notifications
+        val noneAllowed = FavoriteAlertNotifier.findNewFavoriteLineAlerts(
+            alerts = allAlerts,
+            favoriteLines = listOf("12"),
+            seenFingerprints = emptySet(),
+            nowEpochSeconds = now,
+            allowedCategories = emptySet(),
+        )
+        assertTrue(noneAllowed.isEmpty())
+    }
 }

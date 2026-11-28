@@ -34,8 +34,13 @@ class WidgetRefreshJobService : JobService() {
         val appContext = applicationContext
         val prefs = ToBusPreferences.getInstance(appContext)
         val interval = prefs.currentSettings().refreshInterval
+        val isNetworkRetry = params?.jobId == WidgetRefreshJobScheduler.RETRY_JOB_ID
 
-        if (interval == RefreshInterval.MANUAL || !BusMapWidgetProvider.hasAnyInstalledWidgets(appContext)) {
+        if (!BusMapWidgetProvider.hasAnyInstalledWidgets(appContext)) {
+            WidgetRefreshJobScheduler.cancel(appContext)
+            return false
+        }
+        if (!isNetworkRetry && interval == RefreshInterval.MANUAL) {
             WidgetRefreshJobScheduler.cancel(appContext)
             return false
         }
@@ -50,9 +55,12 @@ class WidgetRefreshJobService : JobService() {
         }
 
         // Always keep AlarmManager chain healthy even if AlarmManager fired recently
-        BusMapWidgetProvider.ensurePeriodicAlarmScheduled(appContext, interval)
+        if (interval != RefreshInterval.MANUAL) {
+            BusMapWidgetProvider.ensurePeriodicAlarmScheduled(appContext, interval)
+        }
 
-        if (lastAttempt > 0L && now - lastAttempt < minGapMs) {
+        // Bypass throttling for one-shot network recovery jobs so widgets refresh right away on wake
+        if (!isNetworkRetry && lastAttempt > 0L && now - lastAttempt < minGapMs) {
             return false
         }
 
@@ -95,6 +103,7 @@ object WidgetRefreshJobScheduler {
 
     private const val TAG = "ToBusWidgetJobSched"
     const val JOB_ID = 42_031
+    const val RETRY_JOB_ID = 42_032
 
     @Volatile
     private var lastScheduledIntervalMinutes: Int = -1
@@ -140,9 +149,34 @@ object WidgetRefreshJobScheduler {
         }
     }
 
+    /**
+     * Schedules a lightweight one-shot network-constrained retry job (no extra permissions)
+     * that automatically wakes and refreshes widgets the instant validated connectivity returns
+     * after Doze / screen-off standby.
+     */
+    fun scheduleNetworkRetry(context: Context) {
+        val appContext = context.applicationContext
+        if (!BusMapWidgetProvider.hasAnyInstalledWidgets(appContext)) return
+        val scheduler = appContext.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler ?: return
+        if (scheduler.getPendingJob(RETRY_JOB_ID) != null) return
+        val component = ComponentName(appContext, WidgetRefreshJobService::class.java)
+        val jobInfo = JobInfo.Builder(RETRY_JOB_ID, component)
+            .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+            .setMinimumLatency(2_000L)
+            .setOverrideDeadline(15L * 60_000L)
+            .build()
+        runCatching { scheduler.schedule(jobInfo) }
+    }
+
+    fun cancelNetworkRetry(context: Context) {
+        val scheduler = context.applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler ?: return
+        scheduler.cancel(RETRY_JOB_ID)
+    }
+
     fun cancel(context: Context) {
         val scheduler = context.applicationContext.getSystemService(Context.JOB_SCHEDULER_SERVICE) as? JobScheduler ?: return
         scheduler.cancel(JOB_ID)
+        scheduler.cancel(RETRY_JOB_ID)
         lastScheduledIntervalMinutes = -1
     }
 }

@@ -48,6 +48,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -899,6 +901,132 @@ fun LiquidGlassSwitch(
                         modifier = Modifier
                             .size(7.dp)
                             .background(accentColor.copy(alpha = 0.72f), CircleShape),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private val GlassCheckboxShape = RoundedCornerShape(8.dp)
+
+/**
+ * Translucent Liquid Glass Checkbox matching [LiquidGlassSwitch] with vertical glass refraction,
+ * specular white top rim, spring check reveal, and optional [indeterminate] dash state.
+ */
+@Composable
+fun LiquidGlassCheckbox(
+    checked: Boolean,
+    onCheckedChange: ((Boolean) -> Unit)?,
+    modifier: Modifier = Modifier,
+    accentColor: Color = AccentCyan,
+    indeterminate: Boolean = false,
+) {
+    val isActive = checked || indeterminate
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+
+    val boxScale by animateFloatAsState(
+        targetValue = if (pressed) 0.90f else 1f,
+        animationSpec = tween(durationMillis = 90),
+        label = "liquid_checkbox_scale",
+    )
+    val checkProgress by animateFloatAsState(
+        targetValue = if (isActive) 1f else 0f,
+        animationSpec = glassSpring(),
+        label = "liquid_checkbox_progress",
+    )
+    val fillTopColor by animateColorAsState(
+        targetValue = if (isActive) accentColor.copy(alpha = 0.44f) else GlassPillFill,
+        animationSpec = tween(durationMillis = 200),
+        label = "liquid_checkbox_fill_top",
+    )
+    val fillBottomColor by animateColorAsState(
+        targetValue = if (isActive) accentColor.copy(alpha = 0.22f) else GlassRowFill,
+        animationSpec = tween(durationMillis = 200),
+        label = "liquid_checkbox_fill_bottom",
+    )
+    val rimBottomColor by animateColorAsState(
+        targetValue = if (isActive) accentColor.copy(alpha = 0.88f) else GlassRowBorder,
+        animationSpec = tween(durationMillis = 200),
+        label = "liquid_checkbox_rim_bottom",
+    )
+
+    val interactiveModifier = if (onCheckedChange != null) {
+        modifier
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+            .toggleable(
+                value = checked,
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Checkbox,
+                onValueChange = onCheckedChange,
+            )
+    } else {
+        modifier.size(24.dp)
+    }
+
+    Box(
+        modifier = interactiveModifier,
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .graphicsLayer {
+                    scaleX = boxScale
+                    scaleY = boxScale
+                }
+                .background(
+                    Brush.verticalGradient(listOf(fillTopColor, fillBottomColor)),
+                    GlassCheckboxShape,
+                )
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            Color.White.copy(alpha = if (isActive) 0.24f else 0.10f),
+                            Color.Transparent,
+                        ),
+                    ),
+                    GlassCheckboxShape,
+                )
+                .border(
+                    width = if (isActive) 1.25.dp else 1.dp,
+                    brush = Brush.verticalGradient(
+                        listOf(
+                            Color.White.copy(alpha = if (isActive) 0.72f else 0.36f),
+                            rimBottomColor,
+                        ),
+                    ),
+                    shape = GlassCheckboxShape,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (checkProgress > 0.05f) {
+                if (indeterminate && !checked) {
+                    Box(
+                        modifier = Modifier
+                            .width(10.dp)
+                            .height(2.2.dp)
+                            .graphicsLayer {
+                                alpha = checkProgress.coerceIn(0f, 1f)
+                                scaleX = (0.6f + 0.4f * checkProgress).coerceIn(0f, 1.15f)
+                            }
+                            .background(Color.White, CircleShape),
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Rounded.Check,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier
+                            .size(15.dp)
+                            .graphicsLayer {
+                                alpha = checkProgress.coerceIn(0f, 1f)
+                                val s = (0.55f + 0.45f * checkProgress).coerceIn(0f, 1.18f)
+                                scaleX = s
+                                scaleY = s
+                            },
                     )
                 }
             }

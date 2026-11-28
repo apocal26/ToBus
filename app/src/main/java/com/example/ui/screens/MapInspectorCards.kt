@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.BusVehicle
+import com.example.data.model.RouteColorPalette
 import com.example.data.model.StopArrival
 import com.example.data.model.TransitStop
 import com.example.data.model.VehicleFreshness
@@ -109,17 +110,18 @@ internal fun SelectedBusInspectorCard(
     currentStopName: String?,
     nowMillis: Long,
     colorByDirection: Boolean,
+    routeColorPalette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
     onSwitchToLine: (() -> Unit)?,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val freshness = bus.freshness(nowMillis)
     val freshnessColor = when {
-        health.isInDepot || health.isOffRoute || health.isStuck -> AccentGold
-        health.isStaleGps -> AccentRed
+        health.isInDepot || health.isOffRoute -> AccentGold
+        health.showBlockedWarningOnMap -> AccentRed
         freshness == VehicleFreshness.LIVE -> AccentEmerald
         freshness == VehicleFreshness.SLOW -> AccentGold
-        else -> AccentRed
+        else -> AccentGold
     }
     val warningText = remember(health) { health.warningMessage() }
     val terminusText = remember(health) { health.terminusMessage() }
@@ -127,8 +129,8 @@ internal fun SelectedBusInspectorCard(
     val isAltDir = colorByDirection && resolvedDirectionId == 1
     val badgeAccent = when {
         isExternal -> AccentEmerald
-        isAltDir -> AccentCyan
-        else -> AccentGold
+        isAltDir -> Color(routeColorPalette.secondaryArgb)
+        else -> Color(routeColorPalette.primaryArgb)
     }
     val shortTerminus = remember(terminusName) { terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName) }
     val shortCurrentStop = remember(currentStopName) {
@@ -274,7 +276,7 @@ internal fun SelectedBusInspectorCard(
 
             // Smart Depot / Stale / Stuck / Off-Route Alert Strip OR calm Capolinea info strip
             if (warningText != null) {
-                val warnColor = if (health.isStaleGps) AccentRed else AccentGold
+                val warnColor = if (health.showBlockedWarningOnMap) AccentRed else AccentGold
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -329,12 +331,12 @@ internal fun SelectedBusInspectorCard(
                 health.isInDepot -> "Deposito"
                 health.isOffRoute -> "Fuori linea"
                 health.isAtTerminus -> "Capolinea"
-                health.isStuck -> "Non aggiornato"
+                health.showBlockedWarningOnMap -> "Segnale bloccato"
                 freshness == VehicleFreshness.LIVE -> "Live"
                 freshness == VehicleFreshness.SLOW -> "Segnale lento"
-                else -> "Segnale fermo"
+                else -> "Segnale lento"
             }
-            val shouldPulse = !health.isInDepot && !health.isOffRoute && !health.isStuck && freshness == VehicleFreshness.LIVE
+            val shouldPulse = !health.isInDepot && !health.isOffRoute && !health.showBlockedWarningOnMap && freshness == VehicleFreshness.LIVE
             val pulseAlpha: Float
             val pulseScale: Float
             if (shouldPulse) {
@@ -489,6 +491,7 @@ internal fun SelectedStopArrivalsCard(
     isLightBasemap: Boolean,
     nowMillis: Long,
     colorByDirection: Boolean,
+    routeColorPalette: RouteColorPalette = RouteColorPalette.TURIN_GOLD,
     maxScrollHeight: Dp = 246.dp,
     onToggleFavorite: () -> Unit,
     onRefresh: () -> Unit,
@@ -497,7 +500,11 @@ internal fun SelectedStopArrivalsCard(
     modifier: Modifier = Modifier,
 ) {
     val isAltDir = colorByDirection && stop.directionId == 1
-    val badgeAccent = if (isAltDir) AccentCyan else AccentGold
+    val badgeAccent = if (isAltDir) {
+        Color(routeColorPalette.secondaryArgb)
+    } else {
+        Color(routeColorPalette.primaryArgb)
+    }
     val clockFormat = remember { SimpleDateFormat("HH:mm", Locale.ITALY) }
     val displayStopName = remember(stop.name) { shortTurinPlaceName(stop.name) }
     val shortTerminus = remember(terminusName) { terminusName?.takeIf { it.isNotBlank() }?.let(::shortTurinPlaceName) }

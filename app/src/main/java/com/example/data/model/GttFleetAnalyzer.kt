@@ -12,7 +12,12 @@ data class GttDepot(
     val lat: Double,
     val lon: Double,
     val radiusMeters: Double,
-)
+    val polygon: List<GeoPoint> = emptyList(),
+) {
+    /** True ONLY when backed by a real, verified closed OpenStreetMap footprint polygon. */
+    val hasVerifiedPolygon: Boolean
+        get() = polygon.size >= 4
+}
 
 data class VehicleHealthAssessment(
     val depotName: String?,
@@ -33,18 +38,31 @@ data class VehicleHealthAssessment(
     val isReliableLive: Boolean
         get() = !isInDepot && !isStaleGps && !isStuck && !isOffRoute
 
+    /**
+     * Controls the `!` warning badge directly on the map marker:
+     * shown ONLY when a vehicle outside depots & termini is genuinely stuck without real movement
+     * for >= 4 minutes (240s), or has a deeply stale GPS timestamp (>= 4 min) with no observed motion.
+     * Actively moving buses and brief traffic-light stops (< 4 min) NEVER display `!`.
+     */
+    val showBlockedWarningOnMap: Boolean
+        get() = !isInDepot && !isOffRoute && !isAtTerminus && (
+            isStuck || (isStaleGps && (stationarySeconds == null || stationarySeconds >= GttFleetAnalyzer.STUCK_STATIONARY_SECONDS))
+        )
+
     fun warningMessage(): String? {
         return when {
             depotName != null ->
                 "Vettura al $depotName — in sosta o fuori servizio."
+            isStuck -> {
+                val mins = ((stationarySeconds ?: GttFleetAnalyzer.STUCK_STATIONARY_SECONDS) / 60L).coerceAtLeast(4L)
+                "Vettura ferma da ${mins} min senza movimento — il segnale potrebbe essere bloccato."
+            }
             isStaleGps && gpsAgeSeconds != null -> {
-                val mins = (gpsAgeSeconds / 60L).coerceAtLeast(1L)
+                val mins = (gpsAgeSeconds / 60L).coerceAtLeast(4L)
                 "Segnale GPS vecchio ($mins min fa) — la posizione potrebbe non essere più reale."
             }
             isOffRoute ->
                 "Vettura fuori percorso — probabile rientro in deposito o deviazione."
-            isStuck ->
-                "Questo pullman potrebbe non essere aggiornato"
             else -> null
         }
     }
@@ -66,64 +84,113 @@ data class VehicleSpatialStatus(
     val isNearTerminus: Boolean = false,
     val distanceToTerminusMeters: Double = Double.POSITIVE_INFINITY,
     val terminusStopName: String? = null,
+    val distToRouteMeters: Double? = null,
+    val depotHasVerifiedPolygon: Boolean = false,
 )
 
 /**
  * Turin GTT domain intelligence:
  * - Real geofences for all major GTT bus & tram depots in Turin
- * - Terminus layover detection (cleanly separated from depot & mid-route stalls)
- * - Stale GPS & stationary/stuck detection
+ * - Terminus layover detection (cleanly separated from depot & mid-route stalls, capped at 30 min)
+ * - Movement-first stale GPS & 4-minute stuck detection (moving buses never get false `!` badges)
+ * - Unified ghost & retained-phantom elimination shared identically across Map, Stops, and Widgets
  * - Off-route check against active line geometry
  * - Real Turin GTT fleet series vehicle type decoder (electric BYD/Iveco, articulated, trams)
  */
 object GttFleetAnalyzer {
 
-    private const val STALE_GPS_SECONDS = 150L
-    private const val STUCK_STATIONARY_SECONDS = 120L
-    private const val MATO_PHANTOM_STATIONARY_SECONDS = 180L // 3 minutes mid-route for MaTO-only
-    private const val MATO_TERMINUS_PHANTOM_STATIONARY_SECONDS = 600L // 10 minutes at terminus for MaTO-only
-    private const val TERMINUS_MAX_LAYOVER_SECONDS = 600L // 10 minutes max normal terminus layover
-    private const val DEAD_TERMINUS_GHOST_STATIONARY_SECONDS = 900L // 15 minutes at terminus for any source
+    internal const val STALE_GPS_SECONDS = 240L
+    internal const val STUCK_STATIONARY_SECONDS = 240L
+    private const val TERMINUS_STALE_GPS_SECONDS = 360L
+    internal const val TERMINUS_MAX_LAYOVER_SECONDS = 30L * 60L
+    private const val TERMINUS_UNCORROBORATED_MAX_STATIONARY_SECONDS = 120L
+    private const val MATO_PHANTOM_STATIONARY_SECONDS = 240L
+    private const val MATO_UNCORROBORATED_MIDROUTE_STATIONARY_SECONDS = 180L
     private const val OFF_ROUTE_METERS = 500.0
     private const val TERMINUS_NEAR_METERS = 125.0
-    private const val TERMINUS_PHANTOM_GUARD_METERS = 150.0
+    private const val TERMINUS_PHANTOM_GUARD_METERS = 160.0
     private const val TERMINUS_BAY_METERS = 65.0
     private const val TERMINUS_STATIONARY_SECONDS = 20L
 
-    val TURIN_DEPOTS: List<GttDepot> = listOf(
-        GttDepot("Deposito Gerbido", 45.0398, 7.6022, 290.0),
-        GttDepot("Deposito San Paolo", 45.0598, 7.6463, 210.0),
-        GttDepot("Deposito Venaria", 45.1072, 7.6525, 240.0),
-        GttDepot("Deposito Tortona", 45.0757, 7.7078, 190.0),
-        GttDepot("Deposito Nizza", 45.0252, 7.6656, 210.0),
-        GttDepot("Deposito Fiochetto", 45.0846, 7.6844, 160.0),
+    private const val DEPOT_POLYGON_EDGE_MARGIN_METERS = 16.0
+
+    /**
+     * Verified fallback seed coordinates for Turin's active GTT bus & tram depots.
+     * Used ONLY for geofence fallback before real OSM polygons load from disk/Overpass —
+     * NEVER rendered as guessed circles on the map (see [GttDepot.hasVerifiedPolygon]).
+     */
+    val DEFAULT_TURIN_DEPOTS: List<GttDepot> = listOf(
+        GttDepot("Deposito Gerbido", 45.0345, 7.6012, 160.0),    // Via Paolo Gorini 26
+        GttDepot("Deposito San Paolo", 45.0642, 7.6328, 105.0),  // Corso Trapani 154 / Via Monginevro
+        GttDepot("Deposito Venaria", 45.1321, 7.6254, 150.0),    // Via Gaetano Amati 178, Venaria Reale
+        GttDepot("Deposito Tortona", 45.0746, 7.7047, 105.0),    // Corso Tortona 53/55
+        GttDepot("Deposito Nizza", 45.0445, 7.6651, 95.0),       // Corso Bramante 68
+        GttDepot("Deposito Novara", 45.0807, 7.6990, 95.0),      // Corso Novara 122
+        GttDepot("Deposito Fiochetto", 45.0761, 7.6891, 70.0),   // Via Fiochetto 23
     )
+
+    @Volatile
+    private var resolvedDepots: List<GttDepot> = DEFAULT_TURIN_DEPOTS
+
+    /**
+     * Active Turin GTT depots: starts with conservative verified fallback seeds and upgrades
+     * automatically to exact OpenStreetMap compound polygons once hydrated.
+     */
+    val TURIN_DEPOTS: List<GttDepot>
+        get() = resolvedDepots
+
+    /**
+     * Upgrades active depot geofences with verified real OSM polygons fetched from Overpass/cache.
+     * Canonical depots matched by name are upgraded in-place to their exact OSM polygon & centroid;
+     * any unmatched canonical depot retains its tight fallback seed (without `hasVerifiedPolygon`),
+     * and any extra verified OSM GTT depot (e.g. Sassi) is appended.
+     */
+    fun updateResolvedDepots(osmDepots: List<GttDepot>) {
+        val verified = osmDepots.filter { it.hasVerifiedPolygon }
+        if (verified.isEmpty()) return
+        val byKey = LinkedHashMap<String, GttDepot>(verified.size)
+        for (depot in verified) {
+            byKey[depot.name.trim().lowercase()] = depot
+        }
+        val merged = ArrayList<GttDepot>(DEFAULT_TURIN_DEPOTS.size + verified.size)
+        val consumedKeys = HashSet<String>()
+        for (seed in DEFAULT_TURIN_DEPOTS) {
+            val key = seed.name.trim().lowercase()
+            val osm = byKey[key]
+            if (osm != null) {
+                merged.add(osm)
+                consumedKeys.add(key)
+            } else {
+                merged.add(seed)
+            }
+        }
+        for ((key, extra) in byKey) {
+            if (key !in consumedKeys) {
+                merged.add(extra)
+            }
+        }
+        resolvedDepots = merged
+    }
+
+    internal fun resetDepotsForTest() {
+        resolvedDepots = DEFAULT_TURIN_DEPOTS
+    }
 
     fun assessSpatial(
         bus: BusVehicle,
         routePatterns: List<RoutePattern>,
     ): VehicleSpatialStatus {
         val depot = findDepot(bus.latitude, bus.longitude)
-        val isOffRoute = if (depot == null && routePatterns.isNotEmpty()) {
-            val minDist = minDistanceToRouteMeters(bus.latitude, bus.longitude, routePatterns)
-            minDist != null && minDist > OFF_ROUTE_METERS
+        val minRouteDist = if (routePatterns.isNotEmpty()) {
+            minDistanceToRouteMeters(bus.latitude, bus.longitude, routePatterns)
         } else {
-            false
+            null
         }
+        val isOffRoute = depot == null && minRouteDist != null && minRouteDist > OFF_ROUTE_METERS
         var bestTerminusDist = Double.POSITIVE_INFINITY
         var bestTerminusName: String? = null
         if (depot == null && !isOffRoute && routePatterns.isNotEmpty()) {
-            // Only use primary patterns per direction (stop count >= 70% of max for that direction)
-            // so short-turn / depot-pull-in variants ending mid-route do not grant terminus immunity.
-            val maxStopsByDir = routePatterns
-                .groupBy { it.directionId }
-                .mapValues { (_, pats) -> pats.maxOfOrNull { it.stops.size } ?: 0 }
-            val terminusPatterns = routePatterns.filter { pat ->
-                val maxStops = maxStopsByDir[pat.directionId] ?: 0
-                maxStops <= 4 || pat.stops.size >= (maxStops * 0.7).toInt()
-            }.ifEmpty { routePatterns }
-
-            for (pattern in terminusPatterns) {
+            for (pattern in routePatterns) {
                 val firstStop = pattern.stops.firstOrNull()
                 val lastStop = pattern.stops.lastOrNull()
                 if (firstStop != null) {
@@ -165,6 +232,8 @@ object GttFleetAnalyzer {
             isNearTerminus = isNearTerminus,
             distanceToTerminusMeters = bestTerminusDist,
             terminusStopName = if (isNearTerminus) bestTerminusName?.let(::formatTurinLabel) else null,
+            distToRouteMeters = minRouteDist,
+            depotHasVerifiedPolygon = depot?.hasVerifiedPolygon == true,
         )
     }
 
@@ -174,16 +243,16 @@ object GttFleetAnalyzer {
         nowMillis: Long,
     ): VehicleHealthAssessment {
         val ageSec = bus.gpsAgeSeconds(nowMillis)
-        val isStale = ageSec != null && ageSec > STALE_GPS_SECONDS
         val statSec = bus.stationarySinceMillis?.let { ((nowMillis - it) / 1000L).coerceAtLeast(0L) }
-        val exceededTerminusLayover = statSec != null && statSec >= TERMINUS_MAX_LAYOVER_SECONDS
-        // If coordinates have not displaced by 22m in >= 60s, any non-zero speedKmh is a frozen AVM field
-        val isPhysicallyStationary = statSec != null && statSec >= 60L
-        val isMovingFast = !isPhysicallyStationary && bus.speedKmh != null && bus.speedKmh >= 12f
+        val hasMovedRecently = bus.hasRecentPhysicalMovement(nowMillis, STUCK_STATIONARY_SECONDS)
+        val staleThreshold = if (spatial.isNearTerminus) TERMINUS_STALE_GPS_SECONDS else STALE_GPS_SECONDS
+        // Real physical movement always defeats a lagged feed timestamp: an actively moving bus
+        // never triggers stale/blocked warnings just because GTT's protobuf timestamp lags behind.
+        val isStale = ageSec != null && ageSec >= staleThreshold && !hasMovedRecently
+        val isMovingFast = bus.speedKmh != null && bus.speedKmh >= 12f
         val isAtTerminus = spatial.depotName == null &&
             !spatial.isOffRoute &&
             !isStale &&
-            !exceededTerminusLayover &&
             spatial.isNearTerminus &&
             !isMovingFast &&
             (
@@ -192,12 +261,11 @@ object GttFleetAnalyzer {
                     bus.bearing == null ||
                     (bus.speedKmh != null && bus.speedKmh < 4f)
                 )
-        // A bus waiting normally at its terminus (< 10 min) is never "stuck",
-        // but a bus frozen at a terminus beyond 10 minutes is flagged as stuck/inactive.
-        val isStuck = statSec != null && (
-            (!spatial.isNearTerminus && statSec >= STUCK_STATIONARY_SECONDS) ||
-                (spatial.isNearTerminus && exceededTerminusLayover)
-            )
+        // Genuinely stuck ONLY outside depots & termini after >= 4 minutes (240s) without real motion.
+        val isStuck = spatial.depotName == null &&
+            !spatial.isNearTerminus &&
+            statSec != null &&
+            statSec >= STUCK_STATIONARY_SECONDS
 
         return VehicleHealthAssessment(
             depotName = spatial.depotName,
@@ -219,60 +287,117 @@ object GttFleetAnalyzer {
         return assessWithSpatial(bus, assessSpatial(bus, routePatterns), nowMillis)
     }
 
+    /**
+     * True when the vehicle's ONLY GPS position feed is MaTO Live.
+     * Non-GPS enrichers such as `TripUpdates` (schedule delay/next-stop) are strictly excluded so
+     * a dead MaTO ghost carrying an old tripId can never masquerade as multi-source corroborated.
+     */
     fun isMatoOnlySource(bus: BusVehicle): Boolean {
-        val sources = bus.contributingSources
-        return if (sources.isNotEmpty()) {
-            sources.all { it.equals("MaTO Live", ignoreCase = true) }
+        val gpsSources = bus.gpsSourceNames()
+        return if (gpsSources.isNotEmpty()) {
+            gpsSources.all { it.equals("MaTO Live", ignoreCase = true) }
         } else {
             bus.sourceName.equals("MaTO Live", ignoreCase = true)
         }
     }
 
     /**
-     * Returns true ONLY when a vehicle is exclusively tracked by MaTO Live, is outside GTT depots,
-     * and has either:
-     * - Stale GPS age >= 150s, OR
-     * - Been physically stationary within the same 22m anchor for >= 3 minutes (180s) mid-route
-     *   OR >= 10 minutes (600s) at a terminus (or when route patterns are not yet loaded).
-     *
-     * Never allows a frozen `speedKmh` field in the MaTO packet to bypass stationary phantom detection:
-     * a vehicle whose coordinates have not moved 22m in 3+ minutes is physically motionless (< 0.44 km/h).
+     * Explains why a MaTO-only vehicle is rejected as a confirmed phantom, or returns `null` if kept.
+     * Single source of truth for both [isConfirmedMatoPhantomWithSpatial] and forensic diagnostics.
+     */
+    fun explainMatoPhantomWithSpatial(
+        bus: BusVehicle,
+        spatial: VehicleSpatialStatus,
+        hasKnownRoutePatterns: Boolean,
+        nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
+    ): String? {
+        if (bus.isMqttRetained && !bus.hasOfficialGtfsCorroboration()) {
+            return "mato_retained_uncorroborated"
+        }
+        if (!isMatoOnlySource(bus)) return null
+        if (spatial.depotName != null) return null
+
+        val statSec = bus.stationarySinceMillis?.let { ((nowMillis - it) / 1000L).coerceAtLeast(0L) }
+        val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
+        val hasMovedRecently = bus.hasRecentPhysicalMovement(nowMillis)
+        val nearTerminus = hasKnownRoutePatterns && (
+            spatial.isNearTerminus ||
+                spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
+            )
+
+        if (nearTerminus) {
+            if (statSec != null && statSec >= TERMINUS_MAX_LAYOVER_SECONDS) {
+                return "mato_terminus_over_30m(stat=${statSec}s)"
+            }
+            if (healthyOfficialGtfsOnline) {
+                if (statSec != null && statSec >= TERMINUS_UNCORROBORATED_MAX_STATIONARY_SECONDS) {
+                    return "mato_terminus_uncorroborated(stat=${statSec}s,officialOnline=true)"
+                }
+                if (gpsAgeSec != null && gpsAgeSec >= 180L && !hasMovedRecently) {
+                    return "mato_terminus_stale_gps(age=${gpsAgeSec}s,officialOnline=true)"
+                }
+            }
+            return null
+        }
+
+        if (!hasKnownRoutePatterns) {
+            if (statSec != null && statSec >= TERMINUS_MAX_LAYOVER_SECONDS) {
+                return "mato_no_route_over_30m(stat=${statSec}s)"
+            }
+            return null
+        }
+
+        if (bus.speedKmh != null && bus.speedKmh >= 5f && hasMovedRecently) return null
+        if (statSec == null) return null
+        if (healthyOfficialGtfsOnline &&
+            statSec >= MATO_UNCORROBORATED_MIDROUTE_STATIONARY_SECONDS &&
+            (bus.speedKmh == null || bus.speedKmh < 3f)
+        ) {
+            return "mato_midroute_uncorroborated(stat=${statSec}s,spd=${bus.speedKmh?.toInt() ?: -1},officialOnline=true)"
+        }
+        if (statSec >= MATO_PHANTOM_STATIONARY_SECONDS) {
+            return "mato_midroute_stationary_4m(stat=${statSec}s)"
+        }
+        return null
+    }
+
+    /**
+     * Returns true when a MaTO-only vehicle is a confirmed phantom:
+     * 1. Any uncorroborated MQTT RETAINED message (always hidden until corroborated or live-updated).
+     * 2. At a terminus: hidden if stationary >= 2 min while healthy official GTFS-RT feeds
+     *    (`GTT Ufficiale`/`BusOne Proxy`) are online and do NOT report it, or if GPS is stale >= 3 min.
+     * 3. Mid-route (outside depots & termini): hidden after >= 4 min stationary (or >= 3 min stationary
+     *    with zero speed when healthy official GTFS-RT feeds are online and don't see it).
      */
     fun isConfirmedMatoPhantomWithSpatial(
         bus: BusVehicle,
         spatial: VehicleSpatialStatus,
         hasKnownRoutePatterns: Boolean,
         nowMillis: Long,
-    ): Boolean {
-        if (!isMatoOnlySource(bus)) return false
-        if (spatial.depotName != null) return false
-        val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
-        if (gpsAgeSec != null && gpsAgeSec >= STALE_GPS_SECONDS) return true
-        val since = bus.stationarySinceMillis ?: return false
-        val statSec = ((nowMillis - since) / 1000L).coerceAtLeast(0L)
-        if (!hasKnownRoutePatterns) {
-            return statSec >= MATO_TERMINUS_PHANTOM_STATIONARY_SECONDS
-        }
-        val isNearAnyTerminus = spatial.isNearTerminus ||
-            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
-        return if (isNearAnyTerminus) {
-            statSec >= MATO_TERMINUS_PHANTOM_STATIONARY_SECONDS
-        } else {
-            statSec >= MATO_PHANTOM_STATIONARY_SECONDS
-        }
-    }
+        healthyOfficialGtfsOnline: Boolean = false,
+    ): Boolean = explainMatoPhantomWithSpatial(
+        bus = bus,
+        spatial = spatial,
+        hasKnownRoutePatterns = hasKnownRoutePatterns,
+        nowMillis = nowMillis,
+        healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
+    ) != null
 
     fun isConfirmedMatoPhantom(
         bus: BusVehicle,
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
     ): Boolean {
+        val hasPatterns = routePatterns.isNotEmpty()
         val spatial = assessSpatial(bus, routePatterns)
         return isConfirmedMatoPhantomWithSpatial(
             bus = bus,
             spatial = spatial,
-            hasKnownRoutePatterns = routePatterns.isNotEmpty(),
+            hasKnownRoutePatterns = hasPatterns,
             nowMillis = nowMillis,
+            healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
         )
     }
 
@@ -280,89 +405,270 @@ object GttFleetAnalyzer {
         vehicles: List<BusVehicle>,
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
     ): List<BusVehicle> {
         if (vehicles.isEmpty()) return vehicles
         return vehicles.filterNot { bus ->
-            isConfirmedMatoPhantom(bus, routePatterns, nowMillis)
+            isConfirmedMatoPhantom(bus, routePatterns, nowMillis, healthyOfficialGtfsOnline)
         }
     }
 
     /**
-     * Returns true when ANY vehicle (even multi-source mirrored GTFS-RT) is provably dead:
-     * - GPS timestamp >= 10 minutes old outside depots, OR
-     * - Mid-route: parked at the same anchor (<22m) for >= 7 minutes strictly outside depots and >150m away
-     *   from any primary terminus, with either stale GPS (>= 180s) or >= 8 minutes completely frozen
-     *   mid-route (ignoring any frozen `speedKmh` field since 7+ min inside a 22m radius is physically 0 km/h), OR
-     * - Terminus (or before route patterns load): parked at the exact same coordinates (<22m) for >= 15 minutes.
+     * Explains why ANY vehicle (including corroborated GTFS-RT) is rejected as a dead/abandoned
+     * ghost, or returns `null` if kept. Single source of truth for [isConfirmedDeadGhostWithSpatial].
+     */
+    fun explainDeadGhostWithSpatial(
+        bus: BusVehicle,
+        spatial: VehicleSpatialStatus,
+        hasKnownRoutePatterns: Boolean,
+        nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
+    ): String? {
+        if (bus.isMqttRetained && !bus.hasOfficialGtfsCorroboration()) {
+            return "retained_uncorroborated"
+        }
+        if (spatial.depotName != null) return null
+
+        val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
+        val statSec = bus.stationarySinceMillis?.let { ((nowMillis - it) / 1000L).coerceAtLeast(0L) }
+        val hasMovedRecently = bus.hasRecentPhysicalMovement(nowMillis)
+
+        // Universal 30-minute motionless ceiling (catches terminus overstays even before route loads)
+        if (statSec != null && statSec >= TERMINUS_MAX_LAYOVER_SECONDS) {
+            return "universal_stationary_over_30m(stat=${statSec}s)"
+        }
+
+        if (!hasKnownRoutePatterns) {
+            // Conservative fallback when route geometry is not loaded yet: only drop extreme 15+ min dead GPS
+            if (gpsAgeSec != null && gpsAgeSec >= 900L && !hasMovedRecently) {
+                return "no_route_stale_gps_15m(age=${gpsAgeSec}s)"
+            }
+            return null
+        }
+
+        val nearTerminus = spatial.isNearTerminus ||
+            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
+        if (nearTerminus) {
+            // Legitimate corroborated terminus layovers up to 30 min stay visible; drop deeply dead GPS (>= 10m)
+            if (gpsAgeSec != null && gpsAgeSec >= 600L && !hasMovedRecently) {
+                return "terminus_stale_gps_10m(age=${gpsAgeSec}s)"
+            }
+            if (healthyOfficialGtfsOnline && isMatoOnlySource(bus) &&
+                statSec != null && statSec >= TERMINUS_UNCORROBORATED_MAX_STATIONARY_SECONDS
+            ) {
+                return "terminus_mato_uncorroborated(stat=${statSec}s)"
+            }
+            return null
+        }
+
+        // Mid-route vehicle (strictly outside depot & >160m from any terminus)
+        if (gpsAgeSec != null && gpsAgeSec >= 600L && !hasMovedRecently) {
+            return "midroute_stale_gps_10m(age=${gpsAgeSec}s)"
+        }
+        if (statSec == null || statSec < 420L) return null
+
+        val hasStaleTimestamp = gpsAgeSec != null && gpsAgeSec >= 180L
+        val reportedSpeed = bus.speedKmh
+        val hasFreshLiveSpeed = !hasStaleTimestamp && reportedSpeed != null && reportedSpeed >= 3f
+        // If speed is fresh and >=3 km/h, still catch buses physically frozen within anchor for >= 9 min
+        if (hasFreshLiveSpeed && statSec < 540L) return null
+        return when {
+            hasStaleTimestamp -> "midroute_stationary_7m_stale(stat=${statSec}s,age=${gpsAgeSec}s)"
+            statSec >= 480L -> "midroute_stationary_8m(stat=${statSec}s,spd=${reportedSpeed?.toInt() ?: -1})"
+            else -> null
+        }
+    }
+
+    /**
+     * Returns true when ANY vehicle (including corroborated GTFS-RT) is provably dead/abandoned:
+     * - Uncorroborated MQTT retained ghost -> always hidden.
+     * - Terminus overstay: motionless at/near a terminus for > 30 minutes (1800s), OR stale GPS >= 10 min
+     *   with no movement at terminus -> hidden. Legitimate corroborated layovers <= 30 min are preserved.
+     * - Mid-route dead ghost: outside depots & termini, GPS stale >= 10 min with no recent movement, OR
+     *   motionless >= 8 min (480s), OR motionless >= 7 min (420s) with stale GPS >= 3 min.
      */
     fun isConfirmedDeadGhostWithSpatial(
         bus: BusVehicle,
         spatial: VehicleSpatialStatus,
         hasKnownRoutePatterns: Boolean,
         nowMillis: Long,
-    ): Boolean {
-        if (spatial.depotName != null) return false
-        val gpsAgeSec = bus.gpsAgeSeconds(nowMillis)
-        val hasStaleTimestamp = gpsAgeSec != null && gpsAgeSec >= 180L
-        if (gpsAgeSec != null && gpsAgeSec >= 600L) return true
-        val since = bus.stationarySinceMillis ?: return false
-        val statSec = ((nowMillis - since) / 1000L).coerceAtLeast(0L)
-        if (!hasKnownRoutePatterns) {
-            return statSec >= DEAD_TERMINUS_GHOST_STATIONARY_SECONDS
-        }
-        val isNearAnyTerminus = spatial.isNearTerminus ||
-            spatial.distanceToTerminusMeters <= TERMINUS_PHANTOM_GUARD_METERS
-        if (isNearAnyTerminus) {
-            return statSec >= DEAD_TERMINUS_GHOST_STATIONARY_SECONDS
-        }
-        if (statSec < 420L) return false
-        return hasStaleTimestamp || statSec >= 480L
+        healthyOfficialGtfsOnline: Boolean = false,
+    ): Boolean = explainDeadGhostWithSpatial(
+        bus = bus,
+        spatial = spatial,
+        hasKnownRoutePatterns = hasKnownRoutePatterns,
+        nowMillis = nowMillis,
+        healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
+    ) != null
+
+    fun explainFilterVerdictWithSpatial(
+        bus: BusVehicle,
+        spatial: VehicleSpatialStatus,
+        hasKnownRoutePatterns: Boolean,
+        nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
+    ): String? {
+        return explainMatoPhantomWithSpatial(
+            bus = bus,
+            spatial = spatial,
+            hasKnownRoutePatterns = hasKnownRoutePatterns,
+            nowMillis = nowMillis,
+            healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
+        ) ?: explainDeadGhostWithSpatial(
+            bus = bus,
+            spatial = spatial,
+            hasKnownRoutePatterns = hasKnownRoutePatterns,
+            nowMillis = nowMillis,
+            healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
+        )
     }
 
     fun isConfirmedDeadGhost(
         bus: BusVehicle,
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
     ): Boolean {
+        val hasPatterns = routePatterns.isNotEmpty()
         val spatial = assessSpatial(bus, routePatterns)
         return isConfirmedDeadGhostWithSpatial(
             bus = bus,
             spatial = spatial,
-            hasKnownRoutePatterns = routePatterns.isNotEmpty(),
+            hasKnownRoutePatterns = hasPatterns,
             nowMillis = nowMillis,
+            healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
         )
+    }
+
+    data class FilteredFleetAudit(
+        val kept: List<BusVehicle>,
+        val dropped: List<Pair<BusVehicle, String>>,
+    )
+
+    fun filterOutConfirmedPhantomsAndDeadGhostsWithAudit(
+        vehicles: List<BusVehicle>,
+        routePatterns: List<RoutePattern>,
+        nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
+    ): FilteredFleetAudit {
+        if (vehicles.isEmpty()) return FilteredFleetAudit(emptyList(), emptyList())
+        val hasPatterns = routePatterns.isNotEmpty()
+        val kept = ArrayList<BusVehicle>(vehicles.size)
+        val dropped = ArrayList<Pair<BusVehicle, String>>()
+        for (bus in vehicles) {
+            val spatial = assessSpatial(bus, routePatterns)
+            val dropReason = explainFilterVerdictWithSpatial(
+                bus = bus,
+                spatial = spatial,
+                hasKnownRoutePatterns = hasPatterns,
+                nowMillis = nowMillis,
+                healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
+            )
+            if (dropReason == null) {
+                kept.add(bus)
+            } else {
+                dropped.add(bus to dropReason)
+            }
+        }
+        return FilteredFleetAudit(kept = kept, dropped = dropped)
     }
 
     fun filterOutConfirmedPhantomsAndDeadGhosts(
         vehicles: List<BusVehicle>,
         routePatterns: List<RoutePattern>,
         nowMillis: Long,
+        healthyOfficialGtfsOnline: Boolean = false,
     ): List<BusVehicle> {
-        if (vehicles.isEmpty()) return vehicles
-        val hasKnownPatterns = routePatterns.isNotEmpty()
-        return vehicles.filterNot { bus ->
-            val spatial = assessSpatial(bus, routePatterns)
-            isConfirmedMatoPhantomWithSpatial(
-                bus = bus,
-                spatial = spatial,
-                hasKnownRoutePatterns = hasKnownPatterns,
-                nowMillis = nowMillis,
-            ) || isConfirmedDeadGhostWithSpatial(
-                bus = bus,
-                spatial = spatial,
-                hasKnownRoutePatterns = hasKnownPatterns,
-                nowMillis = nowMillis,
-            )
-        }
+        return filterOutConfirmedPhantomsAndDeadGhostsWithAudit(
+            vehicles = vehicles,
+            routePatterns = routePatterns,
+            nowMillis = nowMillis,
+            healthyOfficialGtfsOnline = healthyOfficialGtfsOnline,
+        ).kept
     }
 
     fun findDepot(lat: Double, lon: Double): GttDepot? {
-        for (depot in TURIN_DEPOTS) {
-            if (haversineMeters(lat, lon, depot.lat, depot.lon) <= depot.radiusMeters) {
-                return depot
+        for (depot in resolvedDepots) {
+            if (depot.hasVerifiedPolygon) {
+                // O(1) bounding-circle reject before exact ray-casting Point-in-Polygon
+                if (haversineMeters(lat, lon, depot.lat, depot.lon) >
+                    depot.radiusMeters + DEPOT_POLYGON_EDGE_MARGIN_METERS
+                ) {
+                    continue
+                }
+                if (isPointInOrNearPolygon(lat, lon, depot.polygon, DEPOT_POLYGON_EDGE_MARGIN_METERS)) {
+                    return depot
+                }
+            } else {
+                if (haversineMeters(lat, lon, depot.lat, depot.lon) <= depot.radiusMeters) {
+                    return depot
+                }
             }
         }
         return null
+    }
+
+    /**
+     * Exact ray-casting Point-in-Polygon check plus tight metric fence margin (handles GPS jitter
+     * of buses parked right along a depot perimeter wall without bleeding into residential streets).
+     */
+    fun isPointInOrNearPolygon(
+        lat: Double,
+        lon: Double,
+        polygon: List<GeoPoint>,
+        marginMeters: Double = DEPOT_POLYGON_EDGE_MARGIN_METERS,
+    ): Boolean {
+        if (polygon.size < 4) return false
+        if (isPointInPolygon(lat, lon, polygon)) return true
+        if (marginMeters <= 0.0) return false
+        return minDistanceToPolygonEdgesMeters(lat, lon, polygon) <= marginMeters
+    }
+
+    internal fun isPointInPolygon(lat: Double, lon: Double, polygon: List<GeoPoint>): Boolean {
+        if (polygon.size < 4) return false
+        var inside = false
+        var j = polygon.lastIndex
+        for (i in polygon.indices) {
+            val yi = polygon[i].lat
+            val xi = polygon[i].lon
+            val yj = polygon[j].lat
+            val xj = polygon[j].lon
+            val intersects = ((yi > lat) != (yj > lat)) &&
+                (lon < (xj - xi) * (lat - yi) / ((yj - yi).takeIf { abs(it) > 1e-12 } ?: 1e-12) + xi)
+            if (intersects) inside = !inside
+            j = i
+        }
+        return inside
+    }
+
+    private fun minDistanceToPolygonEdgesMeters(
+        lat: Double,
+        lon: Double,
+        polygon: List<GeoPoint>,
+    ): Double {
+        val cosLat = cos(Math.toRadians(lat)).coerceAtLeast(0.2)
+        val metersPerDegLat = 110_540.0
+        val metersPerDegLon = 111_320.0 * cosLat
+        var best = Double.POSITIVE_INFINITY
+        for (i in 0 until polygon.size - 1) {
+            val a = polygon[i]
+            val b = polygon[i + 1]
+            val ax = (a.lon - lon) * metersPerDegLon
+            val ay = (a.lat - lat) * metersPerDegLat
+            val bx = (b.lon - lon) * metersPerDegLon
+            val by = (b.lat - lat) * metersPerDegLat
+            val dx = bx - ax
+            val dy = by - ay
+            val lenSq = dx * dx + dy * dy
+            val d = if (lenSq < 0.25) {
+                hypot(ax, ay)
+            } else {
+                val t = (-(ax * dx + ay * dy) / lenSq).coerceIn(0.0, 1.0)
+                hypot(ax + t * dx, ay + t * dy)
+            }
+            if (d < best) best = d
+        }
+        return best
     }
 
     /**
@@ -642,12 +948,12 @@ object GttFleetAnalyzer {
         if (health.isInDepot ||
             health.isStaleGps ||
             health.isOffRoute ||
-            isConfirmedMatoPhantomWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis) ||
-            isConfirmedDeadGhostWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis)
+            isConfirmedMatoPhantomWithSpatial(bus, spatial, routePatterns.isNotEmpty(), nowMillis)
         ) {
             return null
         }
-        val isTrafficPaused = health.isStuck
+        val isTrafficPaused = health.isStuck ||
+            (!health.isAtTerminus && health.stationarySeconds != null && health.stationarySeconds >= 120L)
         if (isTrafficPaused && !allowTrafficPaused) return null
 
         val resolvedDir = resolveDirectionId(bus, routePatterns)

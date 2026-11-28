@@ -63,11 +63,11 @@ object TransitMapBitmapRenderer {
         val scale = density.coerceIn(1.5f, 3.0f)
         val nowMillis = System.currentTimeMillis()
 
-        // Filter out depot / stale vehicles in widget when requested
+        // Filter out depot / genuinely blocked vehicles in widget when requested
         val visibleVehicles = if (settings.hideInactiveInWidget) {
             vehicles.filter { bus ->
                 val health = GttFleetAnalyzer.assess(bus, routePatterns, nowMillis)
-                !health.isInDepot && !health.isStaleGps
+                !health.isInDepot && !health.showBlockedWarningOnMap
             }
         } else {
             vehicles
@@ -77,7 +77,7 @@ object TransitMapBitmapRenderer {
         val camera = when (settings.cameraMode) {
             WidgetCameraMode.AUTO_FIT_BUSES -> WebMercator.computeAutoFitCamera(
                 vehicles = visibleVehicles,
-                patterns = if (settings.showRouteLine) routePatterns else emptyList(),
+                patterns = if (settings.showRouteInWidget) routePatterns else emptyList(),
                 viewportWidthPx = safeW,
                 viewportHeightPx = safeH,
                 paddingFraction = if (isCompactSquare) 0.18 else 0.14,
@@ -104,8 +104,10 @@ object TransitMapBitmapRenderer {
         // 2. Clean label-free architectural tiles
         drawCleanMapTiles(context, canvas, safeW, safeH, camera, settings.mapStyle)
 
+        val palette = settings.routeColorPalette
+
         // 3. Crisp glowing route polylines
-        if (settings.showRouteLine && routePatterns.isNotEmpty()) {
+        if (settings.showRouteInWidget && routePatterns.isNotEmpty()) {
             drawRoutePolylines(
                 canvas = canvas,
                 widthPx = safeW,
@@ -114,16 +116,30 @@ object TransitMapBitmapRenderer {
                 patterns = routePatterns,
                 isDark = settings.mapStyle.isDark,
                 colorByDirection = settings.colorByDirection,
+                primaryArgb = palette.primaryArgb,
+                secondaryArgb = palette.secondaryArgb,
                 scale = scale,
             )
         }
 
         // 4. Subtle favorite stop markers on the current line
-        val lineFavs = favoriteStops.filter {
-            it.lineCode.equals(settings.selectedLine, ignoreCase = true)
+        val lineFavs = if (settings.showFavoriteStopsInWidget) {
+            favoriteStops.filter {
+                it.lineCode.equals(settings.selectedLine, ignoreCase = true)
+            }
+        } else {
+            emptyList()
         }
         if (lineFavs.isNotEmpty()) {
-            drawFavoriteStops(canvas, safeW, safeH, camera, lineFavs, scale)
+            drawFavoriteStops(
+                canvas = canvas,
+                widthPx = safeW,
+                heightPx = safeH,
+                camera = camera,
+                favorites = lineFavs,
+                accentArgb = palette.primaryArgb,
+                scale = scale,
+            )
         }
 
         // 5. Clean directional bus markers (ZERO fleet label clutter on widget!)
@@ -247,6 +263,8 @@ object TransitMapBitmapRenderer {
         patterns: List<RoutePattern>,
         isDark: Boolean,
         colorByDirection: Boolean,
+        primaryArgb: Int,
+        secondaryArgb: Int,
         scale: Float,
     ) {
         val casingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -271,11 +289,14 @@ object TransitMapBitmapRenderer {
             strokeWidth = 8.0f * scale
         }
 
+        val primaryRoute = (primaryArgb and 0x00FFFFFF) or 0xE6000000.toInt()
+        val secondaryRoute = (secondaryArgb and 0x00FFFFFF) or 0xE6000000.toInt()
+
         for (pattern in patterns) {
             val baseColor = when {
-                !colorByDirection -> 0xE6FBBF24.toInt()
-                pattern.directionId == 1 -> 0xE638BDF8.toInt()
-                else -> 0xE6FBBF24.toInt()
+                !colorByDirection -> primaryRoute
+                pattern.directionId == 1 -> secondaryRoute
+                else -> primaryRoute
             }
             strokePaint.color = baseColor
             glowPaint.color = (baseColor and 0x00FFFFFF) or 0x36000000
@@ -306,11 +327,12 @@ object TransitMapBitmapRenderer {
         heightPx: Int,
         camera: CameraState,
         favorites: List<FavoriteStop>,
+        accentArgb: Int,
         scale: Float,
     ) {
         val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
-            color = 0x44FBBF24
+            color = (accentArgb and 0x00FFFFFF) or 0x44000000
         }
         val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
@@ -323,7 +345,7 @@ object TransitMapBitmapRenderer {
         val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeWidth = 1.4f * scale
-            color = COLOR_GOLD
+            color = accentArgb
         }
 
         for (fav in favorites) {
@@ -392,7 +414,11 @@ object TransitMapBitmapRenderer {
             val health = GttFleetAnalyzer.assess(bus, routePatterns, nowMillis)
             val resolvedDirection = GttFleetAnalyzer.resolveDirectionId(bus, routePatterns)
             val isAltDir = settings.colorByDirection && resolvedDirection == 1
-            val accentColor = if (isAltDir) COLOR_CYAN else COLOR_GOLD
+            val accentColor = if (isAltDir) {
+                settings.routeColorPalette.secondaryArgb
+            } else {
+                settings.routeColorPalette.primaryArgb
+            }
             val alphaInt = if (health.isInactiveOrSuspicious) 150 else 255
 
             // Soft ambient halo
@@ -433,8 +459,8 @@ object TransitMapBitmapRenderer {
                 }
             }
 
-            // Red corner dot if GPS is stale or bus is in depot (when shown)
-            if (freshness == VehicleFreshness.STALE || health.isInDepot || health.isOffRoute) {
+            // Red corner dot ONLY if genuinely blocked (4+ min immobile), in depot, or off-route
+            if (health.showBlockedWarningOnMap || health.isInDepot || health.isOffRoute) {
                 canvas.drawCircle(sx + radius * 0.72f, sy - radius * 0.72f, 2.7f * scale, ringPaint)
                 canvas.drawCircle(sx + radius * 0.72f, sy - radius * 0.72f, 1.9f * scale, staleDotPaint)
             }

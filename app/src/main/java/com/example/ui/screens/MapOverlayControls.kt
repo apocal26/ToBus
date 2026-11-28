@@ -325,29 +325,27 @@ internal fun ActiveBusDirectionGlassPill(
     val indicatorColor = when {
         health.isInDepot -> Color(0xFFF59E0B)
         health.isOffRoute -> Color(0xFFF59E0B)
-        health.isStaleGps -> AccentRed
-        health.isStuck -> AccentGold
+        health.showBlockedWarningOnMap -> AccentRed
         health.isAtTerminus -> directionAccent ?: AccentCyan
         freshness == VehicleFreshness.LIVE -> AccentEmerald
-        freshness == VehicleFreshness.SLOW -> AccentGold
-        else -> AccentRed
+        else -> AccentGold
     }
     val statusTag = when {
         health.isInDepot -> "Deposito"
         health.isOffRoute -> "Fuori linea"
-        health.isStaleGps -> bus.gpsAgeSeconds(nowMillis)?.let {
-            "agg. ${formatCompactAge(it)} fa"
-        } ?: "GPS vecchio"
         health.isStuck -> health.stationarySeconds?.let {
             "fermo ${formatCompactAge(it)}"
-        } ?: "fermo"
+        } ?: "bloccato"
+        health.showBlockedWarningOnMap -> bus.gpsAgeSeconds(nowMillis)?.let {
+            "agg. ${formatCompactAge(it)} fa"
+        } ?: "GPS fermo"
         health.isAtTerminus -> "Capolinea"
         else -> bus.gpsAgeSeconds(nowMillis)?.let {
             "agg. ${formatCompactAge(it)} fa"
         } ?: "agg. N/D"
     }
 
-    val isDimmed = health.isInDepot || health.isStuck || health.isStaleGps || health.isOffRoute
+    val isDimmed = health.isInDepot || health.showBlockedWarningOnMap || health.isOffRoute
     val pillShape = RoundedCornerShape(999.dp)
     val interaction = remember { MutableInteractionSource() }
 

@@ -9,6 +9,8 @@ enum class DiagCategory(
     val tag: String,
     val labelIt: String,
 ) {
+    VEHICLE("BUS", "Mezzi"),
+    WIDGET("WIDGET", "Widget"),
     POLL("POLL", "Polling"),
     SOURCE("SRC", "Fonti"),
     MQTT("MQTT", "MQTT"),
@@ -45,13 +47,15 @@ data class DiagnosticLogEntry(
 
 /**
  * Lightweight, zero-disk-I/O, thread-safe in-memory ring buffer capturing structured technical
- * telemetry across data sources, MQTT handshakes/SUBACKs, route/stop ingestion, caches, and
- * GTT upstream outage evaluations so future issues can be diagnosed in seconds from the hidden
- * debug menu.
+ * telemetry across per-vehicle merge/filter decisions, Home Screen widgets, data sources, MQTT
+ * handshakes/SUBACKs, route/stop ingestion, caches, and GTT upstream outage evaluations so any
+ * user bug report can be diagnosed down to the exact rule and threshold.
  */
 object ToBusDiagnosticsLog {
 
-    private const val MAX_ENTRIES = 220
+    const val MAX_ENTRIES = 600
+    private const val MAX_MESSAGE_CHARS = 320
+    private const val MAX_DETAIL_CHARS = 480
 
     private val lock = Any()
     private val seqGen = AtomicLong(0L)
@@ -66,13 +70,13 @@ object ToBusDiagnosticsLog {
     ) {
         val cleanMsg = message.trim()
         if (cleanMsg.isEmpty()) return
-        val cleanDetail = detail?.trim()?.takeIf { it.isNotEmpty() }?.take(220)
+        val cleanDetail = detail?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_DETAIL_CHARS)
         val entry = DiagnosticLogEntry(
             seq = seqGen.incrementAndGet(),
             timestampMillis = timestampMillis,
             category = category,
             severity = severity,
-            message = cleanMsg.take(220),
+            message = cleanMsg.take(MAX_MESSAGE_CHARS),
             detail = cleanDetail,
         )
         synchronized(lock) {
@@ -112,10 +116,23 @@ object ToBusDiagnosticsLog {
         }
     }
 
+    fun formatDurationCompact(seconds: Long?): String {
+        if (seconds == null) return "n/d"
+        val s = seconds.coerceAtLeast(0L)
+        return when {
+            s < 60L -> "${s}s"
+            s < 3600L -> "${s / 60L}m${s % 60L}s"
+            else -> "${s / 3600L}h${(s % 3600L) / 60L}m"
+        }
+    }
+
+    fun formatCoordPair(lat: Double, lon: Double): String =
+        String.format(Locale.US, "%.5f,%.5f", lat, lon)
+
     fun formatReport(
         headerLines: List<String>,
         categories: Set<DiagCategory>? = null,
-        maxEntries: Int = 90,
+        maxEntries: Int = 220,
     ): String {
         val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.ITALY)
         val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ITALY)

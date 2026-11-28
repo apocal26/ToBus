@@ -75,6 +75,8 @@ import com.example.data.model.GttFleetAnalyzer
 import com.example.data.model.LivePollInterval
 import com.example.data.model.MapStyle
 import com.example.data.model.RefreshInterval
+import com.example.data.model.RouteColorPalette
+import com.example.data.model.ServiceAlertCategory
 import com.example.data.model.StopArrival
 import com.example.data.model.WidgetCameraMode
 import com.example.data.model.shortTurinPlaceName
@@ -131,11 +133,18 @@ fun WidgetStudioScreen(
     onCaptureCurrentMapArea: () -> Unit,
     onToggleVehicleLabels: (Boolean) -> Unit,
     onToggleRouteLine: (Boolean) -> Unit,
+    onToggleStopsOnMap: (Boolean) -> Unit = {},
+    onToggleDepotsOnMap: (Boolean) -> Unit = {},
     onToggleColorByDirection: (Boolean) -> Unit,
+    onSelectRouteColorPalette: (RouteColorPalette) -> Unit = {},
+    onToggleRouteInWidget: (Boolean) -> Unit = {},
+    onToggleFavoriteStopsInWidget: (Boolean) -> Unit = {},
     onToggleHideInactiveInWidget: (Boolean) -> Unit,
     onToggleHideInactiveOnMap: (Boolean) -> Unit = {},
     onToggleShowServiceAlerts: (Boolean) -> Unit = {},
     onToggleNotifyFavoriteLineAlerts: (Boolean) -> Unit = {},
+    onToggleNotifyAlertCategory: (ServiceAlertCategory) -> Unit = {},
+    onToggleAllNotifyAlertCategories: (Boolean) -> Unit = {},
     onToggleKeepScreenOn: (Boolean) -> Unit = {},
     onSelectDataSourceMode: (DataSourceMode) -> Unit = {},
     onSelectLivePollInterval: (LivePollInterval) -> Unit = {},
@@ -285,11 +294,18 @@ fun WidgetStudioScreen(
                         onCaptureCurrentMapArea = onCaptureCurrentMapArea,
                         onToggleVehicleLabels = onToggleVehicleLabels,
                         onToggleRouteLine = onToggleRouteLine,
+                        onToggleStopsOnMap = onToggleStopsOnMap,
+                        onToggleDepotsOnMap = onToggleDepotsOnMap,
                         onToggleColorByDirection = onToggleColorByDirection,
+                        onSelectRouteColorPalette = onSelectRouteColorPalette,
+                        onToggleRouteInWidget = onToggleRouteInWidget,
+                        onToggleFavoriteStopsInWidget = onToggleFavoriteStopsInWidget,
                         onToggleHideInactiveInWidget = onToggleHideInactiveInWidget,
                         onToggleHideInactiveOnMap = onToggleHideInactiveOnMap,
                         onToggleShowServiceAlerts = onToggleShowServiceAlerts,
                         onToggleNotifyFavoriteLineAlerts = onToggleNotifyFavoriteLineAlerts,
+                        onToggleNotifyAlertCategory = onToggleNotifyAlertCategory,
+                        onToggleAllNotifyAlertCategories = onToggleAllNotifyAlertCategories,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
                         onSelectDataSourceMode = onSelectDataSourceMode,
                         onSelectLivePollInterval = onSelectLivePollInterval,
@@ -348,11 +364,18 @@ fun WidgetStudioScreen(
                         onCaptureCurrentMapArea = onCaptureCurrentMapArea,
                         onToggleVehicleLabels = onToggleVehicleLabels,
                         onToggleRouteLine = onToggleRouteLine,
+                        onToggleStopsOnMap = onToggleStopsOnMap,
+                        onToggleDepotsOnMap = onToggleDepotsOnMap,
                         onToggleColorByDirection = onToggleColorByDirection,
+                        onSelectRouteColorPalette = onSelectRouteColorPalette,
+                        onToggleRouteInWidget = onToggleRouteInWidget,
+                        onToggleFavoriteStopsInWidget = onToggleFavoriteStopsInWidget,
                         onToggleHideInactiveInWidget = onToggleHideInactiveInWidget,
                         onToggleHideInactiveOnMap = onToggleHideInactiveOnMap,
                         onToggleShowServiceAlerts = onToggleShowServiceAlerts,
                         onToggleNotifyFavoriteLineAlerts = onToggleNotifyFavoriteLineAlerts,
+                        onToggleNotifyAlertCategory = onToggleNotifyAlertCategory,
+                        onToggleAllNotifyAlertCategories = onToggleAllNotifyAlertCategories,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
                         onSelectDataSourceMode = onSelectDataSourceMode,
                         onSelectLivePollInterval = onSelectLivePollInterval,
@@ -475,7 +498,7 @@ private fun LiveWidgetShowcaseBand(
                             val spatial = spatialById[bus.vehicleId]
                                 ?: GttFleetAnalyzer.assessSpatial(bus, uiState.routePatterns)
                             val health = GttFleetAnalyzer.assessWithSpatial(bus, spatial, uiState.nowMillis)
-                            !health.isInDepot && !health.isStaleGps
+                            !health.isInDepot && !health.showBlockedWarningOnMap
                         }
                     } else {
                         uiState.lineVehicles.size
@@ -870,8 +893,9 @@ private fun StopsLiveWidgetPreviewCard(
                                 ?.let(::shortTurinPlaceName)
                             ?: ""
                         val badgeColor = when {
-                            isPrimary && uiState.settings.colorByDirection && activeFav.directionId == 1 -> AccentCyan
-                            isPrimary -> AccentGold
+                            isPrimary && uiState.settings.colorByDirection && activeFav.directionId == 1 ->
+                                Color(uiState.settings.routeColorPalette.secondaryArgb)
+                            isPrimary -> Color(uiState.settings.routeColorPalette.primaryArgb)
                             else -> Color(0x2EFFFFFF)
                         }
                         PreviewStopCardRow(
