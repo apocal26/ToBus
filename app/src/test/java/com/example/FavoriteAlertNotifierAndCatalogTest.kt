@@ -530,4 +530,41 @@ class FavoriteAlertNotifierAndCatalogTest {
         )
         assertTrue(noneAllowed.isEmpty())
     }
+
+    @Test
+    fun findNewFavoriteLineAlerts_blocksSingleVehicleNoiseAndGenericNetworkInfoSpam() {
+        val now = 1_764_200_000L
+        val period = listOf(AlertTimeRange(startEpochSeconds = now - 300L, endEpochSeconds = now + 7_200L))
+
+        val vehicleCapacityNoise = ServiceAlertInfo(
+            id = "veh_9204",
+            headerText = "Informazione sul servizio",
+            descriptionText = "La capienza sul mezzo 9204 non è garantita.",
+            affectedLines = setOf("12"),
+            activePeriods = period,
+        )
+        val bulkGenericNotice = ServiceAlertInfo(
+            id = "bulk_info",
+            headerText = "Avviso agli utenti GTT",
+            descriptionText = "Promemoria sulle norme di accesso e bigliettazione a bordo.",
+            affectedLines = setOf("2", "3", "4", "9", "10", "11", "12", "13", "15", "16CD", "18"),
+            activePeriods = period,
+        )
+        val genuineLineDetour = ServiceAlertInfo(
+            id = "real_detour_12",
+            headerText = "Deviazione linea 12",
+            descriptionText = "Chiusura al traffico in corso Vittorio Emanuele II: percorso deviato.",
+            affectedLines = setOf("12"),
+            activePeriods = period,
+        )
+
+        val matched = FavoriteAlertNotifier.findNewFavoriteLineAlerts(
+            alerts = listOf(vehicleCapacityNoise, bulkGenericNotice, genuineLineDetour),
+            favoriteLines = listOf("12"),
+            seenFingerprints = emptySet(),
+            nowEpochSeconds = now,
+            allowedCategories = com.example.data.model.ServiceAlertCategory.entries.toSet(),
+        )
+        assertEquals(listOf("real_detour_12"), matched.map { it.alert.id })
+    }
 }

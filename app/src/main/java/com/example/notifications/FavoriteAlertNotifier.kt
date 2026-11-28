@@ -55,7 +55,39 @@ object FavoriteAlertNotifier {
 
     private val DIACRITICS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
     private val NON_ALNUM_REGEX = Regex("[^a-z0-9]+")
+    private val SINGLE_VEHICLE_NOTICE_REGEX = Regex(
+        pattern = "\\b(?:sul|sulla|del|della)?\\s*(?:mezzo|vettura|bus|autobus|tram|treno)\\s*(?:n\\.?\\s*)?#?\\d{2,5}\\b",
+        option = RegexOption.IGNORE_CASE,
+    )
+    private val LOW_VALUE_PUSH_PHRASES = listOf(
+        "capienza non garantit",
+        "capienza sul mezzo",
+        "capienza sulla vettura",
+        "posti non garantit",
+        "pedana",
+        "aria condizionata",
+        "climatizzaz",
+        "validatric",
+        "obliteratric",
+        "emettitric",
+        "ascensor",
+        "scala mobile",
+        "scale mobili",
+        "biglietteria",
+    )
     private val processLock = Any()
+
+    internal fun isLowValueVehicleOrGenericPushNoise(
+        alert: ServiceAlertInfo,
+        category: ServiceAlertCategory = alert.classifyCategory(),
+    ): Boolean {
+        if (category == ServiceAlertCategory.CRITICAL) return false
+        val fullText = "${alert.headerText} ${alert.descriptionText}".lowercase(Locale.ITALY)
+        if (SINGLE_VEHICLE_NOTICE_REGEX.containsMatchIn(fullText)) {
+            return true
+        }
+        return LOW_VALUE_PUSH_PHRASES.any { fullText.contains(it) }
+    }
 
     internal fun normalizeTextForFingerprint(raw: String): String {
         if (raw.isBlank()) return ""
@@ -126,15 +158,25 @@ object FavoriteAlertNotifier {
             }
             val category = alert.classifyCategory()
             if (category !in allowedCategories) continue
+            if (isLowValueVehicleOrGenericPushNoise(alert, category)) continue
 
             val affectedUpper = alert.affectedLines
                 .map { it.trim().uppercase(Locale.ROOT) }
                 .filter { it.isNotEmpty() && it != "?" }
                 .toSet()
+            val isNetworkWide = ServiceAlertOrganizer.isNetworkWide(alert)
             val matchingFavs = when {
+                isNetworkWide -> {
+                    // Network-wide / bulk (>=10 lines) alerts push ONLY if CRITICAL (e.g. strike)
+                    // OR if the text explicitly names a favorite line (avoiding generic spam).
+                    val textFavs = favOrdered.filter { ServiceAlertOrganizer.matchesLineText(alert, it) }
+                    when {
+                        textFavs.isNotEmpty() -> textFavs
+                        category == ServiceAlertCategory.CRITICAL -> listOf(NETWORK_WIDE_MATCH_TOKEN)
+                        else -> emptyList()
+                    }
+                }
                 affectedUpper.isNotEmpty() -> favOrdered.filter { it in affectedUpper && it in favSet }
-                ServiceAlertOrganizer.isNetworkWide(alert) && category == ServiceAlertCategory.CRITICAL ->
-                    listOf(NETWORK_WIDE_MATCH_TOKEN)
                 else -> favOrdered.filter { ServiceAlertOrganizer.matchesLine(alert, it) }
             }
             if (matchingFavs.isEmpty()) continue

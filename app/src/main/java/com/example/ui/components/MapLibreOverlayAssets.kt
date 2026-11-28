@@ -1281,17 +1281,17 @@ private fun createDepotHatchPatternBitmap(
     isDarkBasemap: Boolean,
     density: Float,
 ): Bitmap {
-    val tilePx = (14f * density).roundToInt().coerceIn(20, 48)
+    val tilePx = 32
     val bitmap = Bitmap.createBitmap(tilePx, tilePx, Bitmap.Config.ARGB_8888)
     bitmap.density = (density * 160f).roundToInt().coerceAtLeast(160)
     val canvas = Canvas(bitmap)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = (1.0f * density).coerceIn(1.0f, 2.4f)
+        strokeWidth = (1.15f * density).coerceIn(1.2f, 2.8f)
         color = if (isDarkBasemap) {
-            AndroidColor.argb(38, 245, 158, 11) // subtle warm amber-gold hairlines on dark navy
+            AndroidColor.argb(72, 245, 158, 11) // subtle warm amber hairlines on dark basemap
         } else {
-            AndroidColor.argb(40, 161, 98, 7) // subtle architectural ochre hairlines on light basemap
+            AndroidColor.argb(68, 180, 83, 9) // subtle architectural ochre hairlines on light/satellite
         }
     }
     val s = tilePx.toFloat()
@@ -1303,8 +1303,8 @@ private fun createDepotHatchPatternBitmap(
 }
 
 /**
- * Installs subtle, architectural GTT Bus Depot geofence overlays beneath landmarks, transit routes,
- * stops, and vehicle markers so users immediately understand when a bus is parked inside a depot.
+ * Installs subtle, architectural GTT Bus Depot geofence overlays beneath street labels, landmarks,
+ * transit routes, stops, and vehicle markers so users immediately understand when a bus is inside a depot.
  */
 internal fun installGttDepotsLayer(
     style: Style,
@@ -1332,81 +1332,92 @@ internal fun installGttDepotsLayer(
     val patternBmp = createDepotHatchPatternBitmap(isDarkBasemap = isDarkBasemap, density = density)
     style.addImage(MapLibreTransitIds.ICON_DEPOT_PATTERN, patternBmp)
 
+    val streetLabelAnchorId = "label-streets-major".takeIf { style.getLayer(it) != null }
+
     // 1. Delicate warm-tinted architectural veil
     if (style.getLayer(MapLibreTransitIds.DEPOTS_FILL_LAYER) == null) {
-        style.addLayer(
-            FillLayer(MapLibreTransitIds.DEPOTS_FILL_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
-                PropertyFactory.fillColor(
-                    if (isDarkBasemap) "#F59E0B" else "#B45309",
-                ),
-                PropertyFactory.fillOpacity(
-                    Expression.interpolate(
-                        Expression.linear(),
-                        Expression.zoom(),
-                        Expression.stop(9.8, 0.03f),
-                        Expression.stop(11.5, if (isDarkBasemap) 0.065f else 0.06f),
-                        Expression.stop(15.0, if (isDarkBasemap) 0.085f else 0.075f),
-                    ),
-                ),
-                PropertyFactory.fillAntialias(true),
+        val fillLayer = FillLayer(MapLibreTransitIds.DEPOTS_FILL_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
+            PropertyFactory.fillColor(
+                if (isDarkBasemap) "#F59E0B" else "#D97706",
             ),
+            PropertyFactory.fillOpacity(
+                Expression.interpolate(
+                    Expression.linear(),
+                    Expression.zoom(),
+                    Expression.stop(9.8, 0.11f),
+                    Expression.stop(11.8, if (isDarkBasemap) 0.16f else 0.15f),
+                    Expression.stop(15.5, if (isDarkBasemap) 0.21f else 0.19f),
+                ),
+            ),
+            PropertyFactory.fillAntialias(true),
         )
+        if (streetLabelAnchorId != null) {
+            style.addLayerBelow(fillLayer, streetLabelAnchorId)
+        } else {
+            style.addLayer(fillLayer)
+        }
     }
 
-    // 2. Crisp diagonal micro-hatch emerging gently from neighborhood zoom onward
+    // 2. Crisp diagonal micro-hatch pattern over depot yards
     if (style.getLayer(MapLibreTransitIds.DEPOTS_PATTERN_LAYER) == null) {
-        style.addLayer(
-            FillLayer(MapLibreTransitIds.DEPOTS_PATTERN_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
-                PropertyFactory.fillPattern(MapLibreTransitIds.ICON_DEPOT_PATTERN),
-                PropertyFactory.fillOpacity(
-                    Expression.interpolate(
-                        Expression.linear(),
-                        Expression.zoom(),
-                        Expression.stop(10.5, 0.0f),
-                        Expression.stop(12.0, 0.72f),
-                        Expression.stop(15.0, 0.88f),
-                    ),
+        val patternLayer = FillLayer(MapLibreTransitIds.DEPOTS_PATTERN_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
+            PropertyFactory.fillPattern(MapLibreTransitIds.ICON_DEPOT_PATTERN),
+            PropertyFactory.fillOpacity(
+                Expression.interpolate(
+                    Expression.linear(),
+                    Expression.zoom(),
+                    Expression.stop(10.0, 0.28f),
+                    Expression.stop(11.8, 0.78f),
+                    Expression.stop(15.0, 0.92f),
                 ),
             ),
         )
+        if (streetLabelAnchorId != null) {
+            style.addLayerBelow(patternLayer, streetLabelAnchorId)
+        } else {
+            style.addLayer(patternLayer)
+        }
     }
 
     // 3. Hairline dashed perimeter matching the exact depot geofence boundary
     if (style.getLayer(MapLibreTransitIds.DEPOTS_BORDER_LAYER) == null) {
-        style.addLayer(
-            LineLayer(MapLibreTransitIds.DEPOTS_BORDER_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
-                PropertyFactory.lineColor(
-                    if (isDarkBasemap) "#F59E0B" else "#B45309",
-                ),
-                PropertyFactory.lineOpacity(
-                    Expression.interpolate(
-                        Expression.linear(),
-                        Expression.zoom(),
-                        Expression.stop(9.8, 0.16f),
-                        Expression.stop(12.2, if (isDarkBasemap) 0.34f else 0.38f),
-                        Expression.stop(15.0, if (isDarkBasemap) 0.46f else 0.48f),
-                    ),
-                ),
-                PropertyFactory.lineWidth(
-                    Expression.interpolate(
-                        Expression.linear(),
-                        Expression.zoom(),
-                        Expression.stop(10.0, 0.85f),
-                        Expression.stop(13.5, 1.15f),
-                        Expression.stop(16.5, 1.45f),
-                    ),
-                ),
-                PropertyFactory.lineDasharray(arrayOf(3.2f, 3.2f)),
-                PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+        val borderLayer = LineLayer(MapLibreTransitIds.DEPOTS_BORDER_LAYER, MapLibreTransitIds.DEPOTS_SOURCE).withProperties(
+            PropertyFactory.lineColor(
+                if (isDarkBasemap) "#F59E0B" else "#B45309",
             ),
+            PropertyFactory.lineOpacity(
+                Expression.interpolate(
+                    Expression.linear(),
+                    Expression.zoom(),
+                    Expression.stop(9.8, 0.36f),
+                    Expression.stop(12.0, if (isDarkBasemap) 0.56f else 0.60f),
+                    Expression.stop(15.5, if (isDarkBasemap) 0.70f else 0.74f),
+                ),
+            ),
+            PropertyFactory.lineWidth(
+                Expression.interpolate(
+                    Expression.linear(),
+                    Expression.zoom(),
+                    Expression.stop(10.0, 1.1f),
+                    Expression.stop(13.5, 1.45f),
+                    Expression.stop(16.5, 1.85f),
+                ),
+            ),
+            PropertyFactory.lineDasharray(arrayOf(4.0f, 3.0f)),
+            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
         )
+        if (streetLabelAnchorId != null) {
+            style.addLayerBelow(borderLayer, streetLabelAnchorId)
+        } else {
+            style.addLayer(borderLayer)
+        }
     }
 
-    // 4. Discreet, non-intrusive depot name label (zoom >= 12.2, yields to streets/stops/landmarks)
+    // 4. Discreet, non-intrusive depot name label (zoom >= 11.0, yields cleanly on heavy clutter)
     if (style.getLayer(MapLibreTransitIds.DEPOTS_LABEL_LAYER) == null) {
         style.addLayer(
             SymbolLayer(MapLibreTransitIds.DEPOTS_LABEL_LAYER, MapLibreTransitIds.DEPOTS_LABELS_SOURCE).apply {
-                minZoom = 12.2f
+                minZoom = 11.0f
                 setProperties(
                     PropertyFactory.textField(Expression.get("name")),
                     PropertyFactory.textFont(arrayOf("Noto Sans Bold")),
@@ -1414,20 +1425,20 @@ internal fun installGttDepotsLayer(
                         Expression.interpolate(
                             Expression.linear(),
                             Expression.zoom(),
-                            Expression.stop(12.2, 9.6f),
-                            Expression.stop(14.5, 10.8f),
-                            Expression.stop(16.5, 11.6f),
+                            Expression.stop(11.0, 9.4f),
+                            Expression.stop(14.0, 10.8f),
+                            Expression.stop(16.5, 11.8f),
                         ),
                     ),
                     PropertyFactory.textLetterSpacing(0.04f),
                     PropertyFactory.textColor(
-                        if (isDarkBasemap) "rgba(252, 211, 77, 0.72)" else "rgba(146, 64, 14, 0.76)",
+                        if (isDarkBasemap) "rgba(253, 224, 71, 0.88)" else "rgba(146, 64, 14, 0.90)",
                     ),
                     PropertyFactory.textHaloColor(
-                        if (isDarkBasemap) "rgba(10, 14, 22, 0.90)" else "rgba(248, 250, 253, 0.94)",
+                        if (isDarkBasemap) "rgba(10, 14, 22, 0.92)" else "rgba(248, 250, 253, 0.95)",
                     ),
-                    PropertyFactory.textHaloWidth(1.3f),
-                    PropertyFactory.textMaxWidth(9.0f),
+                    PropertyFactory.textHaloWidth(1.5f),
+                    PropertyFactory.textMaxWidth(9.5f),
                     PropertyFactory.textAllowOverlap(false),
                     PropertyFactory.textIgnorePlacement(false),
                     PropertyFactory.textOptional(true),

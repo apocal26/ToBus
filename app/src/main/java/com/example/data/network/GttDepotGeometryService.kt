@@ -101,69 +101,101 @@ internal class GttDepotGeometryService(
             }
             lastAttemptAtMillis = now
 
-            val fetched = queryOverpassTurinDepots()
-            if (fetched.isNotEmpty()) {
-                memoryCache = fetched
-                memoryFetchedAtMillis = now
-                GttFleetAnalyzer.updateResolvedDepots(fetched)
-                writeCacheToDisk(fetched, now)
-                Log.i(TAG, "Loaded ${fetched.size} verified OSM GTT depot polygons")
-                return@withLock fetched
-            }
-
-            // Fallback to expired disk cache if Overpass is temporarily unreachable
-            val staleDisk = readCacheFromDisk(now, allowExpired = true)
-            if (staleDisk != null && staleDisk.depots.isNotEmpty()) {
-                memoryCache = staleDisk.depots
-                memoryFetchedAtMillis = staleDisk.fetchedAtMillis
-                GttFleetAnalyzer.updateResolvedDepots(staleDisk.depots)
-                return@withLock staleDisk.depots
-            }
-            memoryCache
-        }
-    }
-
-    fun clearCache(): Int {
-        memoryCache = emptyList()
-        memoryFetchedAtMillis = 0L
-        lastAttemptAtMillis = 0L
-        return runCatching {
-            val f = cacheFileProvider()
-            if (f.exists() && f.delete()) 1 else 0
-        }.getOrDefault(0)
-    }
-
-    private fun queryOverpassTurinDepots(): List<GttDepot> {
-        val mediaType = "application/x-www-form-urlencoded; charset=utf-8".toMediaType()
-        val encodedBody = "data=" + URLEncoder.encode(OVERPASS_DEPOTS_QL, "UTF-8")
-        val client = httpClientProvider()
-
-        for (endpoint in overpassEndpoints) {
-            try {
-                val req = Request.Builder()
-                    .url(endpoint)
-                    .post(encodedBody.toRequestBody(mediaType))
-                    .header("User-Agent", userAgent)
-                    .header("Accept", "application/json")
-                    .build()
-
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        Log.d(TAG, "Overpass depot HTTP ${resp.code} on $endpoint")
-                        return@use
-                    }
-                    val body = resp.body?.string() ?: return@use
-                    val parsed = parseOverpassDepotsJson(body)
-                    if (parsed.isNotEmpty()) {
-                        return parsed
-                    }
+                val fetched = queryOverpassTurinDepots()
+                if (fetched.isNotEmpty()) {
+                    memoryCache = fetched
+                    memoryFetchedAtMillis = now
+                    GttFleetAnalyzer.updateResolvedDepots(fetched)
+                    writeCacheToDisk(fetched, now)
+                    val msg = "Loaded ${fetched.size} verified OSM GTT depot polygons: ${fetched.joinToString(", ") { it.name }}"
+                    Log.i(TAG, msg)
+                    ToBusDiagnosticsLog.record(DiagCategory.CACHE, "Depots OSM OK (${fetched.size})", msg)
+                    return@withLock fetched
                 }
-            } catch (e: Exception) {
-                Log.d(TAG, "Overpass depot skip $endpoint: ${e.message}")
+
+                ToBusDiagnosticsLog.record(
+                    DiagCategory.CACHE,
+                    "Depots OSM empty/unavailable",
+                    "All Overpass endpoints returned 0 validated GTT depot polygons; will retry after ${FAILURE_RETRY_COOLDOWN_MS / 1000}s",
+                )
+
+                // Fallback to expired disk cache if Overpass is temporarily unreachable
+                val staleDisk = readCacheFromDisk(now, allowExpired = true)
+                if (staleDisk != null && staleDisk.depots.isNotEmpty()) {
+                    memoryCache = staleDisk.depots
+                    memoryFetchedAtMillis = staleDisk.fetchedAtMillis
+                    GttFleetAnalyzer.updateResolvedDepots(staleDisk.depots)
+                    return@withLock staleDisk.depots
+                }
+                memoryCache
             }
         }
-        return emptyList()
-    }
+
+        fun clearCache(): Int {
+            memoryCache = emptyList()
+            memoryFetchedAtMillis = 0L
+            lastAttemptAtMillis = 0L
+            return runCatching {
+                val f = cacheFileProvider()
+                if (f.exists() && f.delete()) 1 else 0
+            }.getOrDefault(0)
+        }
+
+        private fun queryOverpassTurinDepots(): List<GttDepot> {
+            val mediaType = "application/x-www-form-urlencoded; charset=utf-8".toMediaType()
+            val encodedBody = "data=" + URLEncoder.encode(OVERPASS_DEPOTS_QL, "UTF-8")
+            val client = httpClientProvider()
+
+            for (endpoint in overpassEndpoints) {
+                try {
+                    val req = Request.Builder()
+                        .url(endpoint)
+                        .post(encodedBody.toRequestBody(mediaType))
+                        .header("User-Agent", userAgent)
+                        .header("Accept", "application/json")
+                        .build()
+
+                    client.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            Log.d(TAG, "Overpass depot HTTP ${resp.code} on $endpoint")
+                            ToBusDiagnosticsLog.record(
+                                DiagCategory.CACHE,
+                                "Depots Overpass HTTP ${resp.code}",
+                                endpoint,
+                            )
+                            return@use
+                        }
+                        val body = resp.body?.string() ?: return@use
+                        val root = runCatching { MinimalJsonParser.parseObject(body) }.getOrNull()
+                        val remark = root?.optString("remark", "")?.trim().orEmpty()
+                        val rawCount = root?.optArray("elements")?.size ?: 0
+                        val parsed = parseOverpassDepotsJson(body)
+                        if (parsed.isNotEmpty()) {
+                            return parsed
+                        }
+                        val note = buildString {
+                            append("endpoint=").append(endpoint)
+                            append(" rawElements=").append(rawCount)
+                            if (remark.isNotEmpty()) append(" remark=").append(remark)
+                        }
+                        Log.d(TAG, "Overpass depot 0 parsed ($note)")
+                        ToBusDiagnosticsLog.record(
+                            DiagCategory.CACHE,
+                            "Depots Overpass 0 matched (raw=$rawCount)",
+                            note,
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "Overpass depot skip $endpoint: ${e.message}")
+                    ToBusDiagnosticsLog.record(
+                        DiagCategory.CACHE,
+                        "Depots Overpass error",
+                        "$endpoint -> ${e.message}",
+                    )
+                }
+            }
+            return emptyList()
+        }
 
     private data class DiskDepotCache(
         val fetchedAtMillis: Long,
@@ -254,36 +286,19 @@ internal class GttDepotGeometryService(
     companion object {
         private const val TAG = "GttDepotGeometry"
         internal const val CACHE_FILE_NAME = "gtt_depots_osm_v1.json"
-        private const val CACHE_SCHEMA_VERSION = 1
+        private const val CACHE_SCHEMA_VERSION = 2
         private const val CACHE_TTL_MS = 30L * 24L * 60L * 60L * 1000L
-        private const val FAILURE_RETRY_COOLDOWN_MS = 10L * 60L * 1000L
+        private const val FAILURE_RETRY_COOLDOWN_MS = 30_000L
 
         private const val MIN_LAT = 45.010
         private const val MAX_LAT = 45.155
         private const val MIN_LON = 7.560
         private const val MAX_LON = 7.765
 
-        private const val MIN_DEPOT_AREA_SQM = 1_800.0
+        private const val MIN_DEPOT_AREA_SQM = 1_500.0
         private const val MAX_DEPOT_AREA_SQM = 250_000.0
         private const val CANONICAL_NAME_MAX_DIST_METERS = 2_500.0
         private const val UNNAMED_DEPOT_MAX_DIST_METERS = 1_200.0
-
-        private val OVERPASS_DEPOTS_QL = """
-            [out:json][timeout:18];
-            (
-              way["landuse"="depot"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              relation["landuse"="depot"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              way["depot"~"bus|tram|public_transport",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              relation["depot"~"bus|tram|public_transport",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              way["building"="depot"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              relation["building"="depot"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              way["operator"~"GTT|Gruppo Torinese Trasporti",i]["landuse"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              relation["operator"~"GTT|Gruppo Torinese Trasporti",i]["landuse"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              way["name"~"(Deposito|Stabilimento|Rimessa|Comprensorio).*(GTT|Gerbido|San Paolo|Venaria|Tortona|Nizza|Novara|Fiochetto|Sassi)|GTT.*(Deposito|Stabilimento|Rimessa|Comprensorio)",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-              relation["name"~"(Deposito|Stabilimento|Rimessa|Comprensorio).*(GTT|Gerbido|San Paolo|Venaria|Tortona|Nizza|Novara|Fiochetto|Sassi)|GTT.*(Deposito|Stabilimento|Rimessa|Comprensorio)",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);
-            );
-            out tags geom;
-        """.trimIndent()
 
         private data class CanonicalDepotSeed(
             val displayName: String,
@@ -294,24 +309,53 @@ internal class GttDepotGeometryService(
 
         private val CANONICAL_SEEDS = listOf(
             CanonicalDepotSeed("Deposito Gerbido", listOf("gerbido", "gorini"), 45.0345, 7.6012),
-            CanonicalDepotSeed("Deposito San Paolo", listOf("san paolo", "s. paolo", "trapani"), 45.0642, 7.6328),
+            CanonicalDepotSeed("Deposito San Paolo", listOf("san paolo", "s. paolo", "trapani", "monginevro"), 45.0642, 7.6328),
             CanonicalDepotSeed("Deposito Venaria", listOf("venaria", "amati"), 45.1321, 7.6254),
-            CanonicalDepotSeed("Deposito Tortona", listOf("tortona", "officina centrale", "manin"), 45.0746, 7.7047),
-            CanonicalDepotSeed("Deposito Nizza", listOf("nizza", "bramante"), 45.0445, 7.6651),
-            CanonicalDepotSeed("Deposito Novara", listOf("novara"), 45.0807, 7.6990),
+            CanonicalDepotSeed("Deposito Tortona", listOf("tortona", "officina centrale", "officine centrali", "manin"), 45.0746, 7.7047),
+            CanonicalDepotSeed("Deposito Nizza", listOf("nizza", "bramante", "genova"), 45.0445, 7.6651),
+            CanonicalDepotSeed("Deposito Novara", listOf("novara", "regio parco"), 45.0807, 7.6990),
             CanonicalDepotSeed("Deposito Fiochetto", listOf("fiochetto"), 45.0761, 7.6891),
-            CanonicalDepotSeed("Deposito Sassi", listOf("sassi"), 45.0789, 7.7347),
+            CanonicalDepotSeed("Deposito Sassi", listOf("sassi", "modena"), 45.0789, 7.7347),
         )
+
+        // Fast indexed city-wide selectors + targeted around:650 spatial pockets around each canonical
+        // GTT depot (avoids multi-second full-city name regex scans that frequently hit Overpass timeouts).
+        private val OVERPASS_DEPOTS_QL: String = buildString {
+            append("[out:json][timeout:14];\n(\n")
+            append("  way[\"landuse\"=\"depot\"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  relation[\"landuse\"=\"depot\"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  way[\"building\"=\"depot\"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  relation[\"building\"=\"depot\"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  way[\"public_transport\"=\"depot\"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  relation[\"public_transport\"=\"depot\"]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  way[\"depot\"~\"bus|tram|public_transport|trolleybus\",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  relation[\"depot\"~\"bus|tram|public_transport|trolleybus\",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  way[\"operator\"~\"GTT|G\\\\.T\\\\.T\\\\.|Gruppo Torinese Trasporti\",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            append("  relation[\"operator\"~\"GTT|G\\\\.T\\\\.T\\\\.|Gruppo Torinese Trasporti\",i]($MIN_LAT,$MIN_LON,$MAX_LAT,$MAX_LON);\n")
+            for (seed in CANONICAL_SEEDS) {
+                val a = "around:650,${seed.lat},${seed.lon}"
+                append("  way($a)[\"landuse\"~\"depot|industrial|commercial\"];\n")
+                append("  relation($a)[\"landuse\"~\"depot|industrial|commercial\"];\n")
+                append("  way($a)[\"amenity\"=\"bus_station\"];\n")
+                append("  way($a)[\"name\"~\"Deposito|Rimessa|Stabilimento|Comprensorio|Officin|GTT\",i];\n")
+                append("  relation($a)[\"name\"~\"Deposito|Rimessa|Stabilimento|Comprensorio|Officin|GTT\",i];\n")
+            }
+            append(");\nout tags geom;")
+        }
 
         private val FORBIDDEN_BUILDINGS = setOf(
             "apartments", "residential", "house", "terrace", "detached", "semidetached_house",
             "school", "university", "college", "kindergarten", "church", "cathedral", "chapel",
-            "hospital", "clinic", "retail", "commercial", "supermarket", "hotel", "hostel",
-            "office", "stadium", "grandstand", "parking", "garage", "garages",
+            "hospital", "clinic", "retail", "supermarket", "hotel", "hostel",
+            "office", "stadium", "grandstand",
+        )
+
+        private val SOFT_GARAGE_OR_COMMERCIAL_BUILDINGS = setOf(
+            "commercial", "parking", "garage", "garages",
         )
 
         private val FORBIDDEN_LANDUSE = setOf(
-            "residential", "retail", "commercial", "cemetery", "meadow", "grass", "forest",
+            "residential", "retail", "cemetery", "meadow", "grass", "forest",
             "farmland", "allotments", "recreation_ground", "construction", "quarry", "military",
         )
 
@@ -443,6 +487,8 @@ internal class GttDepotGeometryService(
                 nameLower.contains("rimessa") ||
                 nameLower.contains("comprensorio") ||
                 nameLower.contains("officina centrale") ||
+                nameLower.contains("officine centrali") ||
+                nameLower.contains("autoparco") ||
                 nameLower.contains("autostazione")
 
             if ((nameLower.contains("stazione") || nameLower.contains("fermata") || nameLower.contains("parcheggio")) &&
@@ -453,14 +499,26 @@ internal class GttDepotGeometryService(
 
             // 2. Positive transit/depot verification
             val hasExplicitGtt = fullTextBlob.contains("gtt") ||
+                fullTextBlob.contains("g.t.t.") ||
                 fullTextBlob.contains("gruppo torinese trasporti") ||
                 fullTextBlob.contains("atm torino")
-            val hasDepotTag = landuse == "depot" ||
+            val isExplicitDepotTag = landuse == "depot" ||
                 building == "depot" ||
-                isBusOrTramDepotTag ||
+                publicTransport == "depot" ||
+                isBusOrTramDepotTag
+            // Reject commercial landuse or garage/parking buildings unless explicitly tagged as a transit depot / GTT depot
+            if (building in SOFT_GARAGE_OR_COMMERCIAL_BUILDINGS && !(isExplicitDepotTag || (hasExplicitGtt && hasDepotWordInName))) {
+                return null
+            }
+            if (landuse == "commercial" && !(isExplicitDepotTag || (hasExplicitGtt && hasDepotWordInName))) {
+                return null
+            }
+
+            val hasDepotTag = isExplicitDepotTag ||
                 amenity == "bus_station" ||
                 publicTransport == "station" ||
-                hasDepotWordInName
+                hasDepotWordInName ||
+                (hasExplicitGtt && (landuse == "industrial" || building == "industrial" || building == "yes"))
             if (!hasDepotTag) return null
 
             // 3. Match to canonical Turin GTT depot
@@ -470,22 +528,28 @@ internal class GttDepotGeometryService(
                     CANONICAL_NAME_MAX_DIST_METERS
             }
 
-            val matchedByProximity = if (matchedByName == null && (hasExplicitGtt || isBusOrTramDepotTag)) {
+            val matchedByProximity = if (matchedByName == null && (hasExplicitGtt || isExplicitDepotTag)) {
+                val maxDist = if (isExplicitDepotTag && !hasExplicitGtt) 600.0 else UNNAMED_DEPOT_MAX_DIST_METERS
                 CANONICAL_SEEDS
                     .map { seed ->
                         seed to GttFleetAnalyzer.haversineMeters(geom.centroidLat, geom.centroidLon, seed.lat, seed.lon)
                     }
-                    .filter { (_, dist) -> dist <= UNNAMED_DEPOT_MAX_DIST_METERS }
+                    .filter { (_, dist) -> dist <= maxDist }
                     .minByOrNull { it.second }
                     ?.first
             } else {
                 null
             }
 
+            // Reject generic non-depot factory names ("Stabilimento ...") unless explicitly GTT or explicit depot tag
+            if (nameLower.contains("stabilimento") && !hasExplicitGtt && !isExplicitDepotTag && !nameLower.contains("deposito")) {
+                return null
+            }
+
             val resolvedName = when {
                 matchedByName != null -> matchedByName.displayName
                 matchedByProximity != null -> matchedByProximity.displayName
-                hasExplicitGtt && (landuse == "depot" || isBusOrTramDepotTag || hasDepotWordInName) -> {
+                hasExplicitGtt && (isExplicitDepotTag || hasDepotWordInName || landuse == "industrial") -> {
                     normalizeCustomDepotName(rawName) ?: return null
                 }
                 else -> return null

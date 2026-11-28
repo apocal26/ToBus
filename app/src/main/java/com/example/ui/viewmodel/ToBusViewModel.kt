@@ -237,6 +237,8 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     private var stopSearchJob: Job? = null
     private var foregroundPollingJob: Job? = null
     private var clockTickerJob: Job? = null
+    private var depotLoadJob: Job? = null
+    private var lastDepotAttemptMillis: Long = 0L
     private var lastWidgetSyncMillis: Long = 0L
     private var cameraFlySeq: Long = 0L
     private var dismissedOutageStableKey: String? = null
@@ -265,16 +267,7 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
             loadRouteGeometry(initialSettings.selectedLine, isInitialRouteLoad = true)
         }
         // Hydrate verified OSM GTT depot compound polygons (instant from 30-day disk cache, or Overpass fetch).
-        viewModelScope.launch(Dispatchers.IO) {
-            val cachedDepots = repository.getCachedVerifiedDepotsFast()
-            if (cachedDepots.isNotEmpty()) {
-                _uiState.update { it.copy(depotZones = cachedDepots) }
-            }
-            val loadedDepots = repository.ensureDepotPolygonsLoaded()
-            if (loadedDepots.isNotEmpty() && loadedDepots != _uiState.value.depotZones) {
-                _uiState.update { it.copy(depotZones = loadedDepots) }
-            }
-        }
+        ensureDepotsLoadedIfMissing(forceImmediate = true)
         // Hydrate active line list immediately from tiny disk cache or static GTFS routes.txt (~1.5 KB)
         // for instant Line Picker before the first live HTTP poll completes.
         viewModelScope.launch(Dispatchers.IO) {
@@ -528,6 +521,9 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
                 val currentLine = settingsBeforeFetch.selectedLine.trim().uppercase()
                 if (currentLine.isNotEmpty() && _uiState.value.routePatterns.isEmpty() && routeLoadJob?.isActive != true) {
                     loadRouteGeometry(currentLine)
+                }
+                if (settingsBeforeFetch.showDepotsOnMap && _uiState.value.depotZones.isEmpty()) {
+                    ensureDepotsLoadedIfMissing(forceImmediate = false)
                 }
 
                 val result = repository.fetchLiveVehicles(
@@ -1562,6 +1558,29 @@ class ToBusViewModel(application: Application) : AndroidViewModel(application) {
     fun setShowDepotsOnMap(show: Boolean) {
         val updated = preferences.updateSettings { it.copy(showDepotsOnMap = show) }
         _uiState.update { it.copy(settings = updated) }
+        if (show && _uiState.value.depotZones.isEmpty()) {
+            ensureDepotsLoadedIfMissing(forceImmediate = true)
+        }
+    }
+
+    private fun ensureDepotsLoadedIfMissing(forceImmediate: Boolean) {
+        if (_uiState.value.depotZones.isNotEmpty()) return
+        if (depotLoadJob?.isActive == true) return
+        val now = System.currentTimeMillis()
+        if (!forceImmediate && lastDepotAttemptMillis > 0L && (now - lastDepotAttemptMillis) < 40_000L) {
+            return
+        }
+        lastDepotAttemptMillis = now
+        depotLoadJob = viewModelScope.launch(Dispatchers.IO) {
+            val cachedDepots = repository.getCachedVerifiedDepotsFast()
+            if (cachedDepots.isNotEmpty()) {
+                _uiState.update { it.copy(depotZones = cachedDepots) }
+            }
+            val loadedDepots = repository.ensureDepotPolygonsLoaded()
+            if (loadedDepots.isNotEmpty() && loadedDepots != _uiState.value.depotZones) {
+                _uiState.update { it.copy(depotZones = loadedDepots) }
+            }
+        }
     }
 
     fun setColorByDirection(enabled: Boolean) {

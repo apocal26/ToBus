@@ -60,6 +60,17 @@ enum class ServiceAlertCategory(
     INFO(id = "info", label = "Info", filterLabelIt = "Informazioni generali", priority = 1);
 
     companion object {
+        /**
+         * Default categories enabled for favorite-line push notifications:
+         * excludes low-urgency general info announcements so users only receive actionable alerts.
+         */
+        val DEFAULT_NOTIFY_CATEGORIES: Set<ServiceAlertCategory> = setOf(
+            CRITICAL,
+            DISRUPTION,
+            NOTICE,
+            POSITIVE,
+        )
+
         fun fromId(id: String?): ServiceAlertCategory =
             entries.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: INFO
     }
@@ -1168,7 +1179,7 @@ data class UserWidgetSettings(
     val keepScreenOn: Boolean = false,
     val showServiceAlerts: Boolean = true,
     val notifyFavoriteLineAlerts: Boolean = false,
-    val notifyAlertCategories: Set<ServiceAlertCategory> = ServiceAlertCategory.entries.toSet(),
+    val notifyAlertCategories: Set<ServiceAlertCategory> = ServiceAlertCategory.DEFAULT_NOTIFY_CATEGORIES,
     val hideInactiveOnMap: Boolean = false,
 ) {
     val hasSelectedLine: Boolean

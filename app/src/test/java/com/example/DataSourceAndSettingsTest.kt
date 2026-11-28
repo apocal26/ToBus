@@ -75,9 +75,10 @@ class DataSourceAndSettingsTest {
         assertEquals("Classico", RouteColorPalette.TURIN_GOLD.labelIt)
         assertEquals(RouteColorPalette.COBALT_MAGENTA, RouteColorPalette.fromId("cobalt_amber"))
         assertEquals(
-            com.example.data.model.ServiceAlertCategory.entries.toSet(),
+            com.example.data.model.ServiceAlertCategory.DEFAULT_NOTIFY_CATEGORIES,
             UserWidgetSettings().notifyAlertCategories,
         )
+        assertFalse(com.example.data.model.ServiceAlertCategory.INFO in UserWidgetSettings().notifyAlertCategories)
 
         val unorderedColorPairs = mutableSetOf<Set<Int>>()
         RouteColorPalette.entries.forEach { palette ->

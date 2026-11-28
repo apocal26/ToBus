@@ -293,6 +293,12 @@ object ServiceAlertOrganizer {
         if (alert.affectedLines.isNotEmpty()) {
             return alert.affectedLines.any { it.equals(target, ignoreCase = true) }
         }
+        return matchesLineText(alert, target)
+    }
+
+    fun matchesLineText(alert: ServiceAlertInfo, targetLine: String): Boolean {
+        val target = targetLine.trim().uppercase(Locale.ROOT)
+        if (target.isEmpty()) return false
         val mentionRegex = Regex(
             pattern = "\\b(?:linea|linee)\\b[^.\\n]{0,45}\\b${Regex.escape(target)}\\b",
             option = RegexOption.IGNORE_CASE,

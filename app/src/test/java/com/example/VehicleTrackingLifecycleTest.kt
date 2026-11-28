@@ -822,6 +822,51 @@ class VehicleTrackingLifecycleTest {
                     {"lat": 45.0641, "lon": 7.6300},
                     {"lat": 45.0640, "lon": 7.6300}
                   ]
+                },
+                {
+                  "type": "way",
+                  "id": 3004,
+                  "tags": {
+                    "landuse": "industrial",
+                    "operator": "GTT",
+                    "name": "Tortona"
+                  },
+                  "geometry": [
+                    {"lat": 45.0740, "lon": 7.7040},
+                    {"lat": 45.0740, "lon": 7.7054},
+                    {"lat": 45.0752, "lon": 7.7054},
+                    {"lat": 45.0752, "lon": 7.7040},
+                    {"lat": 45.0740, "lon": 7.7040}
+                  ]
+                },
+                {
+                  "type": "way",
+                  "id": 3005,
+                  "tags": {
+                    "landuse": "depot"
+                  },
+                  "geometry": [
+                    {"lat": 45.0802, "lon": 7.6984},
+                    {"lat": 45.0802, "lon": 7.6996},
+                    {"lat": 45.0812, "lon": 7.6996},
+                    {"lat": 45.0812, "lon": 7.6984},
+                    {"lat": 45.0802, "lon": 7.6984}
+                  ]
+                },
+                {
+                  "type": "way",
+                  "id": 3006,
+                  "tags": {
+                    "landuse": "industrial",
+                    "name": "Stabilimento Meccanico Nizza"
+                  },
+                  "geometry": [
+                    {"lat": 45.0440, "lon": 7.6645},
+                    {"lat": 45.0440, "lon": 7.6657},
+                    {"lat": 45.0450, "lon": 7.6657},
+                    {"lat": 45.0450, "lon": 7.6645},
+                    {"lat": 45.0440, "lon": 7.6645}
+                  ]
                 }
               ]
             }
@@ -829,8 +874,8 @@ class VehicleTrackingLifecycleTest {
 
         val parsed = GttDepotGeometryService.parseOverpassDepotsJson(sampleOverpassJson)
         assertEquals(
-            "Should keep only outer San Paolo + stitched Gerbido, rejecting inner shed, apartments, Trenitalia, and tiny cabin",
-            setOf("Deposito San Paolo", "Deposito Gerbido"),
+            "Should keep San Paolo, stitched Gerbido, GTT industrial Tortona, and unnamed landuse=depot Novara, while rejecting inner shed, apartments, Trenitalia, tiny cabin, and unrelated factory",
+            setOf("Deposito San Paolo", "Deposito Gerbido", "Deposito Tortona", "Deposito Novara"),
             parsed.map { it.name }.toSet(),
         )
         val sanPaolo = parsed.first { it.name == "Deposito San Paolo" }

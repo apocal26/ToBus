@@ -291,9 +291,10 @@ class ToBusPreferences private constructor(context: Context) {
 
     private fun readNotifyAlertCategories(): Set<ServiceAlertCategory> {
         if (!prefs.contains(KEY_NOTIFY_ALERT_CATEGORIES)) {
-            return ServiceAlertCategory.entries.toSet()
+            return ServiceAlertCategory.DEFAULT_NOTIFY_CATEGORIES
         }
-        val raw = prefs.getString(KEY_NOTIFY_ALERT_CATEGORIES, null) ?: return ServiceAlertCategory.entries.toSet()
+        val raw = prefs.getString(KEY_NOTIFY_ALERT_CATEGORIES, null)
+            ?: return ServiceAlertCategory.DEFAULT_NOTIFY_CATEGORIES
         if (raw.isBlank()) return emptySet()
         return raw.split(',')
             .mapNotNull { token ->
